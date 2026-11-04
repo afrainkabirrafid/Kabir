@@ -1,0 +1,53 @@
+# todo.kbr -- a small in-memory todo list.
+# Commands: add <task> | list | done <number> | quit
+
+let todos = []
+
+func show_todos() {
+    if len(todos) == 0 {
+        print("No todos yet. Add one with: add <task>")
+        return
+    }
+    print("Your todos:")
+    for i in range(len(todos)) {
+        let t = todos[i]
+        let mark = "[x]"
+        if not t["done"] {
+            mark = "[ ]"
+        }
+        print("{i + 1}. {mark} {t["title"]}")
+    }
+}
+
+print("Todo list -- type 'add <task>', 'list', 'done <number>', or 'quit'.")
+
+while true {
+    let line = input("todo> ")
+    if line == "quit" {
+        print("Goodbye! You have {len(todos)} todos saved in memory.")
+        break
+    } elif line == "list" {
+        show_todos()
+    } elif len(line) >= 4 and line[0] == "a" and line[1] == "d" and line[2] == "d" and line[3] == " " {
+        let title = ""
+        for i in range(4, len(line)) {
+            title = title + line[i]
+        }
+        push(todos, {"title": title, "done": false})
+        print("Added: {title}")
+    } elif len(line) >= 5 and line[0] == "d" and line[1] == "o" and line[2] == "n" and line[3] == "e" and line[4] == " " {
+        let num_text = ""
+        for i in range(5, len(line)) {
+            num_text = num_text + line[i]
+        }
+        let n = num(num_text)
+        if n >= 1 and n <= len(todos) {
+            todos[n - 1]["done"] = true
+            print("Done: {todos[n - 1]["title"]}")
+        } else {
+            print("No todo number {n}.")
+        }
+    } else {
+        print("Unknown command. Try: add <task> | list | done <number> | quit")
+    }
+}

@@ -1,0 +1,82 @@
+# calculator.kbr -- a simple calculator loop.
+# Type an expression like "2 + 3" or "2+3", or "quit" to stop.
+# Supported: + - * / on two numbers (spaces optional).
+
+func calc(a, op, b) {
+    if op == "+" {
+        return a + b
+    } elif op == "-" {
+        return a - b
+    } elif op == "*" {
+        return a * b
+    } elif op == "/" {
+        if b == 0 {
+            print("Error: division by zero.")
+            return null
+        }
+        return a / b
+    } else {
+        print("Unknown operator '{op}'. Use + - * /")
+        return null
+    }
+}
+
+print("Calculator -- type like '2 + 3', or 'quit' to stop.")
+
+while true {
+    let line = input("calc> ")
+    if line == "quit" {
+        print("Goodbye!")
+        break
+    }
+    # Find the operator: the first + - * / that is not a leading minus.
+    # This accepts both "2 + 3" and "2+3".
+    let op = ""
+    let op_pos = -1
+    let i = 0
+    if len(line) > 0 and line[0] == "-" {
+        i = 1
+    }
+    while i < len(line) {
+        let ch = line[i]
+        if ch == "+" or ch == "-" or ch == "*" or ch == "/" {
+            op = ch
+            op_pos = i
+            break
+        }
+        i = i + 1
+    }
+    if op_pos == -1 {
+        print("Use the form: number operator number, e.g. 2 + 3")
+        continue
+    }
+    # Collect the two operands, skipping any spaces.
+    let a_str = ""
+    let j = 0
+    while j < op_pos {
+        let ch = line[j]
+        if ch != " " {
+            a_str = a_str + ch
+        }
+        j = j + 1
+    }
+    let b_str = ""
+    let k = op_pos + 1
+    while k < len(line) {
+        let ch = line[k]
+        if ch != " " {
+            b_str = b_str + ch
+        }
+        k = k + 1
+    }
+    if len(a_str) == 0 or len(b_str) == 0 {
+        print("Use the form: number operator number, e.g. 2 + 3")
+        continue
+    }
+    let a = num(a_str)
+    let b = num(b_str)
+    let result = calc(a, op, b)
+    if result != null {
+        print("{a} {op} {b} = {result}")
+    }
+}

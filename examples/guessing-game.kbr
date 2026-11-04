@@ -1,0 +1,21 @@
+# guessing-game.kbr -- guess the secret number.
+# There is no random built-in in Kabir yet, so the secret is fixed
+# at 42. Change it below if you want a different game.
+
+let secret = 42
+let attempts = 0
+
+print("I'm thinking of a number between 1 and 100. Guess it!")
+
+while true {
+    let guess = num(input("Your guess: "))
+    attempts += 1
+    if guess == secret {
+        print("You got it in {attempts} tries! The number was {secret}.")
+        break
+    } elif guess < secret {
+        print("Too low -- try again.")
+    } else {
+        print("Too high -- try again.")
+    }
+}

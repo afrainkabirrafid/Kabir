@@ -1,0 +1,13 @@
+# fibonacci.kbr -- recursive fib(n), first 15 numbers.
+
+func fib(n) {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+print("First 15 Fibonacci numbers:")
+for i in range(15) {
+    print(fib(i))
+}
