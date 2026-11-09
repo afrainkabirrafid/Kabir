@@ -24,7 +24,7 @@ class TestExamples(unittest.TestCase):
         proc = run_example("hello.kbr")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Hello, Rafid!", proc.stdout)
-        self.assertIn("Welcome to Kabir version 1.0.0.", proc.stdout)
+        self.assertIn("Welcome to Kabir version 1.1.0.", proc.stdout)
         self.assertIn("2 + 3 = 5", proc.stdout)
 
     def test_fizzbuzz(self):
@@ -57,12 +57,14 @@ class TestExamples(unittest.TestCase):
         self.assertEqual(len(primes), 25)
 
     def test_guessing_game(self):
-        proc = run_example("guessing-game.kbr", "10\n50\n42\n")
+        # The secret is random (1-100), so sweep every possible secret
+        # and assert only the success line -- never a specific number.
+        guesses = "\n".join(str(n) for n in range(1, 101)) + "\n"
+        proc = run_example("guessing-game.kbr", guesses)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("Too low", proc.stdout)
-        self.assertIn("Too high", proc.stdout)
-        self.assertIn("You got it in 3 tries! The number was 42.",
-                      proc.stdout)
+        self.assertIn("You got it in", proc.stdout)
+        self.assertIn("tries!", proc.stdout)
+        self.assertIn("The number was", proc.stdout)
 
     def test_sorting(self):
         proc = run_example("sorting.kbr")
@@ -94,7 +96,7 @@ class TestCli(unittest.TestCase):
         proc = subprocess.run([PYTHON, "-m", "kabir", "--version"],
                               capture_output=True, text=True, cwd=ROOT)
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout.strip(), "kabir 1.0.0")
+        self.assertEqual(proc.stdout.strip(), "kabir 1.1.0")
 
     def test_help(self):
         proc = subprocess.run([PYTHON, "-m", "kabir", "--help"],

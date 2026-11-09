@@ -79,6 +79,34 @@ class TestLexer(unittest.TestCase):
         with self.assertRaises(KabirError):
             tokenize("let x = @")
 
+    def test_dot_method_call_tokens(self):
+        toks = tokenize('"abc".upper()')
+        self.assertEqual([(t.kind, t.value) for t in toks],
+                         [("STRING", [("lit", "abc")]),
+                          ("PUNCT", "."), ("IDENT", "upper"),
+                          ("PUNCT", "("), ("PUNCT", ")"), ("EOF", None)])
+
+    def test_numbers_with_dot_still_one_token(self):
+        tok = tokenize("3.5")[0]
+        self.assertEqual(tok.kind, "NUMBER")
+        self.assertEqual(tok.value, 3.5)
+        tok = tokenize("3.14")[0]
+        self.assertEqual(tok.kind, "NUMBER")
+        self.assertEqual(tok.value, 3.14)
+
+    def test_dot_inside_string_is_not_a_token(self):
+        toks = tokenize('"a.b"')
+        self.assertEqual(len(toks), 2)  # STRING + EOF
+        self.assertEqual(toks[0].kind, "STRING")
+        self.assertEqual(toks[0].value, [("lit", "a.b")])
+
+    def test_import_keyword(self):
+        toks = tokenize('import "utils/helpers.kbr"')
+        self.assertEqual([(t.kind, t.value) for t in toks],
+                         [("KEYWORD", "import"),
+                          ("STRING", [("lit", "utils/helpers.kbr")]),
+                          ("EOF", None)])
+
     def test_line_numbers(self):
         toks = tokenize("let a = 1\nlet b = 2")
         b = [t for t in toks if t.value == "b"][0]

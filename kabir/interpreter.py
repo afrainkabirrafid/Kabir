@@ -5,8 +5,13 @@ no dynamic code runs, no transpiling. Lexical scoping via chained
 Environment objects; closures capture their defining environment.
 """
 
+import math
+import os
+import random
+
 from . import ast_nodes as ast
 from .builtins import build_builtins, BuiltinFunction, _type_name
+from .stdlib import STRING_METHODS, build_stdlib
 from .errors import KabirError, error_at
 from .parser import parse as _parse_source
 
@@ -87,8 +92,15 @@ class Interpreter:
         self.filename = filename
         self.lines = source.split("\n") if source else []
         self.globals = Environment()
+        self.modules = {}    # canonical path -> exported-bindings dict
+        self._importing = []  # canonical paths currently being executed
         for name, fn in build_builtins().items():
             self.globals.define(name, fn)
+        self._random = random.Random()
+        for name, fn in build_stdlib().items():
+            self.globals.define(name, fn)
+        self.globals.define("pi", math.pi)
+        self.globals.define("e", math.e)
         self.function_depth = 0
         self.loop_depth = 0
         self.call_depth = 0
@@ -318,6 +330,81 @@ class Interpreter:
         self.run_block(stmt)
         return None
 
+    # -- imports -------------------------------------------------------
+    def _save_file_state(self):
+        """Snapshot the current file context + scoping depths."""
+        return (self.filename, self.source, self.lines,
+                self.function_depth, self.loop_depth)
+
+    def _restore_file_state(self, saved):
+        (self.filename, self.source, self.lines,
+         self.function_depth, self.loop_depth) = saved
+
+    def _run_ImportStmt(self, stmt):
+        self._load_module(stmt.path, stmt)
+        return None
+
+    def _load_module(self, path, node):
+        # Resolve relative to the importing file's directory; with no
+        # importing file (REPL "<repl>", "<stdin>", tests) relative to
+        # the process working directory.
+        if self.filename.startswith("<"):
+            base = os.getcwd()
+        else:
+            base = os.path.dirname(os.path.abspath(self.filename))
+        resolved = os.path.join(base, path)
+        canonical = os.path.realpath(os.path.abspath(resolved))
+        # Cycle: this file is already being executed further up the stack.
+        if canonical in self._importing:
+            chain = [os.path.basename(p) for p in self._importing]
+            chain.append(os.path.basename(canonical))
+            self.error(node, "Import cycle detected: %s"
+                       % " -> ".join(chain))
+        # Cache hit: copy the exported bindings, no file I/O.
+        if canonical in self.modules:
+            for name, value in self.modules[canonical].items():
+                self._current_env().define(name, value)
+            return None
+        # Read (UTF-8, like cli.run_file); convert I/O failures to
+        # Kabir errors at the import statement -- never a traceback.
+        try:
+            with open(canonical, "r", encoding="utf-8") as handle:
+                source = handle.read()
+        except FileNotFoundError:
+            self.error(node, 'Cannot import "%s" -- no such file' % path)
+        except UnicodeDecodeError:
+            self.error(node, 'Cannot import "%s" -- the file is not '
+                       'valid UTF-8' % path)
+        except OSError as exc:
+            self.error(node, 'Cannot import "%s" -- %s' % (path, exc))
+        # Parse; a KabirError propagates unchanged (it already points
+        # at the imported file).
+        program = _parse_source(source, canonical)
+        # Execute once, in a fresh module env under the globals.
+        module_env = Environment(self.globals)
+        saved = self._save_file_state()
+        prev_env = self._current_env()
+        self.filename = canonical
+        self.source = source
+        self.lines = source.split("\n")
+        self.function_depth = 0
+        self.loop_depth = 0
+        self._importing.append(canonical)
+        self._push_env(module_env)
+        try:
+            for stmt in program.statements:
+                self.run_stmt(stmt)
+        finally:
+            self._pop_env(prev_env)
+            self._importing.pop()
+            self._restore_file_state(saved)
+        # Only a successful run is cached, then copied to the importer.
+        exports = dict(module_env.vars)
+        self.modules[canonical] = exports
+        for name, value in exports.items():
+            self._current_env().define(name, value)
+        return None
+
     # -- blocks / environments -----------------------------------------
     def _env_stack(self):
         if not hasattr(self, "_stack"):
@@ -520,6 +607,23 @@ class Interpreter:
                        "that you are calling the right name" % callee)
         self.error(node, "This value (%s) is not a function, so it cannot "
                    "be called" % _type_name(callee))
+
+    def _compute_Member(self, expr):
+        receiver = self.compute(expr.object)
+        if isinstance(receiver, str):
+            if expr.name in STRING_METHODS:
+                def bound(interp, node, args,
+                          _name=expr.name, _recv=receiver):
+                    return STRING_METHODS[_name](interp, node, _recv, args)
+                return BuiltinFunction(expr.name, bound)
+            self.error(expr, "No method '.%s' on a string -- strings have "
+                       "no method named '%s'" % (expr.name, expr.name))
+        if isinstance(receiver, dict):
+            self.error(expr, "Cannot use .%s on a dict -- write "
+                       'dict["%s"] instead (for example, user["name"])'
+                       % (expr.name, expr.name))
+        self.error(expr, "Cannot use .%s on a %s -- only strings have "
+                   "methods" % (expr.name, _type_name(receiver)))
 
     def _compute_Index(self, expr):
         target = self.compute(expr.target)

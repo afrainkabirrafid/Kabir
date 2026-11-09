@@ -83,6 +83,52 @@ class TestParser(unittest.TestCase):
         self.assertIsInstance(node, ast.DictLiteral)
         self.assertEqual([k for k, _ in node.pairs], ["a", "b"])
 
+    def test_string_method_call(self):
+        node = expr('"abc".upper()')
+        self.assertIsInstance(node, ast.Call)
+        self.assertIsInstance(node.callee, ast.Member)
+        self.assertEqual(node.callee.name, "upper")
+        self.assertIsInstance(node.callee.object, ast.StringLiteral)
+        self.assertEqual(node.args, [])
+
+    def test_index_after_method_call(self):
+        node = expr('"abc".upper()[0]')
+        self.assertIsInstance(node, ast.Index)
+        self.assertIsInstance(node.target, ast.Call)
+        self.assertIsInstance(node.target.callee, ast.Member)
+        self.assertEqual(node.target.callee.name, "upper")
+
+    def test_chained_method_calls(self):
+        node = expr('"abc".upper().upper()')
+        self.assertIsInstance(node, ast.Call)
+        self.assertIsInstance(node.callee, ast.Member)
+        self.assertEqual(node.callee.name, "upper")
+        self.assertIsInstance(node.callee.object, ast.Call)
+        self.assertIsInstance(node.callee.object.callee, ast.Member)
+
+    def test_import_statement(self):
+        stmt = parse('import "helpers.kbr"').statements[0]
+        self.assertIsInstance(stmt, ast.ImportStmt)
+        self.assertEqual(stmt.path, "helpers.kbr")
+
+    def test_import_interpolated_path_errors(self):
+        with self.assertRaises(KabirError) as ctx:
+            parse('import "dir/{name}.kbr"')
+        self.assertIn("plain string", str(ctx.exception))
+
+    def test_import_non_kbr_path_errors(self):
+        with self.assertRaises(KabirError) as ctx:
+            parse('import "notes.txt"')
+        self.assertIn(".kbr", str(ctx.exception))
+
+    def test_import_bare_name_errors(self):
+        with self.assertRaises(KabirError):
+            parse("import some_var")
+
+    def test_import_computed_path_errors(self):
+        with self.assertRaises(KabirError):
+            parse('import "a.kbr" + ".kbr"')
+
     def test_missing_expression_is_syntax_error(self):
         with self.assertRaises(KabirError) as ctx:
             parse("let x = ")

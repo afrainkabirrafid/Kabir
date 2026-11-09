@@ -1,0 +1,5 @@
+# greet-lib.kbr -- small reusable helpers (imported by import-demo.kbr).
+func greet(name) {
+    return "Hello, " + name + "!"
+}
+let version_note = "imported from greet-lib.kbr"

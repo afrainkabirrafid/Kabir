@@ -1,4 +1,4 @@
-# Kabir Language Reference — version 1.0.0
+# Kabir Language Reference — version 1.1.0
 
 This is the complete reference for the Kabir language. Every code block in this document is a real, runnable Kabir program, and every output block is the exact output it produces. Run any example with:
 
@@ -22,6 +22,7 @@ For how to run programs, start the REPL, and read error messages, see the [READM
 - [Variables](#variables)
 - [Operators](#operators)
 - [Strings and interpolation](#strings-and-interpolation)
+- [String methods](#string-methods)
 - [Arrays](#arrays)
 - [Dicts](#dicts)
 - [Truthiness](#truthiness)
@@ -30,7 +31,9 @@ For how to run programs, start the REPL, and read error messages, see the [READM
 - [for](#for)
 - [break and continue](#break-and-continue)
 - [Functions](#functions)
+- [Import](#import)
 - [Built-in functions](#built-in-functions)
+- [Standard library](#standard-library)
 - [Errors](#errors)
 - [What Kabir does not have (yet)](#what-kabir-does-not-have-yet)
 
@@ -515,6 +518,166 @@ r
 
 Strings are immutable through indexing — `word[0] = "X"` is an error; only arrays and dicts support index assignment (see [Arrays](#arrays) and [Dicts](#dicts)).
 
+## String methods
+
+Strings have methods, called with a dot: `"abc".upper()`. The dot is only for string methods — dicts still use brackets (`user["name"]`, not `user.name`), and using a dot on anything that is not a string is an error (see below). There is no `length()` method: `len("abc")` already does that.
+
+Methods return new values; they never change the string they are called on (strings are immutable). A method call is an expression, so it works anywhere an expression works — including inside `{ ... }` interpolation, chained with other methods, and followed by indexing.
+
+```kabir
+print("abc".upper())
+print("ABC".lower())
+print("  padded  ".strip())
+print("a,b,c".split(","))
+print("a b  c".split())
+print(", ".join(["a", "b", "c"]))
+print("hello".contains("ell"))
+print("hello".contains("z"))
+print("hello".starts_with("he"))
+print("hello".ends_with("lo"))
+print("aaa".replace("a", "b"))
+print(" a ".strip().upper())
+print("a b".split(" ")[1])
+```
+
+Output:
+
+```text
+ABC
+abc
+padded
+[a, b, c]
+[a, b, c]
+a, b, c
+true
+false
+true
+true
+bbb
+A
+b
+```
+
+### upper
+
+`"abc".upper()` returns the string in upper case. It takes no arguments.
+
+### lower
+
+`"ABC".lower()` returns the string in lower case. It takes no arguments.
+
+### strip
+
+`"  padded  ".strip()` returns the string with leading and trailing whitespace removed. It takes no arguments — there is no `strip(chars)` form, so `strip(",")` is an argument-count error.
+
+### split
+
+`"a,b,c".split(",")` splits on the separator and returns an array of strings. With no argument, `split()` splits on runs of whitespace and drops empty pieces (`"a b  c".split()` is `["a", "b", "c"]`). The separator must be a non-empty string.
+
+```kabir
+print("a,b".split(""))
+```
+
+Error:
+
+```text
+demo.kbr:1:18: split() needs a non-empty separator
+  print("a,b".split(""))
+                   ^
+```
+
+### join
+
+`", ".join(["a", "b", "c"])` joins an array of strings, using the receiver as the separator. The argument must be an array, and every item in it must be a string.
+
+### contains
+
+`"hello".contains("ell")` is `true` when the string contains the argument as a substring, `false` otherwise. The argument must be a string.
+
+### starts_with
+
+`"hello".starts_with("he")` is `true` when the string starts with the argument. The argument must be a string. (Note the underscore: it is `starts_with`, not `startswith`.)
+
+### ends_with
+
+`"hello".ends_with("lo")` is `true` when the string ends with the argument. The argument must be a string. (Note the underscore: it is `ends_with`, not `endswith`.)
+
+### replace
+
+`"aaa".replace("a", "b")` replaces **all** occurrences of the first argument with the second. Both arguments must be strings. There is no count argument — every occurrence is replaced.
+
+### Methods inside interpolation, and stored methods
+
+A method call inside `{ ... }` works like any other expression:
+
+```kabir
+print("shout: {"abc".upper()}")
+```
+
+Output:
+
+```text
+shout: ABC
+```
+
+A method is a value too: `"abc".upper` (without the call) is a function you can store in a variable and call later. It stays bound to the string it came from:
+
+```kabir
+let u = "abc".upper
+print(u())
+```
+
+Output:
+
+```text
+ABC
+```
+
+### Errors
+
+Using a dot on something that is not a string is an error, and the message names the type:
+
+```kabir
+print([1, 2].upper())
+```
+
+Error:
+
+```text
+demo.kbr:1:13: Cannot use .upper on a array -- only strings have methods
+  print([1, 2].upper())
+              ^
+```
+
+A dot on a dict gets a pointer at the Kabir way instead:
+
+```kabir
+let user = {"name": "Rafid"}
+print(user.name)
+```
+
+Error:
+
+```text
+demo.kbr:2:11: Cannot use .name on a dict -- write dict["name"] instead (for example, user["name"])
+  print(user.name)
+            ^
+```
+
+An unknown method on a string is an error naming the method:
+
+```kabir
+print("a".frobnicate())
+```
+
+Error:
+
+```text
+demo.kbr:1:10: No method '.frobnicate' on a string -- strings have no method named 'frobnicate'
+  print("a".frobnicate())
+           ^
+```
+
 ## Arrays
 
 Array literals use `[` and `]`, with items of any type — including mixed types and nested arrays.
@@ -664,7 +827,7 @@ demo.kbr:2:9: No key 'b' in this dict -- available keys: "a"
           ^
 ```
 
-Dict keys must be strings — `d[0]` is an error. (There is no dot access: write `user["name"]`, not `user.name`.)
+Dict keys must be strings — `d[0]` is an error. Dicts still use brackets: write `user["name"]`, not `user.name`. Strings, though, have methods: `"abc".upper()`. See [String methods](#string-methods).
 
 ## Truthiness
 
@@ -1007,9 +1170,143 @@ Output:
 
 (This is `examples/fibonacci.kbr`, extended to the first 10 numbers; the example file itself prints the first 15.)
 
+## Import
+
+`import` loads another `.kbr` file and brings its top-level bindings into the importing file. It is a statement: the keyword `import` followed by a plain string literal holding the path.
+
+```kabir
+import "utils/helpers.kbr"
+import "lib/math-tools.kbr"
+```
+
+The path must be a plain string literal — an interpolated path (`import "dir/{name}.kbr"`) or a computed path (`import some_var`) is a parse error:
+
+```kabir
+import "dir/{x}.kbr"
+```
+
+Error:
+
+```text
+demo.kbr:1:8: import paths must be plain strings, not interpolated ones
+  import "dir/{x}.kbr"
+         ^
+```
+
+The path must end in `.kbr` — anything else is also a parse error:
+
+```kabir
+import "notes.txt"
+```
+
+Error:
+
+```text
+demo.kbr:1:8: import "notes.txt" must name a .kbr file
+  import "notes.txt"
+         ^
+```
+
+### Where the path points
+
+The path resolves **relative to the importing file's directory**, never to the process working directory. `import "helpers.kbr"` in `/home/rafid/proj/main.kbr` loads `/home/rafid/proj/helpers.kbr`, even when you run `kabir run proj/main.kbr` from elsewhere. A file imported by an imported file resolves relative to *its own* directory, not the entry file's. An absolute path in the string is honoured as-is. In the REPL there is no importing file, so the path resolves relative to the working directory.
+
+There is no search path and no `..` sandboxing: `import "../shared.kbr"` is allowed.
+
+### What an import brings in
+
+All top-level bindings of the imported file come in **flat** — `let`s and `func`s defined at the top level of the imported file become visible in the importing file's scope, exactly as if you had defined them there. There are no namespaces, no `as` alias, and no selective import: importing a file always brings in all of its top-level bindings.
+
+- **Only top-level bindings are exported.** A `let` inside a function or a block in the imported file stays local to that function or block.
+- **Name collisions overwrite silently.** If the importer already has a name the module also defines, the import overwrites it — the same rule as redefining a name with `let`. There is no collision warning in 1.1.0.
+- **Mutable values are shared, not copied.** If the module defines `let scores = [1, 2]` and the importer `push`es onto it, the module's functions see the change. Function values are shared too: two importers of the same module get the same function objects.
+- **Bindings are visible only after the `import` statement.** An `import` at the bottom of a file cannot be used at the top. The convention is imports at the top of the file.
+- **The imported file runs in its own scope.** Its functions close over the module's own bindings, not the importer's variables, so a module helper cannot accidentally read (or be broken by) the importer's later `let`s. Its top-level `print`s and other side effects run at import time.
+
+`import` is now a reserved word: it cannot be used as a variable or function name.
+
+### Each file runs once (module cache)
+
+Kabir remembers every file it has imported, keyed by its canonical (absolute, resolved) path, so `./utils.kbr`, `utils.kbr`, and `sub/../utils.kbr` are the same module. Re-importing a file does **not** re-execute it — the cached bindings are simply copied into the current scope again. Diamond imports work and are cheap: if `main.kbr` imports `b.kbr` and `c.kbr`, and both import `d.kbr`, `d.kbr` runs once.
+
+A file is cached only after it executes successfully. And there is no `reload`: editing a file on disk and re-importing it in the same run — or the same REPL session — does **not** pick up the change; the cached bindings are returned.
+
+### Cycles are an error
+
+If two files import each other, Kabir reports the cycle instead of looping forever. The error names the whole chain and points at the `import` statement that closed the cycle:
+
+```kabir
+# main.kbr imports a.kbr, a.kbr imports b.kbr, b.kbr imports a.kbr
+```
+
+Error:
+
+```text
+b.kbr:1:1: Import cycle detected: a.kbr -> b.kbr -> a.kbr
+  import "a.kbr"
+  ^
+```
+
+One honest wrinkle: the chain lists the files Kabir was in the middle of *importing* when the cycle closed. The entry file — the file you ran — is loaded directly, not imported, so it never appears in the chain. If the entry file itself is part of the cycle (say `a.kbr` run directly, importing `b.kbr`, which imports `a.kbr`), the cycle is detected one re-entry later and the chain reads `b.kbr -> a.kbr -> b.kbr`. Either way, mutually recursive functions across two files are not possible in 1.1.0 — that is a documented limitation, not a common program shape for a small language. Self-import (`a.kbr` importing `"a.kbr"`) errors the same way.
+
+### Errors in an imported file
+
+Errors inside an imported file are Kabir errors, never Python tracebacks:
+
+- **Missing file** — a Kabir error at the `import` statement in the importing file:
+
+```kabir
+import "nope.kbr"
+```
+
+Error:
+
+```text
+demo.kbr:1:1: Cannot import "nope.kbr" -- no such file
+  import "nope.kbr"
+  ^
+```
+
+An unreadable or non-UTF-8 file errors the same way, at the same place.
+
+- **Syntax or runtime errors inside the imported file** — the error propagates unchanged, pointing at the imported file's own line and column. An error on the line *after* an import still points at the importing file, not the imported one.
+- **A top-level `return`, `break`, or `continue` in an imported file** — the same error as in any file (`'return' can only be used inside a function`, and so on).
+
+### Import inside a function or block
+
+`import` is allowed anywhere a statement is allowed, and its bindings land in the scope current at the `import` statement. An import inside a block does not leak out of the block; an import inside a function body executes on each call (cheap after the first, because the cache copy still runs). Put imports at the top of the file unless you have a reason not to.
+
+### Worked example
+
+`examples/import-demo.kbr` imports `examples/greet-lib.kbr`, a small library file with only `let`/`func` at the top level and no prints:
+
+```kabir
+# greet-lib.kbr -- small reusable helpers (imported by import-demo.kbr).
+func greet(name) {
+    return "Hello, " + name + "!"
+}
+let version_note = "imported from greet-lib.kbr"
+```
+
+```kabir
+# import-demo.kbr -- shows import: load greet-lib.kbr and use it.
+import "greet-lib.kbr"
+print(greet("Rafid"))
+print(version_note)
+```
+
+Output:
+
+```text
+Hello, Rafid!
+imported from greet-lib.kbr
+```
+
 ## Built-in functions
 
-Kabir has 15 built-in functions. They are available in every program — no import needed — and they live in the global environment, so a `let` with the same name in your program shadows the built-in in that scope. Every built-in checks its argument count and types and reports mistakes in the same friendly error format.
+Kabir has 15 core built-in functions. They are available in every program — no import needed — and they live in the global environment, so a `let` with the same name in your program shadows the built-in in that scope. Every built-in checks its argument count and types and reports mistakes in the same friendly error format.
+
+The math functions `sqrt`, `pow`, and `abs` live in this section; the rest of the math library (`floor`, `ceil`, `sin`, `cos`, `tan`, `log`, `exp`, `pi`, `e`) and the `random` functions are in [Standard library](#standard-library), documented in the same style.
 
 ### print
 
@@ -1325,6 +1622,187 @@ Output:
 
 (`float(2)` is `2.0` internally, and Kabir prints whole-number floats as `2` — see [Numbers](#numbers).)
 
+## Standard library
+
+The standard library is 12 functions plus the constants `pi` and `e`, all plain globals — available in every program with no import, just like the core built-ins above. `sqrt`, `pow`, and `abs` stay in [Built-in functions](#built-in-functions) and are documented there; the functions below join them to make one math library. There are no new global string functions: string helpers are the [methods](#string-methods).
+
+Each run — and each REPL session — has its own random sequence (see `seed`).
+
+### randint
+
+`randint(a, b)` returns a random whole number from `a` to `b`, **both ends included**. Both arguments must be whole numbers, and `a` must not be greater than `b`. This is the guessing-game primitive: `randint(1, 100)`.
+
+```kabir
+print(randint(10, 1))
+```
+
+Error:
+
+```text
+demo.kbr:1:14: randint() needs the first number to be no greater than the second, but got 10 and 1
+  print(randint(10, 1))
+               ^
+```
+
+### randrange
+
+`randrange(n)` returns one random whole number from `range(n)` — that is, from `0` to `n - 1`. `randrange(a, b)` returns one from `range(a, b)`. Arguments must be whole numbers, and the range must not be empty (`randrange(0)` and `randrange(5, 2)` are errors).
+
+### choice
+
+`choice(array)` returns one random item from an array, of any type. The argument must be an array, and it must not be empty.
+
+```kabir
+print(choice([]))
+```
+
+Error:
+
+```text
+demo.kbr:1:13: choice() cannot choose from an empty array
+  print(choice([]))
+              ^
+```
+
+### shuffle
+
+`shuffle(array)` shuffles an array **in place** and returns the same array — the same mutate-and-return convention as `push()`. The argument must be an array.
+
+### seed
+
+`seed(n)` seeds the random sequence, so the numbers after it are deterministic — the same seed always gives the same sequence. It returns `null`. The argument must be a whole number. `seed` is for tests and repeatable demos; the shipped examples never seed the game itself (see `examples/guessing-game.kbr`).
+
+```kabir
+seed(7)
+print(randint(1, 100))
+print(randint(1, 100))
+print(randrange(10))
+print(randrange(5, 10))
+print(choice(["red", "green", "blue"]))
+let deck = [1, 2, 3, 4, 5]
+print(shuffle(deck))
+print(deck)
+seed(7)
+print(randint(1, 100))
+```
+
+Output:
+
+```text
+42
+20
+6
+5
+red
+[3, 4, 2, 1, 5]
+[3, 4, 2, 1, 5]
+42
+```
+
+### floor
+
+`floor(x)` returns the greatest whole number less than or equal to `x`, as a number. The argument must be a number.
+
+### ceil
+
+`ceil(x)` returns the least whole number greater than or equal to `x`, as a number. The argument must be a number.
+
+```kabir
+print(floor(3.7))
+print(floor(0 - 3.2))
+print(ceil(3.2))
+print(ceil(4))
+```
+
+Output:
+
+```text
+3
+-4
+4
+4
+```
+
+### sin
+
+`sin(x)` returns the sine of `x`. The angle is in **radians, not degrees** — there is no degree variant in 1.1.0, so `sin(90)` is not `1`; `sin(pi / 2)` is. The argument must be a number, and the result is a float.
+
+### cos
+
+`cos(x)` returns the cosine of `x`, in **radians** like `sin`. The argument must be a number.
+
+### tan
+
+`tan(x)` returns the tangent of `x`, in **radians** like `sin`. The argument must be a number.
+
+```kabir
+print(sin(0))
+print(cos(0))
+print(sin(pi / 2))
+```
+
+Output:
+
+```text
+0
+1
+1
+```
+
+### log
+
+`log(x)` returns the natural logarithm of `x` (base `e`), with one argument only — there is no `log(x, base)` form. The argument must be a number greater than 0.
+
+```kabir
+print(log(0))
+```
+
+Error:
+
+```text
+demo.kbr:1:10: log() needs a number greater than 0, not 0
+  print(log(0))
+           ^
+```
+
+### exp
+
+`exp(x)` returns `e` to the power of `x`. The argument must be a number. A result too large to calculate is a friendly error, like the `**` overflow error.
+
+```kabir
+print(log(1))
+print(log(10))
+print(exp(0))
+print(exp(1))
+```
+
+Output:
+
+```text
+0
+2.302585092994046
+1
+2.718281828459045
+```
+
+### pi and e
+
+`pi` and `e` are global numbers — the constants `3.141592653589793` and `2.718281828459045` — not functions. Like any built-in name, a `let` with the same name in your program shadows them in that scope. `type(pi)` is `"number"`.
+
+```kabir
+print(pi)
+print(e)
+print(type(pi))
+```
+
+Output:
+
+```text
+3.141592653589793
+2.718281828459045
+number
+```
+
 ## Errors
 
 Every Kabir error has the same shape: `file:line:col`, a plain-language message, the offending source line, and a caret pointing at the problem. There are no Python tracebacks. Lex errors (bad characters, unterminated strings), parse errors (missing `}`, a bad expression), and runtime errors (undefined variable, division by zero, wrong argument count) all render this way.
@@ -1377,12 +1855,11 @@ Exit code is `1` for a Kabir error, `2` for a usage error (unknown command, miss
 
 ## What Kabir does not have (yet)
 
-To avoid surprises, the things people most often expect that are **not** in 1.0.0:
+To avoid surprises, the things people most often expect that are **not** in 1.1.0:
 
-- **`import`** — a program is a single `.kbr` file; there is no way to load another file.
-- **File I/O, random numbers, dates, networking** — `print` and `input` are the only way in or out.
+- **File I/O, dates, networking** — `print` and `input` are the only way in or out (plus `import`, which reads `.kbr` files).
 - **Dot access on dicts** — write `user["name"]`, not `user.name`.
-- **String methods, `switch`/`match`, `else` on loops, ternary `?:`** — none of these exist; `if`/`elif`/`else` covers the conditional ground.
+- **`switch`/`match`, `else` on loops, ternary `?:`** — none of these exist; `if`/`elif`/`else` covers the conditional ground.
 - **A step argument for `range()`** — `range(a, b)` only; there is no `range(a, b, step)`.
 - **Assignment as an expression** — `let x = y = 1` and `print(x = 1)` are errors.
 - **Tail-call optimisation** — recursion is capped at 500 nested calls.

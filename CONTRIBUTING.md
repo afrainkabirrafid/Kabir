@@ -11,7 +11,7 @@ $ git clone https://github.com/afrainkabirrafid/kabir.git
 $ cd kabir
 $ python -m kabir run examples/hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 1.0.0.
+Welcome to Kabir version 1.1.0.
 2 + 3 = 5
 ```
 
@@ -21,7 +21,7 @@ The test suite is plain `unittest`, run by a small runner. Run it before you sta
 
 ```console
 $ python tests/run_tests.py
-Ran 90 tests in 0.579s
+Ran 176 tests in 0.818s
 
 OK
 ```

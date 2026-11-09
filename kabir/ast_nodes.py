@@ -91,6 +91,12 @@ class ContinueStmt(Node):
     pass
 
 
+class ImportStmt(Node):
+    def __init__(self, path, line=None, col=None):
+        super().__init__(line, col)
+        self.path = path    # plain string, e.g. "utils/helpers.kbr"
+
+
 # --- Expressions ------------------------------------------------------
 
 class Literal(Node):
@@ -152,3 +158,10 @@ class Index(Node):
         super().__init__(line, col)
         self.target = target
         self.index = index
+
+
+class Member(Node):
+    def __init__(self, object, name, line=None, col=None):
+        super().__init__(line, col)
+        self.object = object  # receiver expression node
+        self.name = name      # method name as a plain string

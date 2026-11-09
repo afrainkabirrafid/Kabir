@@ -1,6 +1,6 @@
 # Kabir Architecture — how the interpreter works
 
-This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 1.0.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
+This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 1.1.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
 
 ## The big picture
 
@@ -11,11 +11,12 @@ source text ──► Lexer ──► tokens ──► Parser ──► AST ─�
    kabir/lexer.py      kabir/parser.py   kabir/ast_nodes.py   kabir/interpreter.py
 ```
 
-- `kabir/lexer.py` (~205 lines) — source text → token stream.
-- `kabir/parser.py` (~376 lines) — tokens → AST (recursive descent).
-- `kabir/ast_nodes.py` (~154 lines) — one small class per AST node.
-- `kabir/interpreter.py` (~564 lines) — walks the AST and runs it.
-- `kabir/builtins.py` (~237 lines) — the 15 built-in functions.
+- `kabir/lexer.py` (~206 lines) — source text → token stream.
+- `kabir/parser.py` (~400 lines) — tokens → AST (recursive descent).
+- `kabir/ast_nodes.py` (~167 lines) — one small class per AST node.
+- `kabir/interpreter.py` (~668 lines) — walks the AST and runs it.
+- `kabir/builtins.py` (~237 lines) — the 15 core built-in functions.
+- `kabir/stdlib.py` (~265 lines) — the 12 standard-library functions (`random`, `math`) and the `STRING_METHODS` table.
 - `kabir/errors.py` (~49 lines) — the `KabirError` type and its rendering.
 - `kabir/cli.py` (~165 lines) — `run` / `repl` / `--help` / `--version`.
 - `kabir/__init__.py` — version, author, and the public API (`Interpreter`, `parse`, `tokenize`, `KabirError`).
@@ -36,15 +37,15 @@ Everything is standard library only. There are no third-party dependencies, and 
 | `IDENT` | The name | `score`, `my_var` |
 | `KEYWORD` | The keyword text | `let`, `if`, `true`, `and`, … |
 | `OP` | The operator text | `+`, `**`, `==`, `+=`, … |
-| `PUNCT` | The punctuation character | `(`, `)`, `{`, `}`, `[`, `]`, `,`, `;`, `:` |
+| `PUNCT` | The punctuation character | `(`, `)`, `{`, `}`, `[`, `]`, `,`, `;`, `:`, `.` |
 | `NEWLINE` | `"\n"` | Statement separator |
 | `EOF` | `None` | End of input |
 
-Keywords are recognised in `_ident()`: an identifier whose text is in the `KEYWORDS` set (`let`, `func`, `return`, `if`, `elif`, `else`, `while`, `for`, `in`, `break`, `continue`, `true`, `false`, `null`, `and`, `or`, `not`) becomes a `KEYWORD` token; anything else is an `IDENT`. Identifiers start with a letter or `_` and continue with letters, digits, or `_`.
+Keywords are recognised in `_ident()`: an identifier whose text is in the `KEYWORDS` set (`let`, `func`, `return`, `if`, `elif`, `else`, `while`, `for`, `in`, `break`, `continue`, `true`, `false`, `null`, `and`, `or`, `not`, `import`) becomes a `KEYWORD` token; anything else is an `IDENT`. Identifiers start with a letter or `_` and continue with letters, digits, or `_`. (`import` joined the set in 1.1.0; it is the one reserved-word change of that release.)
 
 ### Numbers
 
-`_number()` reads digits, then an optional `.` followed by digits. `42` becomes `int(42)`; `3.5` becomes `float(3.5)`. A `.` not followed by a digit is not part of the number — `3.` lexes `3` and then fails in the lexer with `Unexpected character '.'`, since `.` is not an operator or punctuation in Kabir. There is no exponent notation, no hex, no underscores in numbers.
+`_number()` reads digits, then an optional `.` followed by digits. `42` becomes `int(42)`; `3.5` becomes `float(3.5)`. A `.` not followed by a digit is not part of the number — `3.` lexes as `NUMBER(3)` followed by `PUNCT(.)` (`.` joined `PUNCT` in 1.1.0 for string methods) and fails later in the parser, since a bare `.` after a number is not a valid expression. Before 1.1.0 it failed in the lexer with `Unexpected character '.'`. There is no exponent notation, no hex, no underscores in numbers.
 
 ### Strings and interpolation
 
@@ -75,7 +76,7 @@ Lowest to highest, exactly as the code reads:
 or  →  and  →  equality (== !=)  →  comparison (< <= > >=)
     →  additive (+ -)  →  multiplicative (* / %)
     →  unary (-, not)  →  power (**)
-    →  postfix (call, index)  →  primary
+    →  postfix (call, index, member)  →  primary
 ```
 
 Each level is a method (`_or`, `_and`, `_equality`, `_comparison`, `_additive`, `_multiplicative`, `_unary`, `_power`, `_postfix`, `_primary`). The binary levels loop left-associatively; `**` is the exception.
@@ -95,6 +96,7 @@ Each level is a method (`_or`, `_and`, `_equality`, `_comparison`, `_additive`, 
 - `while` → condition, then a block.
 - `for` → `for <var> in <expression> <block>`.
 - `break` / `continue` → bare statements (the loop check happens at run time, not here).
+- `import` → `_import()`: the keyword plus a plain string-literal path, producing an `ImportStmt`. Two checks happen here, at parse time: an interpolated path is an error (*"import paths must be plain strings, not interpolated ones"* — the same rule as dict keys), and a path not ending in `.kbr` is an error (*'import "…" must name a .kbr file'*).
 - `{` → **the dict-literal disambiguation**: the parser peeks at the next two tokens, and if they are a `STRING` followed by `:`, the `{` starts a dict literal expression (`{"a": 1}`), not a block. Otherwise it is a block statement. This is the only two-token lookahead in the parser, and it is why a statement can never be a bare dict literal with a non-string first key — dict keys are strings by definition.
 - Anything else → `_expr_or_assign_stmt()`: parse an expression, and if `=`, `+=`, or `-=` follows, it must be an assignment whose target is a `Var` or an `Index` — anything else is an error (*"Only a variable or an index can be assigned to"*). Assignment is therefore a statement, never an expression.
 
@@ -103,7 +105,7 @@ Each level is a method (`_or`, `_and`, `_equality`, `_comparison`, `_additive`, 
 ### Expressions
 
 - `_primary()` handles numbers, string tokens (becoming `StringLiteral` nodes holding the lexer's parts list), `true`/`false`/`null` (becoming `Literal` nodes), identifiers, parenthesised expressions, array literals, dict literals, and anonymous `func` expressions. Dict keys must be string tokens whose parts are a single literal part — an interpolated key is a parse error.
-- `_postfix()` loops over `(` argument lists `)` and `[` index `]` suffixes, so `f(1)(2)`, `a[0][1]`, and `f(x)[0]` all parse. Argument lists and index brackets allow newlines inside them.
+- `_postfix()` loops over `(` argument lists `)`, `[` index `]` suffixes, and `.` member suffixes, so `f(1)(2)`, `a[0][1]`, `f(x)[0]`, `"abc".upper()`, and `" a ".strip().upper()` all parse. A `.` suffix consumes the dot, expects an `IDENT` (the method name — keywords are not valid method names), and wraps the expression in a `Member` node. Argument lists and index brackets allow newlines inside them.
 - Separators: `_skip_separators()` consumes `NEWLINE` and `;` tokens; the top-level `parse()` loop and `_block()` call it between statements, so newlines and semicolons are interchangeable as separators.
 
 ### Error reporting in the parser
@@ -114,9 +116,9 @@ Each level is a method (`_or`, `_and`, `_equality`, `_comparison`, `_additive`, 
 
 Every node subclasses `Node`, which carries `line` and `col`. The tree is plain data — no methods, no visitor pattern; the interpreter dispatches on node class name (see §4).
 
-Statements: `Program`, `Block`, `LetStmt`, `AssignStmt` (target + `=`/`+=`/`-=` + value), `ExprStmt`, `FuncDecl` (`name` may be `None` for anonymous functions), `ReturnStmt` (value may be `None`), `IfStmt` (a list of `(condition, Block)` branches plus an optional `else_body`), `WhileStmt`, `ForStmt`, `BreakStmt`, `ContinueStmt`.
+Statements: `Program`, `Block`, `LetStmt`, `AssignStmt` (target + `=`/`+=`/`-=` + value), `ExprStmt`, `FuncDecl` (`name` may be `None` for anonymous functions), `ReturnStmt` (value may be `None`), `IfStmt` (a list of `(condition, Block)` branches plus an optional `else_body`), `WhileStmt`, `ForStmt`, `BreakStmt`, `ContinueStmt`, `ImportStmt` (`path` — the literal string from the `import` statement).
 
-Expressions: `Literal`, `StringLiteral` (a `parts` list of `("lit", text)` / `("expr", source)`), `Var`, `ArrayLiteral`, `DictLiteral` (a list of `(key-string, value-node)` pairs), `BinaryOp`, `UnaryOp` (`-` or `not`), `Call`, `Index`.
+Expressions: `Literal`, `StringLiteral` (a `parts` list of `("lit", text)` / `("expr", source)`), `Var`, `ArrayLiteral`, `DictLiteral` (a list of `(key-string, value-node)` pairs), `BinaryOp`, `UnaryOp` (`-` or `not`), `Call`, `Index`, `Member` (`object` + `name` — the receiver expression and the method name after a `.`).
 
 Because every node remembers where it came from, a runtime error can point at the exact expression that failed — the interpreter never has to guess.
 
@@ -160,7 +162,7 @@ The interpreter keeps an explicit environment stack (`self._stack`, starting wit
 - **Blocks** (`run_block`) push a fresh child environment, run the statements, and pop it in a `finally` — so a `let` inside a block never leaks, and an exception still restores the stack.
 - **`for` loops** create one fresh child environment per iteration holding just the loop variable, then run the body as a block (which pushes *another* child environment for the body's own `let`s).
 - **Function calls** create a child of the function's *captured* environment (`callee.closure_env`), bind the parameters, and run the body in it. This is what makes closures work: the environment a function closes over is the one that was current when the function was *defined*, not when it is called.
-- **The globals** hold the 15 built-ins, installed once in `__init__` from `build_builtins()`. A program-level `let` with the same name as a built-in shadows it in the global environment — by design.
+- **The globals** hold the 15 core built-ins (installed once in `__init__` from `build_builtins()`), the 12 standard-library functions (from `build_stdlib()`), and the `pi` / `e` constants. A program-level `let` with the same name as a built-in shadows it in the global environment — by design.
 
 ### Control flow via signals
 
@@ -184,6 +186,20 @@ This keeps the evaluator's normal path free of "did that statement return?" book
 
 `_compute_StringLiteral` walks the parts list. For an `("expr", source)` part it re-parses the expression text with `_parse_source` and evaluates it (`_compute_interpolation`), after re-pointing the inner nodes' line/column at the string's own location (`_reline`) so an error inside `{ ... }` points at the string, not at line 1 of the fragment. Exactly one expression statement is allowed inside the braces.
 
+### Imports and the module cache
+
+`_run_ImportStmt()` hands the statement's path to `_load_module(path, node)`, which does the whole import:
+
+- **Resolution.** Relative to the importing file's directory (`os.path.dirname(os.path.abspath(self.filename))`); when there is no importing file — the REPL (`"<repl>"`), `"<stdin>"`, tests — relative to the process working directory. The canonical key is `os.path.realpath(os.path.abspath(resolved))`, so `./utils.kbr`, `utils.kbr`, and `sub/../utils.kbr` are one module.
+- **Cycle check.** `self._importing` is the stack of canonical paths currently being executed. If the resolved path is already on it, `_load_module` raises `KabirError` at the importing statement with `Import cycle detected: <chain>`, where the chain is the basenames of the stack plus the repeated file, joined with ` -> `. The entry file is loaded by `run_source`, not by `_load_module`, so it is never on the stack: a cycle through the entry file is detected one re-entry later and the chain starts with the first imported file (see the language reference for the exact example).
+- **Cache.** `self.modules` maps canonical path → exported-bindings dict. On a hit, the cached names are `define()`d into the current environment and no file I/O happens. The cache is per-`Interpreter` (created in `__init__`, next to `self.globals`) and is filled only after the module executes successfully — a file that raises is never cached.
+- **Reading.** The file is read as UTF-8, exactly as `cli.run_file()` does. `FileNotFoundError`, `UnicodeDecodeError`, and other `OSError`s are converted to `KabirError` at the `import` statement (`Cannot import "…" -- …`), so no traceback can leak — `cli.py` catches only `KabirError` and `RecursionError`. A syntax error inside the imported file propagates unchanged (it already carries the imported file's location).
+- **Execution.** The module runs in a fresh `Environment` whose parent is the interpreter's `globals` (so it sees all built-ins but not the importer's locals), via the same `run_stmt` loop as `run()`. Before executing, `_load_module` saves the current file state with `_save_file_state()` and sets `filename` / `source` / `lines` to the imported file's, resets `function_depth` and `loop_depth` to 0 (so a top-level `return` in the module errors instead of returning from an importing function), pushes the path onto `self._importing`, and pushes the module env; everything is restored in a `finally` (`_pop_env`, `_importing.pop()`, `_restore_file_state`). Without the save/restore, an error on the line *after* an import would point at the imported file's lines. After a successful run, the exports are a snapshot of the module env's own `vars` dict (which, because the parent is `globals`, holds only the module's own bindings) — that dict is cached and copied into the importer's current environment.
+
+### String methods (`_compute_Member`)
+
+`_compute_Member(expr)` evaluates the receiver. If it is a `str` and the name is in the `STRING_METHODS` table (imported from `kabir/stdlib.py`), it returns a bound method as an existing `BuiltinFunction` — a closure capturing the receiver — so `Call(Member(…), args)` works with zero changes to `call()`, and the bound method is first-class: it can be stored (`let u = "abc".upper`), passed around, and printed (`"<builtin function upper>"`). If the receiver is a `str` but the name is not in the table, the error names the method (`No method '.frobnicate' on a string …`). A dict receiver errors with an explicit pointer at brackets (`Cannot use .name on a dict -- write dict["name"] instead …`); any other receiver type errors naming the type (`Cannot use .upper on a number -- only strings have methods`). The string-only restriction is enforced here, at run time — the parser accepts `expr.name` for any receiver.
+
 ### Errors
 
 `Interpreter.error(node, message)` raises `KabirError` at the node's line/column. All user-facing errors go through this path (or the lexer's/parser's equivalent), so a Kabir program can never produce a raw Python traceback for a language-level mistake.
@@ -200,6 +216,15 @@ Conventions inside the file:
 - `print` joins `format_value` of each argument with spaces and returns `None`; `input` wraps Python's `input()` and turns `EOFError`/`KeyboardInterrupt` into Kabir errors; `range` requires whole numbers and takes 1 or 2 arguments (no step); `push` mutates and returns the array; `pop` errors on an empty array; `num`/`int`/`float` parse strings (stripping whitespace) and refuse booleans (`int`/`float`) — `int("3.9")` goes through `float` first and truncates to `3`; `sqrt`/`pow`/`abs` delegate to `math` / Python operators; `keys` returns `list(dict.keys())`, i.e. insertion order.
 
 The only import is `math` (for `sqrt`). Everything else is plain Python.
+
+## Standard library (`kabir/stdlib.py`)
+
+The standard library lives in its own file so `builtins.py` stays the core. It follows the exact same pattern — plain Python functions `(interp, node, args) -> value`, wrapped in `BuiltinFunction`, collected in a `STDLIB` dict, exposed by `build_stdlib()` — and reuses the helpers from `builtins.py` (`_need`, `_is_number`, `_type_name`) rather than duplicating them. `Interpreter.__init__` merges `build_stdlib()` into the globals right after `build_builtins()`; `stdlib.py` does not import the interpreter (no circular import).
+
+- **The 12 functions:** `randint`, `randrange`, `choice`, `shuffle`, `seed` (backed by Python's `random`), and `floor`, `ceil`, `sin`, `cos`, `tan`, `log`, `exp` (backed by Python's `math`). `sqrt`/`pow`/`abs` stay in `builtins.py` — they were already global, documented, and tested there, and moving them would be churn with no user-visible benefit.
+- **RNG placement:** one `random.Random()` instance per `Interpreter` (`self._random`, created in `__init__`). Every random function goes through `interp._random`, so two interpreters — and therefore two tests — are independent. A module-level RNG would let one test's `seed()` change another's sequence.
+- **`pi` / `e`:** defined in `__init__` as globals (`self.globals.define("pi", math.pi)`), shadowable by `let` like any built-in name.
+- **String methods:** the `STRING_METHODS` table lives here too — `{"upper": _str_upper, …}`, nine plain functions `(interp, node, receiver, args) -> value` following the same conventions. The interpreter imports the table; see §4 for how `_compute_Member` dispatches on it.
 
 ## 6. Errors (`kabir/errors.py`)
 
@@ -231,14 +256,17 @@ file:line:col: message
 
 ## 8. Testing
 
-`python tests/run_tests.py` discovers `tests/test_*.py` with plain `unittest` (verbosity 2) and exits non-zero on any failure. The 90 tests are split by layer, mirroring this document:
+`python tests/run_tests.py` discovers `tests/test_*.py` with plain `unittest` (verbosity 2) and exits non-zero on any failure. The 176 tests are split by layer, mirroring this document:
 
 | File | Covers |
 | --- | --- |
 | `tests/test_lexer.py` | Tokens, numbers, strings, interpolation, errors |
 | `tests/test_parser.py` | Precedence, statements, dict disambiguation, errors |
 | `tests/test_interpreter.py` | Values, scoping, closures, loops, recursion, operators |
-| `tests/test_builtins.py` | All 15 built-ins, argument and type errors |
+| `tests/test_builtins.py` | All 15 core built-ins, argument and type errors |
+| `tests/test_stdlib.py` | The 12 standard-library functions, `pi`/`e`, RNG independence |
+| `tests/test_string_methods.py` | All 9 string methods, chaining, method values, member errors |
+| `tests/test_import.py` | `import`, module cache, cycles, import errors, the import example |
 | `tests/test_errors.py` | Error format (location, source line, caret) |
 | `tests/test_examples.py` | Every file in `examples/` runs and produces its expected output |
 
@@ -250,7 +278,9 @@ There is no test framework dependency and no mocking — tests drive the real `I
 | --- | --- |
 | Add a keyword | `KEYWORDS` in `lexer.py`, a parse rule in `parser.py`, a node in `ast_nodes.py`, an evaluator method in `interpreter.py`, docs, tests |
 | Add a built-in | One function + one `BUILTINS` line in `builtins.py`, docs, tests |
+| Add a standard-library function | One function + one `STDLIB` line in `stdlib.py`, docs in the Standard library section, tests in `tests/test_stdlib.py` |
+| Add a string method | One function + one `STRING_METHODS` entry in `stdlib.py`, docs, tests in `tests/test_string_methods.py` |
+| Add `import` | A new statement type end-to-end (lexer keyword, AST node, parser rule, interpreter `_load_module` + module cache + file stack), docs, tests in `tests/test_import.py` |
 | Add an operator | Lexer op tables, a parser precedence level, `_binary()`/`_compute_UnaryOp`, docs, tests |
 | Change error wording | The message string where it is raised — rendering is centralised in `errors.py` |
 | Change number formatting | `format_value()` in `interpreter.py` — it is the single formatting path |
-| Add `import` | A new statement type end-to-end (lexer: nothing new; parser, AST, interpreter, plus a module cache) — the biggest item on the roadmap |

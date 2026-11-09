@@ -2,13 +2,13 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)
-![Tests](https://img.shields.io/badge/tests-90%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-176%20passing-brightgreen.svg)
 
 **Kabir is a small, friendly programming language, built from scratch in Python — no dependencies, no magic, just a lexer, a parser, and a tree-walking interpreter you can read in an afternoon.**
 
 ## What is Kabir?
 
-Kabir is a complete little language: variables, numbers, strings with interpolation, arrays, dicts, `if`/`elif`/`else`, `while` and `for` loops, first-class functions with closures and recursion, and 15 built-in functions — all in about 1,700 lines of plain, dependency-free Python. Programs live in `.kbr` files and run with `python -m kabir run`.
+Kabir is a complete little language: variables, numbers, strings with interpolation, arrays, dicts, `if`/`elif`/`else`, `while` and `for` loops, first-class functions with closures and recursion, `import` for `.kbr` files, string methods, and 15 core built-in functions plus 12 standard-library functions — all in about 1,700 lines of plain, dependency-free Python. Programs live in `.kbr` files and run with `python -m kabir run`.
 
 It is a **tree-walking interpreter**: source code is lexed into tokens, parsed into an abstract syntax tree (AST), and the interpreter walks that tree and runs it directly. There is no JIT compiler and no native compilation — Kabir trades speed for clarity, so the whole implementation is easy to read, learn from, and hack on.
 
@@ -25,7 +25,7 @@ $ git clone https://github.com/afrainkabirrafid/kabir.git
 $ cd kabir
 $ python -m kabir run examples/hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 1.0.0.
+Welcome to Kabir version 1.1.0.
 2 + 3 = 5
 ```
 
@@ -40,7 +40,7 @@ let name = "Rafid"
 let language = "Kabir"
 
 print("Hello, {name}!")
-print("Welcome to {language} version 1.0.0.")
+print("Welcome to {language} version 1.1.0.")
 print("2 + 3 = {2 + 3}")
 ```
 
@@ -49,7 +49,7 @@ Run it:
 ```console
 $ python -m kabir run hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 1.0.0.
+Welcome to Kabir version 1.1.0.
 2 + 3 = 5
 ```
 
@@ -68,7 +68,7 @@ All commands work both as `python -m kabir ...` (zero-install, from a fresh clon
 
 ```console
 $ python -m kabir --version
-kabir 1.0.0
+kabir 1.1.0
 ```
 
 ### The `kabir` command
@@ -77,7 +77,7 @@ The repository ships an executable launcher at `bin/kabir`:
 
 ```console
 $ ./bin/kabir --version
-kabir 1.0.0
+kabir 1.1.0
 $ ./bin/kabir run examples/fizzbuzz.kbr
 ```
 
@@ -87,7 +87,7 @@ It lives in `bin/` for a real reason: a repo-root file named `kabir` cannot coex
 
 ```console
 $ python -m kabir repl
-Kabir 1.0.0 -- type 'exit' or press Ctrl-D to leave.
+Kabir 1.1.0 -- type 'exit' or press Ctrl-D to leave.
 kabir> let x = 5
 kabir> x + 1
 6
@@ -174,7 +174,7 @@ The full reference — every construct, every built-in, each with a runnable exa
 
 ## Examples
 
-All eight examples live in [`examples/`](examples/) and are covered by the test suite.
+All ten example files live in [`examples/`](examples/) and are covered by the test suite: nine runnable programs, plus `greet-lib.kbr`, a small library file that `import-demo.kbr` loads.
 
 | File | What it shows |
 | --- | --- |
@@ -183,7 +183,8 @@ All eight examples live in [`examples/`](examples/) and are covered by the test 
 | [`examples/fibonacci.kbr`](examples/fibonacci.kbr) | Recursion — `fib(n)`, first 15 numbers |
 | [`examples/primes.kbr`](examples/primes.kbr) | `while` loop, helper function, primes up to 100 |
 | [`examples/sorting.kbr`](examples/sorting.kbr) | Bubble sort, index assignment, arrays as values |
-| [`examples/guessing-game.kbr`](examples/guessing-game.kbr) | Interactive loop with `input()` (secret is fixed at `42` — there is no random built-in yet) |
+| [`examples/guessing-game.kbr`](examples/guessing-game.kbr) | Interactive loop with `input()` (the secret is a random number from `randint(1, 100)`) |
+| [`examples/import-demo.kbr`](examples/import-demo.kbr) | `import "greet-lib.kbr"` — load and reuse code from another file |
 | [`examples/todo.kbr`](examples/todo.kbr) | In-memory todo CLI: `add`, `list`, `done`, `quit` |
 | [`examples/calculator.kbr`](examples/calculator.kbr) | Interactive calculator; accepts `2+3` and `2 + 3`, handles division by zero |
 
@@ -199,7 +200,7 @@ calc> Goodbye!
 
 ## Built-ins
 
-Kabir ships 15 built-in functions, available in every program with no import:
+Kabir ships 15 core built-in functions, available in every program with no import:
 
 | Function | Purpose |
 | --- | --- |
@@ -220,6 +221,27 @@ Kabir ships 15 built-in functions, available in every program with no import:
 | `float(x)` | Convert to a float |
 
 Each one is documented with a runnable example in [docs/LANGUAGE.md](docs/LANGUAGE.md#built-in-functions).
+
+### Standard library
+
+On top of the core built-ins, Kabir ships 12 standard-library functions — also plain globals, no import needed — plus the constants `pi` and `e`, and 9 string methods (see [docs/LANGUAGE.md](docs/LANGUAGE.md#standard-library)):
+
+| Function | Purpose |
+| --- | --- |
+| `randint(a, b)` | Random whole number from `a` to `b`, both ends included |
+| `randrange(n)` / `randrange(a, b)` | One random number from a `range()` |
+| `choice(array)` | One random item from an array |
+| `shuffle(array)` | Shuffle an array in place (returns the array) |
+| `seed(n)` | Seed the random sequence, so it is repeatable |
+| `floor(x)` / `ceil(x)` | Round a number down / up to a whole number |
+| `sin(x)` / `cos(x)` / `tan(x)` | Trigonometry, in radians |
+| `log(x)` | Natural logarithm |
+| `exp(x)` | `e` to the power of `x` |
+| `pi`, `e` | The constants `3.141592653589793` and `2.718281828459045` |
+
+String methods live on the string itself: `"abc".upper()`, `" a ".strip()`, `"a,b".split(",")`, `", ".join(["a", "b"])`, `"hello".contains("ell")`, `"hello".starts_with("he")`, `"hello".ends_with("lo")`, `"aaa".replace("a", "b")`, and `"ABC".lower()`.
+
+Code can also be shared across files with `import "other.kbr"` — see [docs/LANGUAGE.md](docs/LANGUAGE.md#import).
 
 ## Errors
 
@@ -262,21 +284,21 @@ Zero dependencies here too — the suite is plain `unittest`, run by a small run
 
 ```console
 $ python tests/run_tests.py
-Ran 90 tests in 0.579s
+Ran 176 tests in 0.818s
 
 OK
 ```
 
-The 90 tests cover the lexer, parser, interpreter, built-ins, errors, and every example in `examples/`. Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+The 176 tests cover the lexer, parser, interpreter, built-ins, standard library, string methods, imports, errors, and every example in `examples/`. Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Honest limits
 
-Kabir 1.0.0 is a small language, and it is honest about what it is not:
+Kabir 1.1.0 is a small language, and it is honest about what it is not:
 
 - **No JIT, no native compilation.** It is a tree-walking interpreter; it is fast enough for scripts and learning, not for number-crunching.
-- **No `import`.** A program is a single `.kbr` file; there is no way to load another `.kbr` file yet.
-- **No package manager, no standard-library modules.** The 15 built-ins are the whole library.
-- **No file I/O, no random numbers, no dates.** The only way in or out is `print` and `input`.
+- **`import` loads other `.kbr` files** — a program can be split across files, and each file runs once (see the [roadmap](#roadmap) for what is still missing).
+- **No package manager.** There is no package registry; `import` loads a file by path, and the standard library is the 15 core built-ins plus the `random`/`math` functions and string methods listed above.
+- **No file I/O, no dates, no networking.** The only way in or out is `print` and `input` (plus `import`, which reads `.kbr` files).
 - **Recursion depth is capped** at 500 nested calls, and there is no tail-call optimisation.
 - **One number type** means no separate integer/float semantics; a power that overflows float range fails with a friendly error, while integer powers use arbitrary-precision integers.
 
@@ -284,11 +306,11 @@ Kabir 1.0.0 is a small language, and it is honest about what it is not:
 
 Roughly in order, and open to discussion:
 
-1. **`import` for `.kbr` files** — load and reuse code across files.
-2. **Standard-library modules** — starting with `random` (so the guessing game gets a real secret), then string helpers and math.
+1. **`import` for `.kbr` files** — load and reuse code across files. — done in 1.1.0
+2. **Standard-library modules** — starting with `random` (so the guessing game gets a real secret), then string helpers and math. — done in 1.1.0 (random, math, and string methods as built-ins)
 3. **A formatter** (`kabir fmt`) for canonical `.kbr` style.
 4. **Pip packaging** — `pyproject.toml` is already in the repo; publishing to PyPI so `pip install kabir` gives you the `kabir` command.
-5. **More of the language** — `else` on loops is not planned; instead: string methods, a `switch`-style construct only if it earns its place, and better REPL history.
+5. **More of the language** — `else` on loops is not planned; instead: string methods — done in 1.1.0, a `switch`-style construct only if it earns its place, and better REPL history.
 
 Ideas and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

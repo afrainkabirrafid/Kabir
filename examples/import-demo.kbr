@@ -1,0 +1,4 @@
+# import-demo.kbr -- shows import: load greet-lib.kbr and use it.
+import "greet-lib.kbr"
+print(greet("Rafid"))
+print(version_note)

@@ -111,6 +111,8 @@ class Parser:
         if self._check("KEYWORD", "continue"):
             self._advance()
             return ast.ContinueStmt(line=tok.line, col=tok.col)
+        if self._check("KEYWORD", "import"):
+            return self._import()
         if self._check("PUNCT", "{"):
             # A "{" that opens a string key followed by ":" is a dict
             # literal, not a block: {"a": 1} == {"a": 1}.
@@ -122,6 +124,22 @@ class Parser:
                 return self._expr_or_assign_stmt()
             return self._block()
         return self._expr_or_assign_stmt()
+
+    def _import(self):
+        tok = self._advance()  # import
+        path_tok = self._expect(
+            "STRING",
+            what='a file path in double quotes after \'import\' -- '
+                 'like import "helpers.kbr"')
+        parts = path_tok.value
+        if len(parts) != 1 or parts[0][0] != "lit":
+            self._fail("import paths must be plain strings, not "
+                       "interpolated ones", token=path_tok)
+        path = parts[0][1]
+        if not path.endswith(".kbr"):
+            self._fail('import "%s" must name a .kbr file' % path,
+                       token=path_tok)
+        return ast.ImportStmt(path, line=tok.line, col=tok.col)
 
     def _let(self):
         tok = self._advance()  # let
@@ -290,6 +308,12 @@ class Parser:
                 self._skip_newlines()
                 self._expect("PUNCT", "]", "']' after the index")
                 expr = ast.Index(expr, index, line=tok.line, col=tok.col)
+            elif self._check("PUNCT", "."):
+                dot = self._advance()
+                name_tok = self._expect("IDENT",
+                                        what="a method name after '.'")
+                expr = ast.Member(expr, name_tok.value,
+                                  line=dot.line, col=dot.col)
             else:
                 break
         return expr
