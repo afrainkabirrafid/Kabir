@@ -10,6 +10,7 @@ import os
 import random
 
 from . import ast_nodes as ast
+from . import semantics as _semantics
 from .builtins import build_builtins, BuiltinFunction, _type_name
 from .stdlib import STRING_METHODS, build_stdlib
 from .errors import KabirError, error_at
@@ -117,62 +118,17 @@ class Interpreter:
         raise error_at(message, self.filename, self.lines, line, col)
 
     # -- formatting / truthiness / equality ----------------------------
+    # Delegates to kabir.semantics (shared with the VM); the wrappers
+    # below only convert KabirRuntimeError into a positioned KabirError.
     def format_value(self, value):
-        if value is None:
-            return "null"
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if isinstance(value, float):
-            if value.is_integer():
-                return str(int(value))
-            return repr(value)
-        if isinstance(value, int):
-            return str(value)
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            return "[" + ", ".join(self.format_value(v) for v in value) + "]"
-        if isinstance(value, dict):
-            inner = ", ".join('"%s": %s' % (k, self.format_value(v))
-                              for k, v in value.items())
-            return "{" + inner + "}"
-        if isinstance(value, KabirFunction):
-            return "<function %s>" % value.name
-        if isinstance(value, BuiltinFunction):
-            return "<builtin function %s>" % value.name
-        return str(value)
+        return _semantics.format_value(value)
 
     @staticmethod
     def is_truthy(value):
-        if value is None or value is False:
-            return False
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return value != 0
-        if isinstance(value, (str, list, dict)):
-            return len(value) > 0
-        return True
+        return _semantics.is_truthy(value)
 
     def kabir_equal(self, left, right):
-        if isinstance(left, bool) or isinstance(right, bool):
-            return isinstance(left, bool) and isinstance(right, bool) \
-                and left == right
-        if left is None or right is None:
-            return left is None and right is None
-        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-            return left == right
-        if isinstance(left, str) and isinstance(right, str):
-            return left == right
-        if isinstance(left, list) and isinstance(right, list):
-            return len(left) == len(right) and all(
-                self.kabir_equal(a, b) for a, b in zip(left, right))
-        if isinstance(left, dict) and isinstance(right, dict):
-            return (set(left.keys()) == set(right.keys())
-                    and all(self.kabir_equal(left[k], right[k])
-                            for k in left))
-        if isinstance(left, (KabirFunction, BuiltinFunction)) \
-                or isinstance(right, (KabirFunction, BuiltinFunction)):
-            return left is right
-        return False
+        return _semantics.kabir_equal(left, right)
 
     # -- running -------------------------------------------------------
     def run(self, program):
@@ -511,61 +467,10 @@ class Interpreter:
         return self._binary(expr.op, left, right, expr)
 
     def _binary(self, op, left, right, node):
-        if op == "==":
-            return self.kabir_equal(left, right)
-        if op == "!=":
-            return not self.kabir_equal(left, right)
-        if op in ("<", "<=", ">", ">="):
-            if isinstance(left, (int, float)) and isinstance(right, (int, float)) \
-                    and not isinstance(left, bool) and not isinstance(right, bool):
-                pass
-            elif isinstance(left, str) and isinstance(right, str):
-                pass
-            else:
-                self.error(node, "Cannot compare %s with %s using '%s' -- "
-                           "compare numbers with numbers, or strings with "
-                           "strings" % (_type_name(left), _type_name(right), op))
-            return {"<": left < right, "<=": left <= right,
-                    ">": left > right, ">=": left >= right}[op]
-        if op == "+":
-            if isinstance(left, (int, float)) and isinstance(right, (int, float)) \
-                    and not isinstance(left, bool) and not isinstance(right, bool):
-                return left + right
-            if isinstance(left, str) and isinstance(right, str):
-                return left + right
-            if isinstance(left, list) and isinstance(right, list):
-                return left + right
-            self.error(node, "Cannot add %s and %s -- '+' works on two "
-                       "numbers, two strings, or two arrays"
-                       % (_type_name(left), _type_name(right)))
-        if op in ("-", "*", "/", "%", "**"):
-            if not (isinstance(left, (int, float)) and not isinstance(left, bool)) \
-                    or not (isinstance(right, (int, float)) and not isinstance(right, bool)):
-                self.error(node, "'%s' needs two numbers, but got %s and %s"
-                           % (op, _type_name(left), _type_name(right)))
-            if op == "-":
-                return left - right
-            if op == "*":
-                return left * right
-            if op == "/":
-                if right == 0:
-                    self.error(node, "Division by zero -- the number after "
-                               "'/' cannot be 0")
-                if isinstance(left, int) and isinstance(right, int) \
-                        and left % right == 0:
-                    return left // right
-                return left / right
-            if op == "%":
-                if right == 0:
-                    self.error(node, "Division by zero -- the number after "
-                               "'%' cannot be 0")
-                return left % right
-            if op == "**":
-                try:
-                    return left ** right
-                except (OverflowError, ZeroDivisionError):
-                    self.error(node, "That power is too large to calculate")
-        self.error(node, "Unknown operator %r" % op)
+        try:
+            return _semantics.binary_op(op, left, right)
+        except _semantics.KabirRuntimeError as exc:
+            self.error(node, exc.args[0] if exc.args else str(exc))
 
     def _compute_UnaryOp(self, expr):
         if expr.op == "not":
@@ -667,6 +572,34 @@ class Interpreter:
             return target[index]
         self.error(expr.target, "Cannot index %s -- only arrays, strings "
                    "and dicts support [ ... ]" % _type_name(target))
+
+    def _compute_MatchExpr(self, expr):
+        scrut = self.compute(expr.scrutinee)
+        for arm in expr.arms:
+            if isinstance(arm.pattern, ast.Wildcard):
+                pass  # matches anything, binds nothing
+            elif isinstance(arm.pattern, ast.Var):
+                pass  # binding: matches anything, binds the value
+            elif isinstance(arm.pattern, ast.Literal):
+                if not self.kabir_equal(scrut, arm.pattern.value):
+                    continue
+            else:
+                self.error(arm.pattern, "Invalid pattern in 'match'")
+            # The binding (if any) lives only for this arm's guard/body.
+            env = Environment(self._current_env())
+            if isinstance(arm.pattern, ast.Var):
+                env.define(arm.pattern.name, scrut)
+            prev = self._current_env()
+            self._push_env(env)
+            try:
+                if arm.guard is not None \
+                        and not self.is_truthy(self.compute(arm.guard)):
+                    continue
+                return self.compute(arm.body)
+            finally:
+                self._pop_env(prev)
+        self.error(expr, "No pattern matched the value %s"
+                   % self.format_value(scrut))
 
     def _compute_FuncDecl(self, expr):
         # Anonymous function expression: func(a, b) { ... }

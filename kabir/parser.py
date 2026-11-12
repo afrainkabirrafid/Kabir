@@ -145,12 +145,21 @@ class Parser:
                        token=path_tok)
         return ast.ImportStmt(path, line=tok.line, col=tok.col)
 
+    def _type_ann(self):
+        tok = self._expect("IDENT",
+                           what="a type name, like 'number'")
+        return ast.TypeAnn(tok.value, line=tok.line, col=tok.col)
+
     def _let(self):
         tok = self._advance()  # let
         name_tok = self._expect("IDENT", what="a variable name after 'let'")
+        type_ann = None
+        if self._match("PUNCT", ":"):
+            type_ann = self._type_ann()
         self._expect("OP", "=", "'=' after the variable name in 'let'")
         value = self._expression()
-        return ast.LetStmt(name_tok.value, value, line=tok.line, col=tok.col)
+        return ast.LetStmt(name_tok.value, value,
+                           line=tok.line, col=tok.col, type_ann=type_ann)
 
     def _func_decl_or_expr_stmt(self):
         tok = self._advance()  # func
@@ -159,15 +168,86 @@ class Parser:
             name = self._advance().value
         self._expect("PUNCT", "(", "'(' after the function name")
         params = []
+        param_types = []
         if not self._check("PUNCT", ")"):
             while True:
                 p = self._expect("IDENT", what="a parameter name")
                 params.append(p.value)
+                if self._match("PUNCT", ":"):
+                    param_types.append(self._type_ann())
+                else:
+                    param_types.append(None)
                 if not self._match("PUNCT", ","):
                     break
         self._expect("PUNCT", ")", "')' after the parameter list")
+        return_type = None
+        if self._match("OP", "->"):
+            return_type = self._type_ann()
         body = self._block()
-        return ast.FuncDecl(name, params, body, line=tok.line, col=tok.col)
+        return ast.FuncDecl(name, params, body,
+                            line=tok.line, col=tok.col,
+                            param_types=param_types,
+                            return_type=return_type)
+
+    # -- match expressions --------------------------------------------
+    def _match_expr(self):
+        tok = self._advance()  # match
+        scrutinee = self._expression()
+        self._expect("PUNCT", "{", "'{' after the value in 'match'")
+        arms = []
+        self._skip_newlines()
+        if not self._check("PUNCT", "}"):
+            while True:
+                arms.append(self._match_arm())
+                self._skip_newlines()
+                if not self._match("PUNCT", ","):
+                    break
+                self._skip_newlines()
+                if self._check("PUNCT", "}"):
+                    break  # trailing comma
+        self._expect("PUNCT", "}", "'}' to close the match")
+        return ast.MatchExpr(scrutinee, arms, line=tok.line, col=tok.col)
+
+    def _match_arm(self):
+        tok = self.current
+        pattern = self._pattern()
+        guard = None
+        if self._check("KEYWORD", "if"):
+            self._advance()
+            guard = self._expression()
+        self._expect("OP", "=>", "'=>' after the pattern in a 'match' arm")
+        body = self._expression()
+        return ast.MatchArm(pattern, guard, body,
+                            line=tok.line, col=tok.col)
+
+    def _pattern(self):
+        tok = self.current
+        if self._check("IDENT"):
+            self._advance()
+            if tok.value == "_":
+                return ast.Wildcard(line=tok.line, col=tok.col)
+            return ast.Var(tok.value, line=tok.line, col=tok.col)
+        if self._check("NUMBER"):
+            self._advance()
+            return ast.Literal(tok.value, line=tok.line, col=tok.col)
+        if self._check("STRING"):
+            self._advance()
+            parts = tok.value
+            if len(parts) != 1 or parts[0][0] != "lit":
+                self._fail("A 'match' pattern must be a plain string, not "
+                           "an interpolated one", token=tok)
+            return ast.Literal(parts[0][1], line=tok.line, col=tok.col)
+        if self._check("KEYWORD", "true"):
+            self._advance()
+            return ast.Literal(True, line=tok.line, col=tok.col)
+        if self._check("KEYWORD", "false"):
+            self._advance()
+            return ast.Literal(False, line=tok.line, col=tok.col)
+        if self._check("KEYWORD", "null"):
+            self._advance()
+            return ast.Literal(None, line=tok.line, col=tok.col)
+        self._fail("Expected a pattern in 'match' -- a literal, a name, "
+                   "or '_'")
 
     def _if(self):
         tok = self._advance()  # if
@@ -342,6 +422,8 @@ class Parser:
         if self._check("KEYWORD", "func"):
             # Anonymous function expression: func(a, b) { ... }
             return self._func_decl_or_expr_stmt()
+        if self._check("KEYWORD", "match"):
+            return self._match_expr()
         if self._check("IDENT"):
             self._advance()
             return ast.Var(tok.value, line=tok.line, col=tok.col)

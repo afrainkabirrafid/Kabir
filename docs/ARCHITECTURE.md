@@ -1,29 +1,47 @@
-# Kabir Architecture — how the interpreter works
+# Kabir Architecture — how the compiler, VM, and interpreter work
 
-This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 1.2.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
+This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 2.0.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
 
 ## The big picture
 
-Kabir is a **tree-walking interpreter**: it does not compile to bytecode or to another language, and it never `eval`s or `exec`s anything. Running a program is four stages:
+Kabir is a **compiled language**: programs are type-checked, compiled
+to bytecode, and run on a stack virtual machine. It never `eval`s or
+`exec`s anything. Running a program is six stages:
 
 ```text
-source text ──► Lexer ──► tokens ──► Parser ──► AST ──► Interpreter ──► output
-   kabir/lexer.py      kabir/parser.py   kabir/ast_nodes.py   kabir/interpreter.py
+source ──► Lexer ──► tokens ──► Parser ──► AST ──► Checker ──► Compiler
+  kabir/lexer.py      kabir/parser.py   kabir/ast_nodes.py  kabir/checker.py
+                                                        kabir/compile.py
+  ──► bytecode ──► VM ──► output
+          kabir/vm.py
 ```
 
-- `kabir/lexer.py` (~206 lines) — source text → token stream.
-- `kabir/parser.py` (~400 lines) — tokens → AST (recursive descent).
-- `kabir/ast_nodes.py` (~167 lines) — one small class per AST node.
-- `kabir/interpreter.py` (~674 lines) — walks the AST and runs it.
+- `kabir/lexer.py` (~210 lines) — source text → token stream.
+- `kabir/parser.py` (~430 lines) — tokens → AST (recursive descent).
+- `kabir/ast_nodes.py` (~180 lines) — one small class per AST node.
+- `kabir/checker.py` (~590 lines) — opt-in static type checking; raises
+  `KabirError` on the first type error, passes untyped code unchanged.
+- `kabir/compile.py` (~600 lines) — AST → bytecode (a plain-dict code
+  object, JSON-serialisable as `.kbc`).
+- `kabir/vm.py` (~650 lines) — a stack-based VM that executes bytecode.
+- `kabir/semantics.py` — the shared runtime semantics (`is_truthy`,
+  `format_value`, `kabir_equal`, `binary_op`) used by both the VM and
+  the interpreter, so behaviour cannot drift between them.
+- `kabir/interpreter.py` (~674 lines) — the original tree-walking
+  interpreter. No longer the `run` path (that is the VM now); it still
+  powers the REPL and stays as the reference implementation behind
+  `kabir run --interp`.
 - `kabir/builtins.py` (~237 lines) — the 15 core built-in functions.
 - `kabir/stdlib.py` (~265 lines) — the 12 standard-library functions (`random`, `math`) and the `STRING_METHODS` table.
 - `kabir/errors.py` (~49 lines) — the `KabirError` type and its rendering.
 - `kabir/formatter.py` (~499 lines) — the canonical formatter (`kabir fmt`): parses the file, then re-prints the AST with deterministic spacing, indentation and blank lines; comments are extracted from the source first and re-attached by line number.
-- `kabir/cli.py` (~277 lines) — `run` / `fmt` / `repl` / `--help` / `--version`.
+- `kabir/project.py` (~330 lines) — Cargo-style projects: `kabir new`
+  scaffolding, `Kabir.toml` parsing, `kabir build` to `target/<name>.kbc`.
+- `kabir/cli.py` (~330 lines) — `run` / `new` / `build` / `fmt` / `repl` / `--help` / `--version`.
 - `kabir/__init__.py` — version, author, and the public API (`Interpreter`, `parse`, `tokenize`, `KabirError`).
 - `kabir/__main__.py` — the `python -m kabir` entry point (calls `kabir.cli:main`).
 
-Everything is standard library only. There are no third-party dependencies, and no generated code — the lexer and parser are hand-written.
+Everything is standard library only. There are no third-party dependencies, and no generated code — the lexer, parser, compiler, and VM are hand-written.
 
 ## 1. Lexer (`kabir/lexer.py`)
 
@@ -117,7 +135,7 @@ Each level is a method (`_or`, `_and`, `_equality`, `_comparison`, `_additive`, 
 
 Every node subclasses `Node`, which carries `line` and `col`. The tree is plain data — no methods, no visitor pattern; the interpreter dispatches on node class name (see §4).
 
-Statements: `Program`, `Block`, `LetStmt`, `AssignStmt` (target + `=`/`+=`/`-=` + value), `ExprStmt`, `FuncDecl` (`name` may be `None` for anonymous functions), `ReturnStmt` (value may be `None`), `IfStmt` (a list of `(condition, Block)` branches plus an optional `else_body`), `WhileStmt`, `ForStmt`, `BreakStmt`, `ContinueStmt`, `ImportStmt` (`path` — the literal string from the `import` statement).
+Statements: `Program`, `Block`, `LetStmt` (with an optional `type_ann`), `AssignStmt` (target + `=`/`+=`/`-=` + value), `ExprStmt`, `FuncDecl` (`name` may be `None` for anonymous functions; optional `param_types` and `return_type`), `ReturnStmt` (value may be `None`), `IfStmt` (a list of `(condition, Block)` branches plus an optional `else_body`), `WhileStmt`, `ForStmt`, `BreakStmt`, `ContinueStmt`, `ImportStmt` (`path` — the literal string from the `import` statement), `MatchExpr` (a scrutinee plus a list of `MatchArm`s — pattern, optional guard, body expression). Patterns are `Literal`, `Var` (binding), or `Wildcard` (`_`). Type annotations are `TypeAnn` nodes holding the type name as a string.
 
 Expressions: `Literal`, `StringLiteral` (a `parts` list of `("lit", text)` / `("expr", source)`), `Var`, `ArrayLiteral`, `DictLiteral` (a list of `(key-string, value-node)` pairs), `BinaryOp`, `UnaryOp` (`-` or `not`), `Call`, `Index`, `Member` (`object` + `name` — the receiver expression and the method name after a `.`).
 
@@ -126,6 +144,12 @@ Because every node remembers where it came from, a runtime error can point at th
 ## 4. Interpreter (`kabir/interpreter.py`)
 
 `Interpreter(source, filename)` owns the global environment and runs programs. `run_source(source, filename)` lexes, parses, and runs in one call; `run(program)` runs an already-parsed program; the REPL calls `parse_source` itself and then `run_stmt` per statement so one bad line does not kill the session.
+
+Since 2.0.0 the interpreter is no longer the `kabir run` path — that is
+the compiler + VM (§6–§7) — but it still powers the REPL and stays as
+the reference implementation, reachable with `kabir run --interp`. Its
+operator, truthiness, and formatting logic now live in
+`kabir/semantics.py` (§8); the methods below delegate to it.
 
 ### Values
 
@@ -205,7 +229,150 @@ This keeps the evaluator's normal path free of "did that statement return?" book
 
 `Interpreter.error(node, message)` raises `KabirError` at the node's line/column. All user-facing errors go through this path (or the lexer's/parser's equivalent), so a Kabir program can never produce a raw Python traceback for a language-level mistake.
 
-## 5. Built-ins (`kabir/builtins.py`)
+## 5. Type checker (`kabir/checker.py`)
+
+`check_program(program, filename, lines)` walks the AST once, before
+compilation, and raises `KabirError` on the first type error. Types are
+plain strings (`"number"`, `"string"`, `"bool"`, `"array"`, `"dict"`,
+`"function"`, `"any"`, `"null"`).
+
+- **Scopes.** A stack of `dict`s maps names to types. `let x: T` records
+  `T`; an unannotated `let` records the inferred type of its value;
+  function parameters record their annotations (`"any"` when absent).
+  A pre-pass over top-level function declarations registers their
+  signatures first, so forward and mutually recursive calls type-check.
+- **Inference.** Best effort, `"any"` when unknown: literals; `+` on
+  number+number → `"number"`, string+string → `"string"`,
+  array+array → `"array"`; comparisons → `"bool"`; `and`/`or` → `"any"`;
+  unary `-` → `"number"`, `not` → `"bool"`; indexing a string →
+  `"string"`, an array/dict → `"any"`; calls use the builtin/stdlib
+  signature table (or the callee's annotation) when known, else `"any"`;
+  `match` → the arm bodies' type when they all agree, else `"any"`.
+- **Rules.** A rule fires only when the involved types are statically
+  known (not `"any"`): annotated `let` / arguments / returns must
+  match; arithmetic and comparison operands must have the right kinds;
+  `if`/`while` conditions and `match` guards must be `"bool"`; `for`
+  iterables must be array/string/dict; a `match` literal pattern whose
+  type differs from the scrutinee's is an error; unknown type names in
+  annotations are an error. `any` accepts everything in `let`, param,
+  and return positions.
+- **Type-only.** The checker never reports undefined variables, wrong
+  argument counts, or anything that needs run-time knowledge — those
+  stay runtime errors.
+
+## 6. Bytecode compiler (`kabir/compile.py`)
+
+`compile_program(program, filename, lines)` walks the AST and emits a
+code dict:
+
+```python
+{"name": str, "params": [str], "instrs": [[op, arg], ...],
+ "consts": [...], "lines": [int, ...], "filename": str}
+```
+
+`instrs[i]` is `[op, arg]` (jump targets are absolute instruction
+indices, patched after the block is emitted); `lines[i]` is the source
+line of that instruction, so VM errors point at the right place.
+`consts` holds only scalars (`int`/`float`/`str`/`bool`/`None`) and
+nested function code dicts, which appear as `{"__code__": <code dict>}`.
+`compile_source(source, filename)` is parse + compile in one call.
+`save_bytecode(code, path)` / `load_bytecode(path)` write and read the
+`.kbc` format: JSON `{"magic": "KBC1", "version": 1, "main": <code>}`.
+
+The instruction set (see `kabir/compile.py` for the exact list):
+`LOAD_CONST`, `LOAD_NULL/TRUE/FALSE`, `LOAD_VAR`, `DEFINE_VAR`,
+`STORE_VAR`, `POP`, `DUP`, `BUILD_LIST`, `BUILD_DICT`, `BUILD_STRING`,
+`ADD/SUB/MUL/DIV/MOD/POW`, `NEG`, `NOT`, `EQ/NE/LT/LE/GT/GE`, `JUMP`,
+`JUMP_IF_FALSE/TRUE`, `CALL`, `RETURN`, `MAKE_FUNCTION`, `IMPORT`,
+`GET_INDEX`, `SET_INDEX`, `GET_MEMBER`, `ENTER_SCOPE`, `EXIT_SCOPE`,
+`GET_ITER`, `FOR_ITER`, `MATCH_FAIL`.
+
+Notable compilation choices:
+
+- **Variables are names, not slots.** `LOAD_VAR`/`STORE_VAR` resolve
+  through the `Environment` chain at run time, exactly like the
+  interpreter — so closures, shadowing, and block scoping behave
+  identically, and the compiler needs no scope analysis.
+- **Blocks push environments.** `ENTER_SCOPE`/`EXIT_SCOPE` bracket
+  every block, mirroring the interpreter's per-block `Environment`;
+  a `let` inside a block never leaks out of it.
+- **`and`/`or` short-circuit** with `DUP` + a conditional jump, so
+  the right side is never evaluated when the left decides the result.
+- **`match` compiles inline.** The scrutinee is evaluated once and
+  stays on the stack; each arm `DUP`s it, tests its pattern
+  (`LOAD_CONST` + `EQ` for literals; `DEFINE_VAR` in a fresh per-arm
+  scope for bindings), jumps to the next arm on failure, pops the
+  scrutinee on success, evaluates the body, and jumps to the end.
+  After the last arm, `MATCH_FAIL` raises the no-match error.
+- **Loops.** `for` uses `GET_ITER` (snapshot list) + `FOR_ITER`
+  (push next item or jump out). `break`/`continue` are compiled to
+  jumps with scope cleanup (exit scopes, pop the iterator); the
+  compiler keeps a loop stack and patches the targets when the loop
+  ends. `break`/`continue` outside a loop and `return` outside a
+  function are **compile-time** errors with the interpreter's exact
+  messages.
+- **Functions.** Each `FuncDecl` compiles to its own code dict, stored
+  in the parent's constants; `MAKE_FUNCTION` turns it into a closure
+  capturing the current environment at run time.
+- **Imports.** The `IMPORT` instruction executes the module through
+  the same loader logic as the interpreter (relative resolution,
+  `realpath` cache, cycle detection, identical messages) — the module
+  is parsed, checked, compiled, and run in a fresh module env.
+
+## 7. Stack VM (`kabir/vm.py`)
+
+`VM.run_code(code, filename, lines)` runs a compiled code dict;
+`VM.run_source(source, filename)` is parse + compile + run. The VM
+holds one value stack shared across frames; each frame records its
+code, instruction pointer, stack base, and environment. Calling a
+function creates a frame whose environment is a child of the closure's
+captured environment, binds the parameters, and runs the body; `RETURN`
+pops the frame and pushes the return value onto the caller's stack.
+Call depth is capped at 500, like the interpreter.
+
+Built-ins run through the same `(interp, node, args)` protocol as in
+the interpreter: the VM exposes `.error(node, msg)`,
+`.format_value(v)`, and `._random` (a per-VM `random.Random()`), and
+passes a tiny `_CallNode` shim (line/filename from the `CALL`
+instruction) as the node — so builtin and stdlib implementations work
+unchanged in both runtimes. All arithmetic, comparison, truthiness,
+and formatting go through `kabir/semantics.py`, so the two runtimes
+cannot disagree about values.
+
+VM errors carry the source line of the faulting instruction (the
+bytecode stores lines, not columns), rendered in the same
+file:line + source-line + caret format as interpreter errors.
+
+## 8. Shared semantics (`kabir/semantics.py`)
+
+Pure functions — `is_truthy`, `format_value`, `kabir_equal`,
+`binary_op` — moved verbatim from the interpreter, including the
+exact error strings (division by zero, the int/int exact-division
+rule, `**` overflow, "Cannot add %s and %s…"). Each raises
+`KabirRuntimeError(message)` (a plain exception, message only, no
+position); the interpreter and the VM convert it to `KabirError`
+with their own position information. This module is the single
+source of truth for what operators do — change a rule here and both
+runtimes change together.
+
+## 9. Project tooling (`kabir/project.py`)
+
+- `new_project(name, cwd=".")` validates the name
+  (`^[A-Za-z][A-Za-z0-9_-]*$`), refuses an existing directory, and
+  writes `Kabir.toml` (`[package]` name / version `0.1.0` / authors),
+  `src/main.kbr` (a `func main()` hello program plus a `main()` call),
+  and `.gitignore` (`target/`). Returns the created path.
+- `build_project(path=".")` reads the manifest with a hand-rolled
+  parser (no `tomllib` — the package supports Python 3.8+), compiles
+  `src/main.kbr` (parse → check → compile, imports resolved relative
+  to `src/`), and writes `target/<name>.kbc` via `save_bytecode`.
+  Returns the output path (absolute). Prints nothing — the CLI owns
+  output.
+- `run_project(path)` resolves `src/main.kbr` for a project directory.
+- The checker and compiler are imported lazily inside
+  `build_project`, so the module stays importable on its own.
+
+## 10. Built-ins (`kabir/builtins.py`)
 
 Each built-in is a plain Python function `(interp, node, args) -> value`, wrapped in a `BuiltinFunction(name, impl)` and registered in the `BUILTINS` dict; `build_builtins()` returns a fresh `{name: BuiltinFunction}` mapping for each interpreter. To add a built-in, write one function, add one line to `BUILTINS`, document it in `docs/LANGUAGE.md`, and add tests in `tests/test_builtins.py` — no other wiring exists.
 
@@ -227,7 +394,7 @@ The standard library lives in its own file so `builtins.py` stays the core. It f
 - **`pi` / `e`:** defined in `__init__` as globals (`self.globals.define("pi", math.pi)`), shadowable by `let` like any built-in name.
 - **String methods:** the `STRING_METHODS` table lives here too — `{"upper": _str_upper, …}`, nine plain functions `(interp, node, receiver, args) -> value` following the same conventions. The interpreter imports the table; see §4 for how `_compute_Member` dispatches on it.
 
-## 6. Errors (`kabir/errors.py`)
+## 11. Errors (`kabir/errors.py`)
 
 `KabirError` carries `message`, `filename`, `line`, `col`, and `source_line`. `render()` produces the canonical format:
 
@@ -239,20 +406,32 @@ file:line:col: message
 
 `error_at(message, filename, lines, line, col)` builds one from a list of source lines. Lexer, parser, and interpreter all build errors through this helper, so the format is identical no matter where the error comes from. `__str__` is `render()`, so printing the exception prints the friendly form.
 
-## 7. CLI and REPL (`kabir/cli.py`)
+## 12. CLI and REPL (`kabir/cli.py`)
 
 `main(argv=None)` is the entry point (also the `[project.scripts]` target — see `pyproject.toml`). Dispatch, in order:
 
 1. No arguments → `repl()`.
 2. `-h` / `--help` / `help` → print `HELP_TEXT`, exit `0`.
 3. `-v` / `--version` / `version` → print `kabir <version>`, exit `0`.
-4. `run <file>` → `run_file(path)`; exactly one file, else a usage error (exit `2`).
-5. `repl` → `repl()`; no extra arguments.
-6. `fmt [--check] <file> ...` → `fmt_files(paths, check)`; at least one file, else a usage error (exit `2`). `--check` only reports files that would change and exits `1` when any would; otherwise files are rewritten in place and the exit code is `0`, or `1` if any file could not be read, parsed, or written.
-7. An argument ending in `.kbr` → `run_file` directly (a convenience shortcut not shown in `--help`).
-8. Anything else → usage error (exit `2`), help text printed to stderr.
+4. `run [--interp] <file-or-dir>` → `run_file(path, use_interp)`; exactly one target, else a usage error (exit `2`).
+5. `new <name>` → `new_project(name)`; prints `Created new Kabir project "<name>" in <path>`.
+6. `build [dir]` → `build_project(dir or ".")`; prints `Built <name> v<version> -> <output>`.
+7. `repl` → `repl()`; no extra arguments.
+8. `fmt [--check] <file> ...` → `fmt_files(paths, check)`; at least one file, else a usage error (exit `2`). `--check` only reports files that would change and exits `1` when any would; otherwise files are rewritten in place and the exit code is `0`, or `1` if any file could not be read, parsed, or written.
+9. An argument ending in `.kbr` or `.kbc`, or a directory → `run_file` directly (a convenience shortcut not shown in `--help`).
+10. Anything else → usage error (exit `2`), help text printed to stderr.
 
-`run_file()` reads the file as UTF-8, runs it through `Interpreter.run_source`, and on `KabirError` prints `err.render()` to stderr and returns `1`. It also catches `RecursionError` (deep expression nesting) and reports it as the recursion error. A missing or unreadable file is a usage error (exit `2`), not a Kabir error.
+`run_file()` reads the file as UTF-8 (a `.kbc` file goes to
+`run_bytecode()`, which loads it with `load_bytecode` and runs it in
+the VM; a directory with a `Kabir.toml` resolves to its `src/main.kbr`
+via `run_project`, a directory without one is a usage error). The VM
+path is parse → `check_program` → `compile_program` → `VM.run_code`,
+so a type error fails before any code executes; the `--interp` path
+runs the legacy `Interpreter` instead and skips type checking. On
+`KabirError` it prints `err.render()` to stderr and returns `1`. It
+also catches `RecursionError` (deep expression nesting) and reports
+it as the recursion error. A missing or unreadable file is a usage
+error (exit `2`), not a Kabir error.
 
 `repl()` prints the banner, then loops on `input()` with prompt `kabir> ` (or `... ` while a multi-line construct is open). Multi-line input is brace-aware: `_braces_balanced()` counts `{`/`}` outside strings and comments, and the REPL keeps reading until the depth returns to zero — that is how you type a `func` definition across lines. `exit`/`quit` (typed on an empty buffer), Ctrl-D (`EOFError`), and Ctrl-C (`KeyboardInterrupt`, which clears the buffer) all leave cleanly. Each parsed statement is run with `run_stmt` against one long-lived `Interpreter`, so variables persist between lines; if a statement is an `ExprStmt`, its value is printed with `format_value` — that is why typing `x + 1` in the REPL prints `6`.
 
@@ -260,9 +439,11 @@ History is stdlib `readline`, wired up by `_setup_history()` / `_save_history()`
 
 `fmt_files()` reads each file, formats it through `formatter.format_source()` (which parses it first — a syntax error is reported and the file is skipped, never written), and writes the result back only when it differs. With `--check` nothing is written; the files that would change are printed and the exit code is `1`.
 
-## 8. Testing
+## 13. Testing
 
-`python tests/run_tests.py` discovers `tests/test_*.py` with plain `unittest` (verbosity 2) and exits non-zero on any failure. The 211 tests are split by layer, mirroring this document:
+`python tests/run_tests.py` discovers `tests/test_*.py` with plain
+`unittest` (verbosity 2) and exits non-zero on any failure. The tests
+are split by layer, mirroring this document:
 
 | File | Covers |
 | --- | --- |
@@ -277,19 +458,27 @@ History is stdlib `readline`, wired up by `_setup_history()` / `_save_history()`
 | `tests/test_formatter.py` | `kabir fmt` rules, idempotency, `--check`, invalid files, meaning preserved across formatting |
 | `tests/test_repl_history.py` | REPL history setup/save across restarts, missing and unwritable history files |
 | `tests/test_examples.py` | Every file in `examples/` runs and produces its expected output |
+| `tests/test_match.py` | `match` parsing and interpreter behaviour: all pattern kinds, guards, nesting, no-match error |
+| `tests/test_types_syntax.py` | Type annotation parsing, annotations ignored at runtime, formatter round-trips |
+| `tests/test_checker.py` | The type checker: every rule, builtin/stdlib signatures, untyped code passes |
+| `tests/test_compiler_vm.py` | Compiler + VM: every example's output identical between VM and interpreter, closures, imports, match, bytecode round-trip, compile-time errors |
+| `tests/test_project.py` | `kabir new` scaffolding, manifest parsing, `kabir build` round-trip |
+| `tests/test_cli_2_0.py` | CLI wiring: type errors inside `kabir run`, `--interp`, `new`/`build`/project-dir/`.kbc` commands |
 
-There is no test framework dependency and no mocking — tests drive the real `Interpreter` and compare real output.
+There is no test framework dependency and no mocking — tests drive the real `Interpreter` and `VM` and compare real output. The VM/interpreter equivalence tests are the safety net for the compiler: any behaviour change shows up there first.
 
-## 9. Where to change things
+## 14. Where to change things
 
 | You want to… | Touch… |
 | --- | --- |
-| Add a keyword | `KEYWORDS` in `lexer.py`, a parse rule in `parser.py`, a node in `ast_nodes.py`, an evaluator method in `interpreter.py`, docs, tests |
+| Add a keyword | `KEYWORDS` in `lexer.py`, a parse rule in `parser.py`, a node in `ast_nodes.py`, an evaluator method in `interpreter.py` **and** a compiler case in `compile.py`, docs, tests |
 | Add a built-in | One function + one `BUILTINS` line in `builtins.py`, docs, tests |
 | Add a standard-library function | One function + one `STDLIB` line in `stdlib.py`, docs in the Standard library section, tests in `tests/test_stdlib.py` |
 | Add a string method | One function + one `STRING_METHODS` entry in `stdlib.py`, docs, tests in `tests/test_string_methods.py` |
-| Add `import` | A new statement type end-to-end (lexer keyword, AST node, parser rule, interpreter `_load_module` + module cache + file stack), docs, tests in `tests/test_import.py` |
-| Add an operator | Lexer op tables, a parser precedence level, `_binary()`/`_compute_UnaryOp`, docs, tests |
+| Add `import` | A new statement type end-to-end (lexer keyword, AST node, parser rule, interpreter `_load_module` + module cache + file stack, compiler `IMPORT` + VM import handling), docs, tests in `tests/test_import.py` |
+| Add an operator | Lexer op tables, a parser precedence level, `binary_op()` in `semantics.py` (both runtimes change together), docs, tests |
+| Add a type-check rule | One rule in `checker.py`, tests in `tests/test_checker.py` |
+| Add a bytecode instruction | An emitter case in `compile.py`, a dispatch case in `vm.py` (`_loop`), docs in this file, tests in `tests/test_compiler_vm.py` |
 | Change the canonical style | The style rules in `kabir/formatter.py` (`_Printer`), docs in `docs/LANGUAGE.md` (Formatter section), tests in `tests/test_formatter.py` |
 | Change error wording | The message string where it is raised — rendering is centralised in `errors.py` |
-| Change number formatting | `format_value()` in `interpreter.py` — it is the single formatting path |
+| Change number formatting | `format_value()` in `semantics.py` — it is the single formatting path for both runtimes |

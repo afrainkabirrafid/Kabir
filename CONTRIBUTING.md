@@ -11,7 +11,7 @@ $ git clone https://github.com/afrainkabirrafid/kabir.git
 $ cd kabir
 $ python -m kabir run examples/hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 1.2.0.
+Welcome to Kabir version 2.0.0.
 2 + 3 = 5
 ```
 
@@ -26,7 +26,7 @@ Ran 176 tests in 0.818s
 OK
 ```
 
-The suite is split by layer — `tests/test_lexer.py`, `tests/test_parser.py`, `tests/test_interpreter.py`, `tests/test_builtins.py`, `tests/test_errors.py`, and `tests/test_examples.py` (which runs every file in `examples/`). If you change behaviour in one layer, the tests for that layer are the first place to look. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the layers fit together.
+The suite is split by layer — `tests/test_lexer.py`, `tests/test_parser.py`, `tests/test_interpreter.py`, `tests/test_builtins.py`, `tests/test_errors.py`, `tests/test_examples.py` (which runs every file in `examples/`), plus `tests/test_match.py`, `tests/test_types_syntax.py`, `tests/test_checker.py`, `tests/test_compiler_vm.py`, `tests/test_project.py`, and `tests/test_cli_2_0.py` for the 2.0.0 layers. If you change behaviour in one layer, the tests for that layer are the first place to look. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the layers fit together.
 
 ## How to contribute
 
@@ -61,7 +61,7 @@ Follow the existing conventions: use `_need()` for argument counts, `_is_number(
 
 ## Adding syntax
 
-A new construct touches four places, in order: a node class in `kabir/ast_nodes.py`, a parse rule in `kabir/parser.py`, an evaluator method (`_run_…` / `_compute_…`) in `kabir/interpreter.py`, and tests plus documentation. If the construct needs a new keyword, add it to `KEYWORDS` in `kabir/lexer.py` first. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#9-where-to-change-things) for the map.
+A new construct touches five places, in order: a node class in `kabir/ast_nodes.py`, a parse rule in `kabir/parser.py`, an evaluator method (`_run_…` / `_compute_…`) in `kabir/interpreter.py`, a compiler case in `kabir/compile.py` plus a VM dispatch case in `kabir/vm.py`, and tests plus documentation. If the construct needs a new keyword, add it to `KEYWORDS` in `kabir/lexer.py` first. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#14-where-to-change-things) for the map.
 
 ## Examples
 

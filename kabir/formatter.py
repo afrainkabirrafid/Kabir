@@ -248,6 +248,10 @@ class _Printer:
     def _stmt_lines(self, stmt, level):
         indent = INDENT * level
         if isinstance(stmt, ast.LetStmt):
+            if getattr(stmt, "type_ann", None) is not None:
+                return [indent + "let %s: %s = %s"
+                        % (stmt.name, stmt.type_ann.name,
+                           self._fmt_expr(stmt.value, level))]
             return [indent + "let %s = %s"
                     % (stmt.name, self._fmt_expr(stmt.value, level))]
         if isinstance(stmt, ast.AssignStmt):
@@ -293,14 +297,21 @@ class _Printer:
             line += "  " + close_comment
         return line
 
+    def _fmt_func_header(self, stmt):
+        """The `func name(params) -> Ret {` header, without indent."""
+        types = getattr(stmt, "param_types", None) or [None] * len(stmt.params)
+        params = ", ".join(
+            p if t is None else "%s: %s" % (p, t.name)
+            for p, t in zip(stmt.params, types))
+        ret = getattr(stmt, "return_type", None)
+        ret_text = (" -> %s" % ret.name) if ret is not None else ""
+        if stmt.name is not None:
+            return "func %s(%s)%s {" % (stmt.name, params, ret_text)
+        return "func(%s)%s {" % (params, ret_text)
+
     def _fmt_func(self, stmt, level):
         indent = INDENT * level
-        params = ", ".join(stmt.params)
-        if stmt.name is not None:
-            header = "func %s(%s) {" % (stmt.name, params)
-        else:
-            header = "func(%s) {" % params
-        lines = [indent + header]
+        lines = [indent + self._fmt_func_header(stmt)]
         body, close = self._fmt_block(stmt.body, level + 1)
         lines.extend(body)
         lines.append(self._close_line(level, close))
@@ -372,6 +383,10 @@ class _Printer:
                 return "false", _PRIMARY_PREC
             if isinstance(value, (int, float)):
                 return _format_number(value), _PRIMARY_PREC
+            if isinstance(value, str):
+                # Only a string literal in a match pattern reaches
+                # here as a Literal; ordinary strings are StringLiteral.
+                return _quote(value), _PRIMARY_PREC
             raise AssertionError("formatter: bad literal %r" % (value,))
         if isinstance(node, ast.StringLiteral):
             return self._fmt_string(node), _PRIMARY_PREC
@@ -412,16 +427,43 @@ class _Printer:
             return "%s.%s" % (obj, node.name), _POSTFIX_PREC
         if isinstance(node, ast.FuncDecl):
             return self._fmt_func_expr(node, level), _PRIMARY_PREC
+        if isinstance(node, ast.MatchExpr):
+            return self._fmt_match(node, level), _PRIMARY_PREC
         raise AssertionError("formatter: unknown expression %r" % (node,))
 
     def _fmt_func_expr(self, node, level):
         """An anonymous function as an expression value."""
-        params = ", ".join(node.params)
-        lines = ["func(%s) {" % params]
+        lines = [self._fmt_func_header(node)]
         body, close = self._fmt_block(node.body, level + 1)
         lines.extend(body)
         lines.append(self._close_line(level, close))
         return "\n".join(lines)
+
+    def _fmt_match(self, node, level):
+        """A match expression: one line if it fits in 80 characters,
+        else one arm per line."""
+        scrut = self._fmt_expr(node.scrutinee, level)
+        arms = [self._fmt_arm(a, level) for a in node.arms]
+        if arms:
+            one_line = "match %s { %s }" % (scrut, ", ".join(arms))
+        else:
+            one_line = "match %s { }" % scrut
+        if "\n" not in one_line and len(one_line) <= MAX_ONE_LINE:
+            return one_line
+        indent = INDENT * (level + 1)
+        close = INDENT * level
+        return ("match %s {\n" % scrut
+                + ",\n".join(indent + a for a in arms)
+                + "\n" + close + "}")
+
+    def _fmt_arm(self, arm, level):
+        if isinstance(arm.pattern, ast.Wildcard):
+            text = "_"
+        else:
+            text = self._fmt_expr(arm.pattern, level)
+        if arm.guard is not None:
+            text += " if " + self._fmt_expr(arm.guard, level)
+        return "%s => %s" % (text, self._fmt_expr(arm.body, level))
 
     def _fmt_string(self, node):
         parts = []

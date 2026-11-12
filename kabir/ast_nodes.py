@@ -26,10 +26,11 @@ class Block(Node):
 # --- Statements -------------------------------------------------------
 
 class LetStmt(Node):
-    def __init__(self, name, value, line=None, col=None):
+    def __init__(self, name, value, line=None, col=None, type_ann=None):
         super().__init__(line, col)
         self.name = name
         self.value = value
+        self.type_ann = type_ann  # TypeAnn or None
 
 
 class AssignStmt(Node):
@@ -47,11 +48,16 @@ class ExprStmt(Node):
 
 
 class FuncDecl(Node):
-    def __init__(self, name, params, body, line=None, col=None):
+    def __init__(self, name, params, body, line=None, col=None,
+                 param_types=None, return_type=None):
         super().__init__(line, col)
         self.name = name      # may be None for an anonymous func expression
         self.params = params  # list of names
         self.body = body      # Block
+        # param_types: list parallel to params, each a TypeAnn or None;
+        # return_type: a TypeAnn or None. Both None when unannotated.
+        self.param_types = param_types
+        self.return_type = return_type
 
 
 class ReturnStmt(Node):
@@ -165,3 +171,31 @@ class Member(Node):
         super().__init__(line, col)
         self.object = object  # receiver expression node
         self.name = name      # method name as a plain string
+
+
+# --- 2.0.0 additions: type annotations and match ----------------------
+
+class TypeAnn(Node):
+    def __init__(self, name, line=None, col=None):
+        super().__init__(line, col)
+        self.name = name      # type name as written, e.g. "number"
+
+
+class Wildcard(Node):
+    """The `_` pattern in a match arm: matches anything, binds nothing."""
+    pass
+
+
+class MatchArm(Node):
+    def __init__(self, pattern, guard, body, line=None, col=None):
+        super().__init__(line, col)
+        self.pattern = pattern  # Literal | Var | Wildcard
+        self.guard = guard      # expression or None
+        self.body = body        # expression
+
+
+class MatchExpr(Node):
+    def __init__(self, scrutinee, arms, line=None, col=None):
+        super().__init__(line, col)
+        self.scrutinee = scrutinee
+        self.arms = arms        # list of MatchArm

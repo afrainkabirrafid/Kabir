@@ -25,7 +25,7 @@ $ git clone https://github.com/afrainkabirrafid/kabir.git
 $ cd kabir
 $ python -m kabir run examples/hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 1.2.0.
+Welcome to Kabir version 2.0.0.
 2 + 3 = 5
 ```
 
@@ -40,7 +40,7 @@ let name = "Rafid"
 let language = "Kabir"
 
 print("Hello, {name}!")
-print("Welcome to {language} version 1.2.0.")
+print("Welcome to {language} version 2.0.0.")
 print("2 + 3 = {2 + 3}")
 ```
 
@@ -49,7 +49,7 @@ Run it:
 ```console
 $ python -m kabir run hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 1.2.0.
+Welcome to Kabir version 2.0.0.
 2 + 3 = 5
 ```
 
@@ -69,7 +69,7 @@ All commands work both as `python -m kabir ...` (zero-install, from a fresh clon
 
 ```console
 $ python -m kabir --version
-kabir 1.2.0
+kabir 2.0.0
 ```
 
 ### The `kabir` command
@@ -78,7 +78,7 @@ The repository ships an executable launcher at `bin/kabir`:
 
 ```console
 $ ./bin/kabir --version
-kabir 1.2.0
+kabir 2.0.0
 $ ./bin/kabir run examples/fizzbuzz.kbr
 ```
 
@@ -88,7 +88,7 @@ It lives in `bin/` for a real reason: a repo-root file named `kabir` cannot coex
 
 ```console
 $ python -m kabir repl
-Kabir 1.2.0 -- type 'exit' or press Ctrl-D to leave.
+Kabir 2.0.0 -- type 'exit' or press Ctrl-D to leave.
 kabir> let x = 5
 kabir> x + 1
 6
@@ -298,20 +298,20 @@ Zero dependencies here too — the suite is plain `unittest`, run by a small run
 
 ```console
 $ python tests/run_tests.py
-Ran 211 tests in 1.918s
+Ran 441 tests in 3.1s
 
 OK
 ```
 
-The 211 tests cover the lexer, parser, interpreter, built-ins, standard library, string methods, imports, errors, the formatter, REPL history, and every example in `examples/`. Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+The 441 tests cover the lexer, parser, interpreter, compiler and VM, type checker, `match`, built-ins, standard library, string methods, imports, errors, the formatter, REPL history, project tooling, and every example in `examples/`. Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Honest limits
 
-Kabir 1.2.0 is a small language, and it is honest about what it is not:
+Kabir 2.0.0 is a small language, and it is honest about what it is not:
 
-- **No JIT, no native compilation.** It is a tree-walking interpreter; it is fast enough for scripts and learning, not for number-crunching.
+- **No JIT, no native compilation.** Programs compile to bytecode and run on a stack virtual machine — noticeably faster than the old tree-walking interpreter, but still not native code.
 - **`import` loads other `.kbr` files** — a program can be split across files, and each file runs once (see the [roadmap](#roadmap) for what is still missing).
-- **No package manager.** There is no package registry; `import` loads a file by path, and the standard library is the 15 core built-ins plus the `random`/`math` functions and string methods listed above.
+- **No package manager.** There is no package registry; `kabir new` / `kabir build` manage local projects, `import` loads a file by path, and the standard library is the 15 core built-ins plus the `random`/`math` functions and string methods listed above.
 - **No file I/O, no dates, no networking.** The only way in or out is `print` and `input` (plus `import`, which reads `.kbr` files).
 - **Recursion depth is capped** at 500 nested calls, and there is no tail-call optimisation.
 - **One number type** means no separate integer/float semantics; a power that overflows float range fails with a friendly error, while integer powers use arbitrary-precision integers.
@@ -324,7 +324,8 @@ Roughly in order, and open to discussion:
 2. **Standard-library modules** — starting with `random` (so the guessing game gets a real secret), then string helpers and math. — done in 1.1.0 (random, math, and string methods as built-ins)
 3. **A formatter** (`kabir fmt`) for canonical `.kbr` style. — done in 1.2.0
 4. **Pip packaging** — published to PyPI as `kabir-lang` in 1.1.0, so `pip install kabir-lang` gives you the `kabir` command. (The name `kabir` itself is taken on PyPI by an unrelated package.)
-5. **More of the language** — `else` on loops is not planned; instead: string methods — done in 1.1.0, better REPL history — done in 1.2.0, and a `switch`-style construct only if it earns its place.
+5. **More of the language** — `else` on loops is not planned; instead: string methods — done in 1.1.0, better REPL history — done in 1.2.0, and a `switch`-style construct only if it earns its place — done in 2.0.0 as `match`.
+6. **Compiled, typed, tooled (2.0.0)** — a bytecode compiler and stack VM (`kabir run` now executes compiled bytecode; the old tree-walking interpreter stays for the REPL and behind `kabir run --interp`), opt-in static types (`let x: number`, `fn f(a: number) -> number`), Rust-style `match` expressions, and Cargo-style projects (`kabir new`, `kabir build` to `target/<name>.kbc`). — done in 2.0.0 (see [CHANGELOG.md](CHANGELOG.md))
 
 Ideas and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

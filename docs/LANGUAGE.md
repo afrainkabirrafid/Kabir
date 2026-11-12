@@ -1,4 +1,4 @@
-# Kabir Language Reference — version 1.2.0
+# Kabir Language Reference — version 2.0.0
 
 This is the complete reference for the Kabir language. Every code block in this document is a real, runnable Kabir program, and every output block is the exact output it produces. Run any example with:
 
@@ -30,13 +30,16 @@ For how to run programs, start the REPL, and read error messages, see the [READM
 - [while](#while)
 - [for](#for)
 - [break and continue](#break-and-continue)
+- [match](#match)
 - [Functions](#functions)
+- [Static types (opt-in)](#static-types-opt-in)
 - [Import](#import)
 - [Built-in functions](#built-in-functions)
 - [Standard library](#standard-library)
 - [Errors](#errors)
 - [Formatter](#formatter)
 - [REPL history](#repl-history)
+- [Projects](#projects)
 - [What Kabir does not have (yet)](#what-kabir-does-not-have-yet)
 
 ## Program structure
@@ -1017,6 +1020,75 @@ demo.kbr:1:1: 'break' can only be used inside a loop
   ^
 ```
 
+## match
+
+`match` tests one value against a list of patterns and evaluates the
+first arm that fits — Rust-style pattern matching, in one expression.
+Arms are tried in order; the first matching arm wins and the rest are
+not evaluated.
+
+```kabir
+let label = match x { 0 => "zero", 1 => "one", _ => "other" }
+print(label)
+```
+
+An arm is `<pattern> => <expression>`, with arms separated by commas
+(a trailing comma is allowed). There are three kinds of pattern:
+
+- **Literal** — a number, string, `true`, `false`, or `null`. The arm
+  matches when the value equals the literal.
+- **Binding** — a bare name (`n`). It always matches and binds the
+  value to that name for the arm's expression. Because it always
+  matches, arms after a binding arm are unreachable.
+- **Wildcard** — `_`. It always matches and binds nothing.
+
+```kabir
+let kind = match n {
+    0 => "zero",
+    1 => "one",
+    x if x > 1 => "big",
+    _ => "negative",
+}
+```
+
+A guard (`if <condition>` between the pattern and `=>`) adds a further
+test: the arm matches only when both the pattern and the guard hold.
+A guard must be a boolean (when its type is known).
+
+`match` is an expression, so it works anywhere an expression works —
+in `let`, in `return`, as a call argument, and as a statement on its
+own line:
+
+```kabir
+func label(n) {
+    return match n { 0 => "zero", _ => "other" }
+}
+
+match cmd {
+    "go" => print("going"),
+    "stop" => print("stopping"),
+    _ => print("unknown command"),
+}
+```
+
+If no arm matches, it is an error:
+
+```kabir
+match 5 { 0 => "zero" }
+```
+
+Error:
+
+```text
+demo.kbr:1:1: No pattern matched the value 5
+  match 5 { 0 => "zero" }
+  ^
+```
+
+When the scrutinee's type is known (see [Static types](#static-types-opt-in)),
+a literal pattern of a different type is a compile-time error —
+`match "a" { 0 => "zero", _ => "other" }` fails before the program runs.
+
 ## Functions
 
 ### Named functions
@@ -1171,6 +1243,84 @@ Output:
 ```
 
 (This is `examples/fibonacci.kbr`, extended to the first 10 numbers; the example file itself prints the first 15.)
+
+## Static types (opt-in)
+
+Types in Kabir are optional. Unannotated code works exactly as before —
+nothing is checked, nothing breaks. Add an annotation and the compiler
+checks it **before the program runs**: a mistyped program fails at
+compile time with a clear error instead of crashing halfway through.
+
+The types are `number`, `string`, `bool`, `array`, `dict`, `function`,
+and `any` (`any` means "unchecked" — it accepts everything).
+
+### Annotations
+
+```kabir
+let x: number = 5
+let name: string = "Rafid"
+let tags: array = ["a", "b"]
+
+func add(a: number, b: number) -> number {
+    return a + b
+}
+```
+
+Annotate a `let`, a parameter, or a function's return type (`-> Type`
+after the parameter list). You can annotate some parameters and leave
+others bare — unannotated parts stay dynamic.
+
+### What is checked
+
+- **Annotated `let`** — the value's type must match the annotation.
+- **Function arguments** — calling an annotated function with the wrong
+  argument type is an error (only when the callee's annotations are
+  known).
+- **Return values** — a `return` inside an annotated function must give
+  the annotated type. A bare `return` gives `null`.
+- **Operators** — `- * / % **` need numbers; `+` needs two numbers, two
+  strings, or two arrays; comparisons need two numbers or two strings.
+- **Conditions** — `if` / `while` conditions and `match` guards must be
+  booleans (when their type is known).
+- **`for`** — the iterable must be an array, a string, or a dict.
+- **`match`** — a literal pattern of a different type from the
+  scrutinee is an error; a binding arm takes the scrutinee's type.
+
+Checks only fire when the types are statically known. An unannotated
+`let` takes the inferred type of its value, and an unannotated
+parameter has type `any` — and `any` never causes an error:
+
+```kabir
+let x = "hello"   # x is inferred as string
+let y: number = x # error: x is a string, not a number
+
+func show(v) {    # v is any
+    let n: number = v  # fine: any accepts the annotation
+    print(n)
+}
+```
+
+But this fails before running:
+
+```kabir
+let x: number = "hello"
+```
+
+Error:
+
+```text
+demo.kbr:1:17: Variable 'x' is declared as number, but the value is a string -- give it a number, or change the annotation
+  let x: number = "hello"
+                  ^
+```
+
+### What is NOT checked
+
+The checker is type-only. It never reports undefined variables, wrong
+argument counts, or anything that can only be known at run time —
+those are still runtime errors, reported the same way as before.
+Annotations are ignored at run time: `kabir run --interp` (the legacy
+interpreter path) does not check types at all.
 
 ## Import
 
@@ -1886,16 +2036,49 @@ Parentheses are added only where meaning needs them: `(a + b) * c` keeps its par
 
 The REPL remembers your lines. Press up/down to recall previous lines, and the history is saved to `~/.kabir_history` when the REPL exits, so it is still there next time you start it. If `readline` is not available (or the history file cannot be read or written), the REPL simply runs without history — nothing else changes.
 
+## Projects
+
+For anything bigger than one file, make a project. `kabir new` scaffolds
+it, `kabir build` compiles it to bytecode, and `kabir run` runs it.
+
+```console
+$ kabir new my_app
+Created new Kabir project "my_app" in my_app
+$ kabir build my_app
+Built my_app v0.1.0 -> /path/to/my_app/target/my_app.kbc
+$ kabir run my_app
+Hello from my_app!
+$ kabir run my_app/target/my_app.kbc
+Hello from my_app!
+```
+
+A project is a directory with a `Kabir.toml` manifest:
+
+```toml
+[package]
+name = "my_app"
+version = "0.1.0"
+authors = ["Afrain Kabir Rafid"]
+```
+
+plus `src/main.kbr` (the entry point — `build` compiles it and its
+imports, resolved relative to `src/`) and a `.gitignore` that ignores
+`target/`. `kabir build` type-checks first, then writes the compiled
+bytecode to `target/<name>.kbc` — a JSON file you can run directly with
+`kabir run <file.kbc>`. There is no central package registry and no
+network fetching: projects are local, and `import` loads `.kbr` files
+by path, as always.
+
 ## What Kabir does not have (yet)
 
-To avoid surprises, the things people most often expect that are **not** in 1.2.0:
+To avoid surprises, the things people most often expect that are **not** in 2.0.0:
 
 - **File I/O, dates, networking** — `print` and `input` are the only way in or out (plus `import`, which reads `.kbr` files).
 - **Dot access on dicts** — write `user["name"]`, not `user.name`.
-- **`switch`/`match`, `else` on loops, ternary `?:`** — none of these exist; `if`/`elif`/`else` covers the conditional ground.
+- **`else` on loops, ternary `?:`** — none of these exist; `if`/`elif`/`else` covers the conditional ground.
 - **A step argument for `range()`** — `range(a, b)` only; there is no `range(a, b, step)`.
 - **Assignment as an expression** — `let x = y = 1` and `print(x = 1)` are errors.
 - **Tail-call optimisation** — recursion is capped at 500 nested calls.
-- **A JIT or native compilation** — Kabir is a tree-walking interpreter by design (see [ARCHITECTURE.md](ARCHITECTURE.md)).
+- **A JIT or native compilation** — programs compile to bytecode and run on a stack VM (see [ARCHITECTURE.md](ARCHITECTURE.md)); there is no machine-code backend.
 
 The roadmap for these lives in the [README](../README.md#roadmap).
