@@ -1,5 +1,29 @@
 # Kabir Changelog
 
+## 4.1.0 — 2026-11-12 — "Fearless & Everywhere" (combined 3.0.0 + 4.0.0 release)
+
+The combined release, per the Commander's order (2026-11-12): everything from the 3.0.0 checkpoint below, plus the 4.0.0 waves (borrow checker, async/await, LSP + VS Code extension, WASM target, self-hosting step 1). No breaking change to existing programs.
+
+### 3.0.0 — "Goes Native" (checkpoint, already landed)
+
+Slot-based compiler, native compilation, a package registry, opt-in ownership, and a bigger standard library. No breaking change to existing programs.
+
+- **Slot-based compiler (Wave 0)** — the bytecode format is now code dict v2: params and locals that are never captured by a nested function live in numbered slots (`LOAD_SLOT`/`STORE_SLOT`/`DEFINE_SLOT`); captured variables and top-level globals stay name-based. Honest finding: slots give **no** significant speedup (fib(25): slot VM 2.97 s vs old VM 2.70 s; per-instruction dispatch dominates, not variable lookup). Slots are the foundation for the native and WASM backends, not a speed feature.
+- **Native compilation (Wave 1)** — `kabir build --native` / `kabir run --native` transpile Kabir to C99 and compile with the system `cc`. fib(25): 2.99 s (VM) → 0.007 s native; primes to 10000: 1.93 s → 0.008 s. Compile time (~1.3 s) dominates for short programs. Memory model is **native (arena)**, not refcounting — refcounting was cut deliberately (correct retain/release needs an ownership analysis that does not exist yet). Closures and `import` are rejected with clear compile-time errors.
+- **Package registry (Wave 2)** — `kabir add <name>@<version>` fetches from a GitHub-based registry (`index.json`, `KABIR_REGISTRY` env var), verifies SHA-256, vendors into `vendor/<name>/<version>/`, and writes `Kabir.lock`. `kabir publish` builds a deterministic tarball and prints the registry-entry JSON; it pushes nothing. Exact versions only. The default registry URL does not exist yet, so `kabir add` refuses with a clear error until a real registry is set.
+- **Ownership-lite (Wave 3)** — opt-in `let mut`: arrays/dicts move on assign, call, and return; use-after-move is a compile-time error; reassignment revives. Plain `let` is untouched. The immutable-by-default break was **not** taken (pending the user's explicit yes). Passing an owned value to `print`/`len` moves it too — strict for now, may be relaxed for known read-only built-ins later.
+- **Standard library expansion (Wave 4)** — 9 new functions: `read_file`/`write_file`/`file_exists`, `json_parse`/`json_stringify`, `http_get`/`http_post` (10 s timeout), `now()`/`sleep()`. The checker now type-checks them per-name. Known quirk: a literal `{` cannot appear in a Kabir string (it starts interpolation), so JSON object text must come from `read_file`/`http_get`/`json_stringify`.
+- **Tests** — 668 tests at the checkpoint (441 in 2.0.0 + 227 new), including slot, native, registry, ownership, stdlib-3, and CLI-3.0 suites.
+
+### 4.0.0 waves
+
+- **Borrow checker (Wave 0)** — `&x` shared borrows and `&mut x` mutable borrows, checked at compile time (NLL-lite: a borrow ends at its last use); at run time a borrow is the value, zero cost. Borrow types in annotations (`&number`, `&mut array`). No explicit lifetime parameters; borrows of `a[i]` borrow the whole container; no reborrowing; no dereference operator yet (a borrowed value cannot be used in arithmetic or where the plain type is expected); no interprocedural tracking beyond signatures.
+- **Async/await + tasks and channels (Wave 1)** — `async func`, `await`, `spawn` (tasks), `chan` / `send` / `recv` (channels). Cooperative round-robin scheduler in the VM (1000-instruction quanta) with deadlock detection; `async`/`await` are real keywords. VM only — native async is out of scope (clear rejection); the interpreter/REPL rejects `async` with a clear error. Demo example `examples/async-demo.kbr` (two tasks + a channel).
+- **LSP + VS Code extension (Wave 2)** — `kabir lsp`: LSP over stdio (JSON-RPC, `Content-Length` framing); diagnostics (parse + type check on open/change), completion, hover, go-to-definition, formatting via `kabir fmt`. VS Code extension in `editors/vscode/` (language id `kabir`, syntax highlighting, client launching `kabir lsp`, local-install README). Marketplace publishing is out of scope. The extension was not run inside real VS Code here.
+- **WASM target (Wave 3)** — `kabir build --target wasm` produces `<name>.wasm` + an HTML harness. Direct WASM backend for the bytecode VM (no Emscripten); host imports `env.print_num` / `env.print_str` / `env.print_bool` / `env.print_nl` / `env.format_num`. Supported: numbers, bools, null, strings, arrays, loops, functions incl. recursion, `match`, core builtins — verified under Node v24 with VM-identical output (fibonacci, fizzbuzz). `import`, dicts, string methods, closures are rejected at build time; runtime errors trap without a message; numbers are f64 (exact to 2^53).
+- **Self-hosting, step 1 (Wave 4)** — the lexer written in Kabir itself (`selfhost/lexer.kbr`), using `read_file` + string methods. Bootstrap check: token streams match the Python lexer exactly over the full test corpus (3,899 tokens, zero mismatches). The parser in Kabir was not written — a half-written parser would be dead weight; it stays a follow-up wave.
+- **Tests** — 849 tests (441 in 2.0.0 + 408 new), including borrow (78), async (56), LSP (31), WASM (38), self-host (7), and CLI-4.0 (9) suites.
+
 ## 2.0.0 — 2026-11-12 — the biggest update yet
 
 Kabir becomes a compiled language, with opt-in types, pattern matching,

@@ -1,6 +1,6 @@
 # Kabir Architecture — how the compiler, VM, and interpreter work
 
-This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 2.0.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
+This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 4.1.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
 
 ## The big picture
 
@@ -22,8 +22,20 @@ source ──► Lexer ──► tokens ──► Parser ──► AST ──►
 - `kabir/checker.py` (~590 lines) — opt-in static type checking; raises
   `KabirError` on the first type error, passes untyped code unchanged.
 - `kabir/compile.py` (~600 lines) — AST → bytecode (a plain-dict code
-  object, JSON-serialisable as `.kbc`).
+  object, JSON-serialisable as `.kbc`). Since 3.0.0 the code dict is
+  version 2: params and locals that are never captured by a nested
+  function live in numbered **slots** (`LOAD_SLOT`/`STORE_SLOT`/
+  `DEFINE_SLOT`, `cols` + `locals` in the dict); captured variables
+  and top-level globals stay name-based through the environment chain.
+  Slot lookup is not measurably faster than name lookup (dispatch
+  dominates) — slots exist as the foundation for the native and WASM
+  backends, not as a speed feature on their own.
 - `kabir/vm.py` (~650 lines) — a stack-based VM that executes bytecode.
+- `kabir/codegen.py` (~840 lines) + `kabir/native/rt.{h,c}` — the
+  native backend (3.0.0): AST → C99 transpiler plus a small C runtime
+  (`KVal` tagged values, helpers mirroring `semantics.py`). Memory
+  model is **native (arena)** — all heap values freed at exit, not
+  refcounted. See "Native backend" below.
 - `kabir/semantics.py` — the shared runtime semantics (`is_truthy`,
   `format_value`, `kabir_equal`, `binary_op`) used by both the VM and
   the interpreter, so behaviour cannot drift between them.
@@ -32,12 +44,16 @@ source ──► Lexer ──► tokens ──► Parser ──► AST ──►
   powers the REPL and stays as the reference implementation behind
   `kabir run --interp`.
 - `kabir/builtins.py` (~237 lines) — the 15 core built-in functions.
-- `kabir/stdlib.py` (~265 lines) — the 12 standard-library functions (`random`, `math`) and the `STRING_METHODS` table.
+- `kabir/stdlib.py` (~400 lines) — the 21 standard-library functions (`random`, `math`, file I/O, JSON, HTTP, time) and the `STRING_METHODS` table.
 - `kabir/errors.py` (~49 lines) — the `KabirError` type and its rendering.
 - `kabir/formatter.py` (~499 lines) — the canonical formatter (`kabir fmt`): parses the file, then re-prints the AST with deterministic spacing, indentation and blank lines; comments are extracted from the source first and re-attached by line number.
-- `kabir/project.py` (~330 lines) — Cargo-style projects: `kabir new`
-  scaffolding, `Kabir.toml` parsing, `kabir build` to `target/<name>.kbc`.
-- `kabir/cli.py` (~330 lines) — `run` / `new` / `build` / `fmt` / `repl` / `--help` / `--version`.
+- `kabir/project.py` (~700 lines) — Cargo-style projects: `kabir new`
+  scaffolding, `Kabir.toml` parsing, `kabir build` to `target/<name>.kbc`, plus the registry (`kabir add` / `kabir publish`).
+- `kabir/cli.py` (~550 lines) — `run` / `new` / `build` (incl. `--native` and `--target wasm`) / `add` / `publish` / `lsp` / `fmt` / `repl` / `--help` / `--version`.
+- `kabir/lsp.py` — the language server (4.1.0, Wave 2): LSP over stdio, wired as `kabir lsp`. See §17.
+- `kabir/wasm.py` (~3,800 lines) — the WASM backend (4.1.0, Wave 3): direct WASM backend for the bytecode VM. See §18.
+- Async executor (4.1.0, Wave 1): cooperative scheduler + tasks/channels in `kabir/vm.py`. See §16.
+- `selfhost/lexer.kbr` — the Kabir lexer written in Kabir (4.1.0, Wave 4); bootstrap check passes exactly. See §19.
 - `kabir/__init__.py` — version, author, and the public API (`Interpreter`, `parse`, `tokenize`, `KabirError`).
 - `kabir/__main__.py` — the `python -m kabir` entry point (calls `kabir.cli:main`).
 
@@ -256,6 +272,14 @@ plain strings (`"number"`, `"string"`, `"bool"`, `"array"`, `"dict"`,
   type differs from the scrutinee's is an error; unknown type names in
   annotations are an error. `any` accepts everything in `let`, param,
   and return positions.
+- **Ownership-lite (3.0.0).** `let mut` marks a value as owned; the
+  checker moves arrays/dicts on assign, call argument, and return
+  (Copy values — numbers, strings, bools, null — never move), errors
+  on use-after-move, and revives a name on reassignment. Plain `let`
+  is untouched. `mut` is contextual, not a keyword, so `let mut = 1`
+  still parses as a variable named `mut`. Passing an owned value to
+  any function moves it — including `print`/`len`, which only read it;
+  that strictness is deliberate for now (see the LANGUAGE.md section).
 - **Type-only.** The checker never reports undefined variables, wrong
   argument counts, or anything that needs run-time knowledge — those
   stay runtime errors.
@@ -263,11 +287,12 @@ plain strings (`"number"`, `"string"`, `"bool"`, `"array"`, `"dict"`,
 ## 6. Bytecode compiler (`kabir/compile.py`)
 
 `compile_program(program, filename, lines)` walks the AST and emits a
-code dict:
+code dict (version 2 since 3.0.0):
 
 ```python
 {"name": str, "params": [str], "instrs": [[op, arg], ...],
- "consts": [...], "lines": [int, ...], "filename": str}
+ "consts": [...], "lines": [int, ...], "filename": str,
+ "version": 2, "cols": {name: slot, ...}, "locals": {name: slot, ...}}
 ```
 
 `instrs[i]` is `[op, arg]` (jump targets are absolute instruction
@@ -277,7 +302,7 @@ line of that instruction, so VM errors point at the right place.
 nested function code dicts, which appear as `{"__code__": <code dict>}`.
 `compile_source(source, filename)` is parse + compile in one call.
 `save_bytecode(code, path)` / `load_bytecode(path)` write and read the
-`.kbc` format: JSON `{"magic": "KBC1", "version": 1, "main": <code>}`.
+`.kbc` format: JSON `{"magic": "KBC1", "version": 2, "main": <code>}`.
 
 The instruction set (see `kabir/compile.py` for the exact list):
 `LOAD_CONST`, `LOAD_NULL/TRUE/FALSE`, `LOAD_VAR`, `DEFINE_VAR`,
@@ -289,10 +314,17 @@ The instruction set (see `kabir/compile.py` for the exact list):
 
 Notable compilation choices:
 
-- **Variables are names, not slots.** `LOAD_VAR`/`STORE_VAR` resolve
-  through the `Environment` chain at run time, exactly like the
+- **Variables are slots where possible (3.0.0).** Inside a function,
+  params and locals that are never captured by a nested function get a
+  numbered slot (`LOAD_SLOT`/`STORE_SLOT`/`DEFINE_SLOT`, `cols` +
+  `locals` in the code dict). Captured variables and top-level globals
+  stay name-based through the `Environment` chain, exactly like the
   interpreter — so closures, shadowing, and block scoping behave
-  identically, and the compiler needs no scope analysis.
+  identically. The top level never uses slots (module exports broke
+  until that exclusion was added). Honest benchmark: slots give no
+  significant speedup over name lookup (fib(25): slot VM 2.97 s vs
+  old VM 2.70 s; dispatch dominates, not lookup) — slots are the
+  foundation for the native/WASM backends, not a speed feature.
 - **Blocks push environments.** `ENTER_SCOPE`/`EXIT_SCOPE` bracket
   every block, mirroring the interpreter's per-block `Environment`;
   a `let` inside a block never leaks out of it.
@@ -343,6 +375,50 @@ VM errors carry the source line of the faulting instruction (the
 bytecode stores lines, not columns), rendered in the same
 file:line + source-line + caret format as interpreter errors.
 
+## Native backend (`kabir/codegen.py` + `kabir/native/rt.{h,c}`)
+
+`transpile(source, filename)` walks the AST and emits C99;
+`compile_native(source, filename, out_path)` writes it to a temp file
+and runs the system `cc` (`-std=c99 -O2 -lm`, `-I kabir/native` for
+`rt.h`); `run_native(source, filename, input_text)` compiles to a temp
+binary and runs it (30 s timeout), returning `(exit_code, stdout,
+stderr)`. The CLI wires these as `kabir run --native` and
+`kabir build --native`; the transpiler does **not** run the checker —
+the CLI runs `check_program` first, like the VM path.
+
+- **Values.** A `KVal` tagged struct (`K_NULL/K_NUM/K_BOOL/K_STR/
+  K_ARR/K_DICT/K_FUNC`); numbers are C doubles; strings are heap
+  buffers; arrays/dicts are heap structs. Runtime helpers in `rt.c`
+  mirror `kabir/semantics.py` exactly (Python-style `%`, integral
+  `4/2 → 2`, same error strings where practical); `format_value` uses
+  shortest-round-trip float repr.
+- **Memory: arena, not refcounting.** One arena (`g_arena`) tracks
+  every allocation; `k_rt_cleanup()` frees it all at exit. Refcounting
+  was cut deliberately: correct retain/release across `push`/`pop`/
+  index-assignment mutation, early returns, and first-class functions
+  needs an ownership analysis that does not exist yet, and a
+  half-correct refcounting backend would be worse than a correct arena
+  one. Everything labels the model "native (arena)".
+- **Functions.** Top-level and nested non-capturing functions are
+  hoisted to C functions; recursion and mutual recursion between
+  top-level functions work; first-class function values work. A
+  static pre-pass rejects closures (a function reading a variable
+  bound in an enclosing function) and `import` with clear
+  compile-time errors — never silently wrong code.
+- **`if`/`elif` chains** compile to guarded flag blocks, because
+  conditions need preparatory statements that cannot sit between a
+  `}` and an `else if` in C.
+- **Benchmarks (honest).** fib(25): VM 2.99 s → native 0.007 s;
+  primes to 10000: VM 1.93 s → native 0.008 s. Compile time (~1.3 s,
+  mostly `cc -O2` on `rt.c`) dominates for short programs — native
+  wins on compute-heavy runs, not one-liners.
+- **Known divergences.** Integers beyond 2^53 lose precision;
+  whole-valued `1.0` is accepted as an array index (the VM errors);
+  random uses C `rand()` (same ranges, different sequence);
+  string methods/indexing are byte/ASCII-based; `http_*` is
+  `http://` only; native runtime errors print
+  `Kabir runtime error: <message>` + exit 1, with no `file:line:col`.
+
 ## 8. Shared semantics (`kabir/semantics.py`)
 
 Pure functions — `is_truthy`, `format_value`, `kabir_equal`,
@@ -361,7 +437,7 @@ runtimes change together.
   (`^[A-Za-z][A-Za-z0-9_-]*$`), refuses an existing directory, and
   writes `Kabir.toml` (`[package]` name / version `0.1.0` / authors),
   `src/main.kbr` (a `func main()` hello program plus a `main()` call),
-  and `.gitignore` (`target/`). Returns the created path.
+  and `.gitignore` (`target/` and `vendor/`). Returns the created path.
 - `build_project(path=".")` reads the manifest with a hand-rolled
   parser (no `tomllib` — the package supports Python 3.8+), compiles
   `src/main.kbr` (parse → check → compile, imports resolved relative
@@ -371,6 +447,17 @@ runtimes change together.
 - `run_project(path)` resolves `src/main.kbr` for a project directory.
 - The checker and compiler are imported lazily inside
   `build_project`, so the module stays importable on its own.
+- **Registry (3.0.0).** `add_package(name, version, project_dir,
+  registry=None)` reads the registry index (`index.json`, default
+  URL from `KABIR_REGISTRY`, refused with a clear error when it is
+  the not-yet-existing default), fetches the tarball, verifies its
+  SHA-256, vendors it into `vendor/<name>/<version>/`, adds an exact
+  version to `[dependencies]` in `Kabir.toml`, and writes
+  `Kabir.lock`. `publish_package(project_dir)` builds a
+  deterministic tarball (`target/<name>-<version>.tar.gz`), returns
+  its SHA-256, the registry-entry JSON, and the steps to publish —
+  and pushes nothing itself. Registry format:
+  `{"packages": {"name": {"1.0.0": {"url": ..., "sha256": ...}}}}`.
 
 ## 10. Built-ins (`kabir/builtins.py`)
 
@@ -389,7 +476,7 @@ The only import is `math` (for `sqrt`). Everything else is plain Python.
 
 The standard library lives in its own file so `builtins.py` stays the core. It follows the exact same pattern — plain Python functions `(interp, node, args) -> value`, wrapped in `BuiltinFunction`, collected in a `STDLIB` dict, exposed by `build_stdlib()` — and reuses the helpers from `builtins.py` (`_need`, `_is_number`, `_type_name`) rather than duplicating them. `Interpreter.__init__` merges `build_stdlib()` into the globals right after `build_builtins()`; `stdlib.py` does not import the interpreter (no circular import).
 
-- **The 12 functions:** `randint`, `randrange`, `choice`, `shuffle`, `seed` (backed by Python's `random`), and `floor`, `ceil`, `sin`, `cos`, `tan`, `log`, `exp` (backed by Python's `math`). `sqrt`/`pow`/`abs` stay in `builtins.py` — they were already global, documented, and tested there, and moving them would be churn with no user-visible benefit.
+- **The 21 functions:** `randint`, `randrange`, `choice`, `shuffle`, `seed` (backed by Python's `random`), and `floor`, `ceil`, `sin`, `cos`, `tan`, `log`, `exp` (backed by Python's `math`), plus the 3.0.0 additions `read_file`, `write_file`, `file_exists` (plain file I/O, `open`/`os.path`), `json_parse`, `json_stringify` (Python's `json`), `http_get`, `http_post` (`urllib.request`, 10 s timeout), and `now`, `sleep` (`time`). `sqrt`/`pow`/`abs` stay in `builtins.py` — they were already global, documented, and tested there, and moving them would be churn with no user-visible benefit.
 - **RNG placement:** one `random.Random()` instance per `Interpreter` (`self._random`, created in `__init__`). Every random function goes through `interp._random`, so two interpreters — and therefore two tests — are independent. A module-level RNG would let one test's `seed()` change another's sequence.
 - **`pi` / `e`:** defined in `__init__` as globals (`self.globals.define("pi", math.pi)`), shadowable by `let` like any built-in name.
 - **String methods:** the `STRING_METHODS` table lives here too — `{"upper": _str_upper, …}`, nine plain functions `(interp, node, receiver, args) -> value` following the same conventions. The interpreter imports the table; see §4 for how `_compute_Member` dispatches on it.
@@ -413,13 +500,15 @@ file:line:col: message
 1. No arguments → `repl()`.
 2. `-h` / `--help` / `help` → print `HELP_TEXT`, exit `0`.
 3. `-v` / `--version` / `version` → print `kabir <version>`, exit `0`.
-4. `run [--interp] <file-or-dir>` → `run_file(path, use_interp)`; exactly one target, else a usage error (exit `2`).
+4. `run [--interp | --native] <file-or-dir>` → `run_file(path, use_interp, use_native)`; exactly one target, else a usage error (exit `2`). `--interp` and `--native` together are a usage error. `--native` needs a `.kbr` file (not `.kbc`); it parses, type-checks, compiles to a temp binary with `codegen.compile_native`, and runs it with inherited stdio so `input()` works interactively.
 5. `new <name>` → `new_project(name)`; prints `Created new Kabir project "<name>" in <path>`.
-6. `build [dir]` → `build_project(dir or ".")`; prints `Built <name> v<version> -> <output>`.
-7. `repl` → `repl()`; no extra arguments.
-8. `fmt [--check] <file> ...` → `fmt_files(paths, check)`; at least one file, else a usage error (exit `2`). `--check` only reports files that would change and exits `1` when any would; otherwise files are rewritten in place and the exit code is `0`, or `1` if any file could not be read, parsed, or written.
-9. An argument ending in `.kbr` or `.kbc`, or a directory → `run_file` directly (a convenience shortcut not shown in `--help`).
-10. Anything else → usage error (exit `2`), help text printed to stderr.
+6. `build [--native] [dir]` → `build_project(dir or ".")`; prints `Built <name> v<version> -> <output>`. `--native` instead parses, type-checks, and compiles the entry to `target/<name>` with `codegen.compile_native`, printing `Built <name> v<version> (native, arena) -> <output>`.
+7. `add <name>@<version> [dir]` → `add_package(name, version, dir)`; an exact version is required (no `@` is a usage error, exit `2`); prints `Added <name> <version> -> <vendor_dir> (lockfile Kabir.lock)`.
+8. `publish [dir]` → `publish_package(dir)`; prints the tarball path, its SHA-256, the registry-entry JSON, and the steps.
+9. `repl` → `repl()`; no extra arguments.
+10. `fmt [--check] <file> ...` → `fmt_files(paths, check)`; at least one file, else a usage error (exit `2`). `--check` only reports files that would change and exits `1` when any would; otherwise files are rewritten in place and the exit code is `0`, or `1` if any file could not be read, parsed, or written.
+11. An argument ending in `.kbr` or `.kbc`, or a directory → `run_file` directly (a convenience shortcut not shown in `--help`).
+12. Anything else → usage error (exit `2`), help text printed to stderr.
 
 `run_file()` reads the file as UTF-8 (a `.kbc` file goes to
 `run_bytecode()`, which loads it with `load_bytecode` and runs it in
@@ -452,6 +541,7 @@ are split by layer, mirroring this document:
 | `tests/test_interpreter.py` | Values, scoping, closures, loops, recursion, operators |
 | `tests/test_builtins.py` | All 15 core built-ins, argument and type errors |
 | `tests/test_stdlib.py` | The 12 standard-library functions, `pi`/`e`, RNG independence |
+| `tests/test_stdlib3.py` | The 9 new 3.0.0 stdlib functions: file I/O, JSON, HTTP, time |
 | `tests/test_string_methods.py` | All 9 string methods, chaining, method values, member errors |
 | `tests/test_import.py` | `import`, module cache, cycles, import errors, the import example |
 | `tests/test_errors.py` | Error format (location, source line, caret) |
@@ -463,7 +553,18 @@ are split by layer, mirroring this document:
 | `tests/test_checker.py` | The type checker: every rule, builtin/stdlib signatures, untyped code passes |
 | `tests/test_compiler_vm.py` | Compiler + VM: every example's output identical between VM and interpreter, closures, imports, match, bytecode round-trip, compile-time errors |
 | `tests/test_project.py` | `kabir new` scaffolding, manifest parsing, `kabir build` round-trip |
+| `tests/test_registry.py` | Registry: `add` (fetch, SHA-256, vendor, lockfile), `publish` (tarball, entry JSON), exact versions only |
+| `tests/test_ownership.py` | Ownership-lite: `let mut` moves, use-after-move errors, revival on reassignment |
+| `tests/test_slots.py` | Slot compiler: code dict v2, `LOAD_SLOT`/`STORE_SLOT`, captured vars stay name-based, VM output equivalence |
+| `tests/test_native.py` | Native backend: transpile fragments, every builtin/method, match, recursion, JSON/file I/O/HTTP e2e, closure/import errors |
 | `tests/test_cli_2_0.py` | CLI wiring: type errors inside `kabir run`, `--interp`, `new`/`build`/project-dir/`.kbc` commands |
+| `tests/test_cli_3_0.py` | CLI wiring for 3.0.0: `run --native`, `build --native`, `add`, `publish` |
+| `tests/test_lsp.py` | LSP server (4.1.0 Wave 2): protocol framing, methods, diagnostics (31 tests) |
+| `tests/test_selfhost.py` | Self-host lexer bootstrap check (4.1.0 Wave 4): exact token-stream match (7 tests) |
+| `tests/test_borrow.py` | Borrow checker (4.1.0 Wave 0): shared/mutable borrows, NLL-lite, annotations, limits (78 tests) |
+| `tests/test_async.py` | Async executor (4.1.0 Wave 1): async funcs, await, spawn, channels, deadlock (56 tests) |
+| `tests/test_wasm.py` | WASM backend (4.1.0 Wave 3): VM-vs-WASM parity under Node, build-time rejections (38 tests) |
+| `tests/test_cli_4_0.py` | CLI wiring for 4.1.0: `lsp`, `build --target wasm` (file + project), rejections (9 tests) |
 
 There is no test framework dependency and no mocking — tests drive the real `Interpreter` and `VM` and compare real output. The VM/interpreter equivalence tests are the safety net for the compiler: any behaviour change shows up there first.
 
@@ -482,3 +583,54 @@ There is no test framework dependency and no mocking — tests drive the real `I
 | Change the canonical style | The style rules in `kabir/formatter.py` (`_Printer`), docs in `docs/LANGUAGE.md` (Formatter section), tests in `tests/test_formatter.py` |
 | Change error wording | The message string where it is raised — rendering is centralised in `errors.py` |
 | Change number formatting | `format_value()` in `semantics.py` — it is the single formatting path for both runtimes |
+
+## 15. Borrow checker (4.1.0 Wave 0)
+
+The borrow checker lives in the checker (`kabir/checker.py`), with parser and AST support (`kabir/parser.py`, `kabir/ast_nodes.py`, `kabir/formatter.py`). It is compile-time only: at run time a borrow **is** the value — `&x` compiles to just `x`, zero runtime cost (`compile.py`, the interpreter, and the native backend each have a 3-line `_expr_BorrowExpr` that compiles a borrow to the borrowed expression; no new opcode, no VM change).
+
+- **Syntax.** `&x` is a shared borrow, `&mut x` a mutable borrow. The lexer adds `&` as an `OP` token. The AST gains `BorrowExpr(expr, mutable)`. Type annotations may use borrow types: `&number`, `&mut array` (`TypeAnn.borrow`: None / `"shared"` / `"mut"`, plus a `full_name` property the LSP uses for hover text).
+- **Rules enforced** (checker only): (1) while a mutable borrow of a place is live, no other access to that place — read, write, or move; (2) while shared borrows of a place are live, no mutation or move of that place; (3) a borrowed place cannot be moved while borrowed; (4) a borrow ends at its last use — NLL-lite liveness from a last-use walk within a function body (a borrow whose holder is never used ends at once); (5) lifetime elision only — a function returning a borrow must have exactly one borrowed input, else a clear error; returning a borrow of a local is an error.
+- **Documented limits.** No explicit lifetime parameters (`'a`); borrows of `a[i]` are treated as borrowing the whole container; **no reborrowing** (borrowing a borrow-typed value errors); **no dereference operator** (a borrowed value can be printed, compared, indexed, passed on, or returned, but not used in arithmetic, method calls, or where the plain type is expected); no interprocedural tracking beyond signatures; tracked within one function body only; the REPL runs without the checker, so it does not enforce borrow rules.
+- **Honesty rule.** Full NLL was never promised, only the honest subset above — and the subset is what shipped (78 tests in `tests/test_borrow.py`).
+
+## 16. Async executor (4.1.0 Wave 1)
+
+Async/await touches the parser, AST, VM, built-ins, the interpreter's error path, and the native backend's rejection path (`kabir/parser.py`, `kabir/ast_nodes.py`, `kabir/vm.py`, `kabir/builtins.py`, `kabir/interpreter.py`, `kabir/codegen.py`).
+
+- **Syntax.** `async func f() { ... }` and `await <expr>`. `async`/`await` are real keywords. The AST gains `FuncDecl.is_async` and `AwaitExpr`; code dicts carry `"is_async"`. Built-ins: `spawn(<call>)` → task, `chan()` → channel, `send(ch, v)`, `recv(ch)` → value.
+- **Runtime (VM only).** Tasks are `kabir/vm.py:Task` objects (own frames + value stack, state ready/running/blocked/done/failed). `VM._schedule()` round-robins tasks in 1000-instruction quanta (`VM.QUANTUM`); `_run_task()` is the old `_loop` reshaped per task, with `self._stack`/`self._frames` rebound to the running task. `AWAIT` suspends via the internal `_TaskSuspend` exception (never user-visible); waiters are woken with the result pushed onto their stack. `Channel` holds a value deque and a receiver deque; `send`/`recv` are builtins delegating to `VM._async_send`/`_async_recv`. Calling an async `VMFunction` creates and queues a task instead of pushing a frame. `spawn(<call>)` is a compiler special case emitting `SPAWN_TASK` so the call is never evaluated in the caller. A run waits for every spawned task; if the ready queue empties while tasks are blocked, the run fails with a positioned deadlock error. Live-task cap: 1000. The checker is untouched: `await` and the new builtins type as `any`.
+- **Interpreter path.** `async` in the REPL/interpreter raises a clear error ("async needs the VM path — run with `kabir run`"). **Native async is out of scope** — the native backend rejects async programs with a clear error before compiling.
+- **Deliverable example.** Two tasks + a channel, tested, output verified — `examples/async-demo.kbr` (`main done` / `received: [10, 11, 12]` / `sum: 42`). 56 tests in `tests/test_async.py`.
+
+## 17. LSP server (4.1.0 Wave 2)
+
+`kabir/lsp.py` implements the language server; `editors/vscode/` holds the VS Code extension. `kabir lsp` is wired in `kabir/cli.py` (stdio JSON-RPC; `main()` in `lsp.py` is the entry point).
+
+- **Protocol.** LSP over stdio, JSON-RPC with `Content-Length` framing. Methods: `initialize`, `initialized`, `textDocument/didOpen`, `didChange`, `didClose`, `textDocument/completion`, `hover`, `definition`, `formatting`, `shutdown`, `exit`. Unknown methods get a proper `MethodNotFound` response, never a crash.
+- **Diagnostics.** Parse + `check_program` on open/change; `publishDiagnostics` with file/line/col + message. Diagnostics are parse + check (first error only); completion/hover/definition are same-file only.
+- **Completion.** Keywords, built-ins, stdlib functions, in-scope names.
+- **Hover.** For a `Var`, its declared/inferred type + definition line. Types come from `TypeAnn.full_name`, so borrow annotations show as `&number`, not `number`.
+- **Definition.** Jump to the `let`/func definition in the same file.
+- **Formatting.** Delegates to `format_source`.
+- **VS Code extension (`editors/vscode/`).** `package.json` (language id `kabir`, `.kbr`), `syntaxes/kabir.tmLanguage.json`, a minimal client launching `kabir lsp`, README (install locally; Marketplace publishing is out of scope). The extension was NOT run inside real VS Code here (none installed) and is NOT published to the Marketplace.
+
+## 18. WASM backend (4.1.0 Wave 3)
+
+`kabir/wasm.py` is a hand-built WASM encoder (LEB128 + section encoding, stdlib only) that translates the v2 slot-based bytecode directly to a `.wasm` binary — a direct WASM backend for the bytecode VM, no Emscripten.
+
+- **Values.** Every Kabir value is a tagged 16-byte entry in linear memory (`tag:i32, len:i32, payload:f64`); tags 0 null, 1 number, 2 bool, 3 string, 4 array, 5 function, 6 iterator, 7 unset (loading an unset slot traps). Numbers are f64 (integers exact only to 2^53). The value stack lives in linear memory (2,048 entries) with a `$sp` global; call args travel via a fixed scratch area (max 32 args/call — more is a build-time error).
+- **Control flow.** Bytecode jumps are arbitrary, WASM control flow is structured, so each function body is a pc-dispatch loop (`block $exit { loop $dispatch { br_table on $pc } }`) with one `br_table` case per bytecode instruction.
+- **Functions.** All functions (Kabir + builtins) share one type `(i32) -> ()` and one function table, so recursion and first-class function values work through `call_indirect`. Slots map to WASM locals; top-level names live in a globals area in linear memory. Name resolution uses a scope simulation over the bytecode with a popped-scope pool: scopes exited by `break`/`continue` stay resolvable inside the loop they belong to, so loop variables keep working after a `break`/`continue`, while names defined in an exited non-loop block still trap, matching the VM.
+- **Host imports.** `env.print_num`, `print_str`, `print_bool`, `print_nl`, `format_num`, `pow`, `parse_num` — implemented by the Node harness (`HARNESS_JS`, used by `run_wasm`) and by the browser page from `html_harness()`.
+- **Supported.** Numbers, bools, null, strings (constants, concat, indexing, interpolation, comparison), arrays (literals, indexing incl. negative wrap, `push`/`pop`, `len`, `for` over arrays/strings/`range()`), `if`/`while`/`for`, `break`/`continue`, functions incl. recursion and first-class values, `match`, builtins `print`, `range`, `len`, `abs`, `sqrt`, `pow`, `int`, `float`, `num`, `type`, `str`, `push`, `pop`, constants `pi`/`e`. Python-style modulo; division-by-zero traps.
+- **Cut (build-time `KabirError`).** `import`, dicts, string methods, closures, calls with >32 args, a function reading a top-level block-scoped name. `input` and the file/JSON/HTTP/time stdlib are unsupported.
+- **Partial.** Runtime errors (wrong types, bad index, division by zero, arity mismatch, undefined variable) trap the module (`unreachable`) instead of reporting a Kabir error message. Printing a function value prints `<function>` instead of `<function name>`.
+- **CLI.** `kabir build --target wasm [file|dir]` (wired in `cli.py`) writes `target/<name>.wasm` + `target/<name>.html`. 38 tests in `tests/test_wasm.py`, every parity test executing the real `.wasm` under Node v24.
+
+## 19. Self-hosting, step 1 (4.1.0 Wave 4)
+
+`selfhost/lexer.kbr` is the Kabir lexer written in Kabir itself, using file I/O from the 3.0.0 stdlib (`read_file`) plus string methods. It knows the full token set, including the 4.0.0 keywords (`async`, `await`) and the `&` borrow token.
+
+- **Same token set as `kabir/lexer.py`:** keywords, identifiers, numbers, strings (escapes + interpolation markers), comments, operators.
+- **Bootstrap check (the proof).** Run the Kabir lexer via the Python VM over the full test corpus (every `.kbr` in the repo + the test fixtures) and compare token streams (kind/value/line/col) with the Python lexer. It matches **exactly**: 3,899 tokens, zero mismatches over all 11 `.kbr` files in the repo, including lexing itself — plus matching streams on borrow and async programs. 7 self-host tests + 17 lexer tests in `tests/test_selfhost.py` / `tests/test_lexer.py`.
+- **Scope.** The parser in Kabir was NOT written in this release — a half-written parser would be dead weight, so it stays a follow-up wave of its own. Full self-hosting is a multi-release project; 4.1.0 only starts it. Say so plainly.

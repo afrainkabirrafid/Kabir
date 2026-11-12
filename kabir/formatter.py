@@ -248,12 +248,14 @@ class _Printer:
     def _stmt_lines(self, stmt, level):
         indent = INDENT * level
         if isinstance(stmt, ast.LetStmt):
+            prefix = "let " + ("mut " if getattr(stmt, "mutable", False)
+                               else "")
             if getattr(stmt, "type_ann", None) is not None:
-                return [indent + "let %s: %s = %s"
-                        % (stmt.name, stmt.type_ann.name,
+                return [indent + "%s%s: %s = %s"
+                        % (prefix, stmt.name, stmt.type_ann.full_name,
                            self._fmt_expr(stmt.value, level))]
-            return [indent + "let %s = %s"
-                    % (stmt.name, self._fmt_expr(stmt.value, level))]
+            return [indent + "%s%s = %s"
+                    % (prefix, stmt.name, self._fmt_expr(stmt.value, level))]
         if isinstance(stmt, ast.AssignStmt):
             target = self._fmt_expr(stmt.target, level)
             return [indent + "%s %s %s"
@@ -301,13 +303,16 @@ class _Printer:
         """The `func name(params) -> Ret {` header, without indent."""
         types = getattr(stmt, "param_types", None) or [None] * len(stmt.params)
         params = ", ".join(
-            p if t is None else "%s: %s" % (p, t.name)
+            p if t is None else "%s: %s" % (p, t.full_name)
             for p, t in zip(stmt.params, types))
         ret = getattr(stmt, "return_type", None)
-        ret_text = (" -> %s" % ret.name) if ret is not None else ""
+        ret_text = (" -> %s" % ret.full_name) if ret is not None else ""
+        # 4.0.0 async: `async func ...` round-trips through the
+        # formatter (used by both declarations and anonymous funcs).
+        prefix = "async " if getattr(stmt, "is_async", False) else ""
         if stmt.name is not None:
-            return "func %s(%s)%s {" % (stmt.name, params, ret_text)
-        return "func(%s)%s {" % (params, ret_text)
+            return "%sfunc %s(%s)%s {" % (prefix, stmt.name, params, ret_text)
+        return "%sfunc(%s)%s {" % (prefix, params, ret_text)
 
     def _fmt_func(self, stmt, level):
         indent = INDENT * level
@@ -414,6 +419,17 @@ class _Printer:
                 text = "-" + self._fmt_expr(node.operand, level,
                                             _UNARY_PREC)
             return text, _UNARY_PREC
+        if isinstance(node, ast.AwaitExpr):
+            # 4.0.0 async: `await` binds like a unary operator.
+            text = "await " + self._fmt_expr(node.expr, level, _UNARY_PREC)
+            return text, _UNARY_PREC
+        if isinstance(node, ast.BorrowExpr):
+            # A borrow binds like a unary operator: `&x`, `&mut x`,
+            # `&x[0]`; a lower-precedence operand gets parentheses.
+            inner = self._fmt_expr(node.expr, level, _UNARY_PREC)
+            if node.mutable:
+                return "&mut " + inner, _UNARY_PREC
+            return "&" + inner, _UNARY_PREC
         if isinstance(node, ast.Call):
             callee = self._fmt_expr(node.callee, level, _POSTFIX_PREC)
             args = ", ".join(self._fmt_expr(a, level) for a in node.args)

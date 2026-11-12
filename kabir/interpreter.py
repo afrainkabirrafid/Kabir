@@ -211,6 +211,13 @@ class Interpreter:
         return self.compute(stmt.expr)
 
     def _run_FuncDecl(self, stmt):
+        # 4.0.0 async: the legacy interpreter cannot run async code.
+        # Fail here, at the declaration, with a clear pointer to the
+        # VM path -- never half-run the body.
+        if getattr(stmt, "is_async", False):
+            self.error(stmt, "async needs the VM path -- run with "
+                       "`kabir run` (the legacy interpreter cannot "
+                       "run async code)")
         fn = KabirFunction(stmt.name, stmt.params, stmt.body,
                            self._current_env())
         if stmt.name is not None:
@@ -446,6 +453,10 @@ class Interpreter:
         self.error(expr, "Undefined variable '%s' -- it was never defined "
                    "with 'let'. Check the spelling" % expr.name)
 
+    def _compute_BorrowExpr(self, expr):
+        # 4.0.0 borrow checker: a borrow IS the value at runtime.
+        return self.compute(expr.expr)
+
     def _compute_ArrayLiteral(self, expr):
         return [self.compute(el) for el in expr.elements]
 
@@ -603,5 +614,15 @@ class Interpreter:
 
     def _compute_FuncDecl(self, expr):
         # Anonymous function expression: func(a, b) { ... }
+        if getattr(expr, "is_async", False):
+            self.error(expr, "async needs the VM path -- run with "
+                       "`kabir run` (the legacy interpreter cannot "
+                       "run async code)")
         return KabirFunction(expr.name, expr.params, expr.body,
                              self._current_env())
+
+    def _compute_AwaitExpr(self, expr):
+        # 4.0.0 async: `await` only runs on the VM.
+        self.error(expr, "'await' needs the VM path -- run with "
+                   "`kabir run` (the legacy interpreter cannot run "
+                   "async code)")

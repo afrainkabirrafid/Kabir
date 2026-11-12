@@ -81,6 +81,13 @@ def kabir_equal(left, right):
                         for k in left))
     if _is_function(left) or _is_function(right):
         return left is right
+    # 4.0.0 async values (tasks, channels) compare by identity:
+    # two handles to the same task/channel are equal, anything else
+    # is not. They name themselves through _kabir_type (see
+    # kabir/builtins.py) so this module never imports the VM.
+    if (getattr(left, "_kabir_type", None) is not None
+            or getattr(right, "_kabir_type", None) is not None):
+        return left is right
     return False
 
 

@@ -93,6 +93,11 @@ class Parser:
         if self._check("KEYWORD", "func"):
             # func declaration (named) or func expression statement
             return self._func_decl_or_expr_stmt()
+        if self._check("KEYWORD", "async"):
+            # async func declaration: `async func name() { ... }`
+            async_tok = self._advance()
+            return self._func_decl_or_expr_stmt(is_async=True,
+                                                async_tok=async_tok)
         if self._check("KEYWORD", "return"):
             self._advance()
             value = None
@@ -146,12 +151,38 @@ class Parser:
         return ast.ImportStmt(path, line=tok.line, col=tok.col)
 
     def _type_ann(self):
+        # 4.0.0 borrow types: `&number` (shared) and `&mut number`.
+        borrow = None
+        if self._match("OP", "&"):
+            borrow = "shared"
+            if self._check("IDENT", "mut"):
+                nxt = (self.tokens[self.pos + 1]
+                       if self.pos + 1 < len(self.tokens) else None)
+                # `&mut` is a mutable-borrow marker only when a type
+                # name follows; `&mut` on its own is not a type.
+                if nxt is not None and nxt.kind == "IDENT":
+                    self._advance()
+                    borrow = "mut"
         tok = self._expect("IDENT",
                            what="a type name, like 'number'")
-        return ast.TypeAnn(tok.value, line=tok.line, col=tok.col)
+        return ast.TypeAnn(tok.value, line=tok.line, col=tok.col,
+                           borrow=borrow)
 
     def _let(self):
         tok = self._advance()  # let
+        # `mut` is CONTEXTUAL, not a keyword: the lexer produces IDENT
+        # "mut", and it only means "mutable binding" when it appears
+        # immediately after `let` AND is followed by a variable name.
+        # `let mut = 5` still declares a variable named `mut`, and
+        # `mut` keeps working as an ordinary identifier everywhere
+        # else (a variable, a call, a member, ...).
+        mutable = False
+        if self._check("IDENT", "mut"):
+            nxt = (self.tokens[self.pos + 1]
+                   if self.pos + 1 < len(self.tokens) else None)
+            if nxt is not None and nxt.kind == "IDENT":
+                self._advance()
+                mutable = True
         name_tok = self._expect("IDENT", what="a variable name after 'let'")
         type_ann = None
         if self._match("PUNCT", ":"):
@@ -159,10 +190,18 @@ class Parser:
         self._expect("OP", "=", "'=' after the variable name in 'let'")
         value = self._expression()
         return ast.LetStmt(name_tok.value, value,
-                           line=tok.line, col=tok.col, type_ann=type_ann)
+                           line=tok.line, col=tok.col, type_ann=type_ann,
+                           mutable=mutable)
 
-    def _func_decl_or_expr_stmt(self):
-        tok = self._advance()  # func
+    def _func_decl_or_expr_stmt(self, is_async=False, async_tok=None):
+        if async_tok is not None:
+            # `async` was already consumed; `func` must follow it.
+            # _expect returns (and consumes) the `func` token.
+            tok = self._expect("KEYWORD", "func",
+                               "'func' after 'async' -- write 'async func "
+                               "name() { ... }'")
+        else:
+            tok = self._advance()  # func
         name = None
         if self._check("IDENT"):
             name = self._advance().value
@@ -184,10 +223,13 @@ class Parser:
         if self._match("OP", "->"):
             return_type = self._type_ann()
         body = self._block()
+        line = async_tok.line if async_tok is not None else tok.line
+        col = async_tok.col if async_tok is not None else tok.col
         return ast.FuncDecl(name, params, body,
-                            line=tok.line, col=tok.col,
+                            line=line, col=col,
                             param_types=param_types,
-                            return_type=return_type)
+                            return_type=return_type,
+                            is_async=is_async)
 
     # -- match expressions --------------------------------------------
     def _match_expr(self):
@@ -352,6 +394,28 @@ class Parser:
 
     def _unary(self):
         tok = self.current
+        if self._check("KEYWORD", "await"):
+            # `await <expr>`: binds like a unary operator, so
+            # `await f()` awaits the call and `await a + b` means
+            # `(await a) + b`.
+            self._advance()
+            return ast.AwaitExpr(self._unary(),
+                                 line=tok.line, col=tok.col)
+        if self._check("OP", "&"):
+            # 4.0.0 borrow: `&x` (shared) or `&mut x` (mutable).
+            # `mut` is contextual here, as after `let`: `&mut x` is
+            # a mutable borrow, while `&mut` on its own borrows a
+            # variable actually named `mut`.
+            self._advance()
+            mutable = False
+            if self._check("IDENT", "mut"):
+                nxt = (self.tokens[self.pos + 1]
+                       if self.pos + 1 < len(self.tokens) else None)
+                if nxt is not None and _starts_expression(nxt):
+                    self._advance()
+                    mutable = True
+            return ast.BorrowExpr(self._unary(), mutable,
+                                  line=tok.line, col=tok.col)
         if self._check("OP", "-"):
             self._advance()
             return ast.UnaryOp("-", self._unary(), line=tok.line, col=tok.col)
@@ -422,6 +486,11 @@ class Parser:
         if self._check("KEYWORD", "func"):
             # Anonymous function expression: func(a, b) { ... }
             return self._func_decl_or_expr_stmt()
+        if self._check("KEYWORD", "async"):
+            # Anonymous async function expression: async func(a) { ... }
+            async_tok = self._advance()
+            return self._func_decl_or_expr_stmt(is_async=True,
+                                                async_tok=async_tok)
         if self._check("KEYWORD", "match"):
             return self._match_expr()
         if self._check("IDENT"):
@@ -477,6 +546,25 @@ class Parser:
                        "here")
         self._fail("Unexpected %r -- an expression was expected here"
                    % (tok.value,))
+
+
+def _starts_expression(tok):
+    """True if *tok* can begin an expression (operand).
+
+    Used for the contextual `mut` after `&`: `&mut x` is a mutable
+    borrow, but `&mut` followed by anything that cannot start an
+    expression borrows a variable actually named `mut`.
+    """
+    if tok.kind in ("IDENT", "NUMBER", "STRING"):
+        return True
+    if tok.kind == "PUNCT" and tok.value in ("(", "[", "{"):
+        return True
+    if tok.kind == "KEYWORD" and tok.value in (
+            "func", "match", "true", "false", "null", "not"):
+        return True
+    if tok.kind == "OP" and tok.value == "-":
+        return True
+    return False
 
 
 def parse(source, filename="<stdin>"):

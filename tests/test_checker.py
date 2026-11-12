@@ -462,7 +462,7 @@ class TestExamplesPass(unittest.TestCase):
         examples = sorted(glob.glob(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "examples", "*.kbr")))
-        self.assertEqual(len(examples), 10)
+        self.assertEqual(len(examples), 11)
         for path in examples:
             with open(path, encoding="utf-8") as fh:
                 source = fh.read()

@@ -1,0 +1,38 @@
+# async-demo.kbr -- async/await + tasks + channels (Kabir 4.0.0).
+#
+# Run it:  kabir run examples/async-demo.kbr
+#
+# Two tasks cooperate through a channel: `producer` sends numbers,
+# `coordinator` receives them and awaits a second task's result.
+# The top level cannot use `await` (only an async func can), so it
+# starts the tasks and ends -- the run waits for every spawned task
+# before exiting, so both finish before the program ends.
+
+async func producer(ch, start) {
+    let i = 0
+    while i < 3 {
+        send(ch, start + i)
+        i = i + 1
+    }
+}
+
+async func add(a, b) {
+    return a + b
+}
+
+async func coordinator(ch) {
+    let total = add(20, 22)
+    let got = []
+    let i = 0
+    while i < 3 {
+        push(got, recv(ch))
+        i = i + 1
+    }
+    print("received: " + str(got))
+    print("sum: " + str(await total))
+}
+
+let ch = chan()
+let p = spawn(producer(ch, 10))
+let c = coordinator(ch)
+print("main done")

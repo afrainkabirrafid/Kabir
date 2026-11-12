@@ -2,15 +2,17 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)
-![Tests](https://img.shields.io/badge/tests-176%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-668%20passing-brightgreen.svg)
 
 **Kabir is a small, friendly programming language, built from scratch in Python — no dependencies, no magic, just a lexer, a parser, and a tree-walking interpreter you can read in an afternoon.**
 
 ## What is Kabir?
 
-Kabir is a complete little language: variables, numbers, strings with interpolation, arrays, dicts, `if`/`elif`/`else`, `while` and `for` loops, first-class functions with closures and recursion, `import` for `.kbr` files, string methods, and 15 core built-in functions plus 12 standard-library functions — all in about 1,700 lines of plain, dependency-free Python. Programs live in `.kbr` files and run with `python -m kabir run`.
+Kabir is a complete little language: variables, numbers, strings with interpolation, arrays, dicts, `if`/`elif`/`else`, `while` and `for` loops, first-class functions with closures and recursion, `import` for `.kbr` files, string methods, and 15 core built-in functions plus 21 standard-library functions — all in about 7,900 lines of plain, dependency-free Python. Programs live in `.kbr` files and run with `python -m kabir run`.
 
-It is a **tree-walking interpreter**: source code is lexed into tokens, parsed into an abstract syntax tree (AST), and the interpreter walks that tree and runs it directly. There is no JIT compiler and no native compilation — Kabir trades speed for clarity, so the whole implementation is easy to read, learn from, and hack on.
+It is a **compiled language**: source code is lexed into tokens, parsed into an abstract syntax tree (AST), type-checked, compiled to bytecode, and run on a stack VM. The original tree-walking interpreter still powers the REPL and stays available behind `kabir run --interp`. There is also an opt-in native path: `kabir build --native` transpiles a program to C99 and compiles it with the system `cc`.
+
+**Version 4.1.0** is the combined 3.0.0 + 4.0.0 release: everything in the 3.0.0 checkpoint (slot compiler, native compilation, package registry, opt-in ownership, bigger stdlib) plus the 4.0.0 waves (borrow checker, async/await, LSP + VS Code extension, WASM target, self-hosting step 1). See the [roadmap](#roadmap).
 
 ## Why Kabir exists
 
@@ -25,7 +27,7 @@ $ git clone https://github.com/afrainkabirrafid/kabir.git
 $ cd kabir
 $ python -m kabir run examples/hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 2.0.0.
+Welcome to Kabir version 4.1.0.
 2 + 3 = 5
 ```
 
@@ -40,7 +42,7 @@ let name = "Rafid"
 let language = "Kabir"
 
 print("Hello, {name}!")
-print("Welcome to {language} version 2.0.0.")
+print("Welcome to {language} version 4.1.0.")
 print("2 + 3 = {2 + 3}")
 ```
 
@@ -49,7 +51,7 @@ Run it:
 ```console
 $ python -m kabir run hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 2.0.0.
+Welcome to Kabir version 4.1.0.
 2 + 3 = 5
 ```
 
@@ -69,7 +71,7 @@ All commands work both as `python -m kabir ...` (zero-install, from a fresh clon
 
 ```console
 $ python -m kabir --version
-kabir 2.0.0
+kabir 4.1.0
 ```
 
 ### The `kabir` command
@@ -78,7 +80,7 @@ The repository ships an executable launcher at `bin/kabir`:
 
 ```console
 $ ./bin/kabir --version
-kabir 2.0.0
+kabir 4.1.0
 $ ./bin/kabir run examples/fizzbuzz.kbr
 ```
 
@@ -88,7 +90,7 @@ It lives in `bin/` for a real reason: a repo-root file named `kabir` cannot coex
 
 ```console
 $ python -m kabir repl
-Kabir 2.0.0 -- type 'exit' or press Ctrl-D to leave.
+Kabir 4.1.0 -- type 'exit' or press Ctrl-D to leave.
 kabir> let x = 5
 kabir> x + 1
 6
@@ -298,21 +300,25 @@ Zero dependencies here too — the suite is plain `unittest`, run by a small run
 
 ```console
 $ python tests/run_tests.py
-Ran 441 tests in 3.1s
+Ran 849 tests in 67.1s
 
 OK
 ```
 
-The 441 tests cover the lexer, parser, interpreter, compiler and VM, type checker, `match`, built-ins, standard library, string methods, imports, errors, the formatter, REPL history, project tooling, and every example in `examples/`. Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+The 849 tests cover the lexer, parser, interpreter, compiler and VM, slot-based compilation, native compilation, the package registry, ownership-lite, the borrow checker, async/await, the LSP server, the WASM backend, self-hosting, type checker, `match`, built-ins, standard library, string methods, imports, errors, the formatter, REPL history, project tooling, and every example in `examples/`. Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Honest limits
 
-Kabir 2.0.0 is a small language, and it is honest about what it is not:
+Kabir 4.1.0 is a small language, and it is honest about what it is not:
 
-- **No JIT, no native compilation.** Programs compile to bytecode and run on a stack virtual machine — noticeably faster than the old tree-walking interpreter, but still not native code.
-- **`import` loads other `.kbr` files** — a program can be split across files, and each file runs once (see the [roadmap](#roadmap) for what is still missing).
-- **No package manager.** There is no package registry; `kabir new` / `kabir build` manage local projects, `import` loads a file by path, and the standard library is the 15 core built-ins plus the `random`/`math` functions and string methods listed above.
-- **No file I/O, no dates, no networking.** The only way in or out is `print` and `input` (plus `import`, which reads `.kbr` files).
+- **Native compilation is arena, not refcounting.** `kabir build --native` frees all values at exit; there is no per-value memory management yet, and closures and `import` are compile-time errors in native mode (the VM path supports both).
+- **No package registry exists yet.** `kabir add` / `kabir publish` are built, but the default registry URL points at a registry that does not exist — set `KABIR_REGISTRY` to a real `index.json` to use it.
+- **Ownership is opt-in only.** Plain `let` never moves; `let mut` moves arrays/dicts, and passing one to `print`/`len` moves it too. Borrowing (`&` / `&mut`) is checked at compile time with NLL-lite liveness — but there is no dereference operator yet, so a borrowed value cannot be used in arithmetic or where the plain type is expected (see [docs/LANGUAGE.md](docs/LANGUAGE.md#borrowing---mut)).
+- **Async is VM-only.** `async`/`await` with tasks and channels runs on the bytecode VM; the native backend refuses async programs with a clear error, and the interpreter path does too (see [docs/LANGUAGE.md](docs/LANGUAGE.md#asyncawait--tasks-and-channels)).
+- **WASM is a subset.** `kabir build --target wasm` supports numbers, bools, strings, arrays, loops, functions, `match`, and core builtins — but not `import`, dicts, string methods, or closures (clear build-time errors), and runtime errors trap without a message (see [docs/LANGUAGE.md](docs/LANGUAGE.md#webassembly-target)).
+- **Self-hosting is step 1 only.** Only the lexer is written in Kabir itself in 4.1.0; the full compiler in Kabir is a multi-release project (see [docs/LANGUAGE.md](docs/LANGUAGE.md#self-hosting-step-1-the-lexer)).
 - **Recursion depth is capped** at 500 nested calls, and there is no tail-call optimisation.
 - **One number type** means no separate integer/float semantics; a power that overflows float range fails with a friendly error, while integer powers use arbitrary-precision integers.
 
@@ -326,6 +332,8 @@ Roughly in order, and open to discussion:
 4. **Pip packaging** — published to PyPI as `kabir-lang` in 1.1.0, so `pip install kabir-lang` gives you the `kabir` command. (The name `kabir` itself is taken on PyPI by an unrelated package.)
 5. **More of the language** — `else` on loops is not planned; instead: string methods — done in 1.1.0, better REPL history — done in 1.2.0, and a `switch`-style construct only if it earns its place — done in 2.0.0 as `match`.
 6. **Compiled, typed, tooled (2.0.0)** — a bytecode compiler and stack VM (`kabir run` now executes compiled bytecode; the old tree-walking interpreter stays for the REPL and behind `kabir run --interp`), opt-in static types (`let x: number`, `fn f(a: number) -> number`), Rust-style `match` expressions, and Cargo-style projects (`kabir new`, `kabir build` to `target/<name>.kbc`). — done in 2.0.0 (see [CHANGELOG.md](CHANGELOG.md))
+7. **Goes Native (3.0.0)** — a slot-based compiler, native compilation to C99 (`kabir build --native`, `kabir run --native`, arena memory), a GitHub-based package registry (`kabir add` / `kabir publish`), opt-in ownership (`let mut`), and a bigger standard library (file I/O, JSON, HTTP, time). — done in 3.0.0 (see [CHANGELOG.md](CHANGELOG.md))
+8. **Fearless & Everywhere (4.1.0)** — a borrow checker (`&` / `&mut`), async/await with tasks and channels, an LSP + VS Code extension, a WASM target, and self-hosting step 1 (the lexer in Kabir itself). — done in 4.1.0, together with item 7 (the combined 3.0.0 + 4.0.0 release; see [CHANGELOG.md](CHANGELOG.md)).
 
 Ideas and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

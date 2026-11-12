@@ -26,11 +26,16 @@ class Block(Node):
 # --- Statements -------------------------------------------------------
 
 class LetStmt(Node):
-    def __init__(self, name, value, line=None, col=None, type_ann=None):
+    def __init__(self, name, value, line=None, col=None, type_ann=None,
+                 mutable=False):
         super().__init__(line, col)
         self.name = name
         self.value = value
         self.type_ann = type_ann  # TypeAnn or None
+        # 3.0.0 ownership lite: True for `let mut x = ...`. Plain `let`
+        # stays mutable at runtime exactly as before; this flag only
+        # marks the binding for the checker's move tracking.
+        self.mutable = mutable
 
 
 class AssignStmt(Node):
@@ -49,7 +54,7 @@ class ExprStmt(Node):
 
 class FuncDecl(Node):
     def __init__(self, name, params, body, line=None, col=None,
-                 param_types=None, return_type=None):
+                 param_types=None, return_type=None, is_async=False):
         super().__init__(line, col)
         self.name = name      # may be None for an anonymous func expression
         self.params = params  # list of names
@@ -58,6 +63,11 @@ class FuncDecl(Node):
         # return_type: a TypeAnn or None. Both None when unannotated.
         self.param_types = param_types
         self.return_type = return_type
+        # 4.0.0 async: True for `async func ...`. Calling an async
+        # function starts a task and returns it at once (VM only);
+        # `await` inside it suspends that task until awaited work
+        # finishes.
+        self.is_async = is_async
 
 
 class ReturnStmt(Node):
@@ -152,6 +162,17 @@ class UnaryOp(Node):
         self.operand = operand
 
 
+class AwaitExpr(Node):
+    """`await <expr>` (4.0.0 async): suspends the current task until
+    the awaited task completes, then evaluates to that task's return
+    value. Only valid inside an `async func` (the compiler enforces
+    this); only the VM runs it (the interpreter rejects it)."""
+
+    def __init__(self, expr, line=None, col=None):
+        super().__init__(line, col)
+        self.expr = expr
+
+
 class Call(Node):
     def __init__(self, callee, args, line=None, col=None):
         super().__init__(line, col)
@@ -173,12 +194,38 @@ class Member(Node):
         self.name = name      # method name as a plain string
 
 
-# --- 2.0.0 additions: type annotations and match ----------------------
+# --- 4.0.0 additions: borrow expressions and borrow types --------
+
+class BorrowExpr(Node):
+    """A borrow: `&x` (shared) or `&mut x` (mutable).
+
+    Compile-time only: at runtime a borrow IS the value -- `&x`
+    compiles to just `x`, so borrowing costs nothing. The checker
+    enforces the borrow rules; the VM/interpreter just evaluate
+    the borrowed expression.
+    """
+    def __init__(self, expr, mutable, line=None, col=None):
+        super().__init__(line, col)
+        self.expr = expr        # the borrowed place expression
+        self.mutable = mutable  # True for `&mut x`, False for `&x`
+
 
 class TypeAnn(Node):
-    def __init__(self, name, line=None, col=None):
+    def __init__(self, name, line=None, col=None, borrow=None):
         super().__init__(line, col)
-        self.name = name      # type name as written, e.g. "number"
+        self.name = name      # base type name as written, e.g. "number"
+        # 4.0.0 borrow types: None (plain), "shared" (`&number`),
+        # "mut" (`&mut number`).
+        self.borrow = borrow
+
+    @property
+    def full_name(self):
+        """The type as written, e.g. "number", "&number", "&mut array"."""
+        if self.borrow == "shared":
+            return "&" + self.name
+        if self.borrow == "mut":
+            return "&mut " + self.name
+        return self.name
 
 
 class Wildcard(Node):

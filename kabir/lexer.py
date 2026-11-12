@@ -10,10 +10,10 @@ from .errors import KabirError, error_at
 KEYWORDS = {
     "let", "func", "return", "if", "elif", "else", "while", "for", "in",
     "break", "continue", "true", "false", "null", "and", "or", "not",
-    "import", "match",
+    "import", "match", "async", "await",
 }
 
-SINGLE_OPS = set("+-*/%=<>")
+SINGLE_OPS = set("+-*/%=<>&")
 MULTI_OPS = ("**", "==", "!=", "<=", ">=", "+=", "-=", "=>", "->")
 PUNCT = set("()[]{},;:.")
 

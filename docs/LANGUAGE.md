@@ -1,4 +1,4 @@
-# Kabir Language Reference — version 2.0.0
+# Kabir Language Reference — version 4.1.0
 
 This is the complete reference for the Kabir language. Every code block in this document is a real, runnable Kabir program, and every output block is the exact output it produces. Run any example with:
 
@@ -40,6 +40,14 @@ For how to run programs, start the REPL, and read error messages, see the [READM
 - [Formatter](#formatter)
 - [REPL history](#repl-history)
 - [Projects](#projects)
+- [Native compilation](#native-compilation)
+- [Package registry](#package-registry)
+- [Ownership-lite (`let mut`)](#ownership-lite-let-mut)
+- [Borrowing (`&` / `&mut`)](#borrowing---mut)
+- [Async/await + tasks and channels](#asyncawait--tasks-and-channels)
+- [Language server (`kabir lsp` + VS Code)](#language-server-kabir-lsp--vs-code)
+- [WebAssembly target](#webassembly-target)
+- [Self-hosting, step 1 (the lexer)](#self-hosting-step-1-the-lexer)
 - [What Kabir does not have (yet)](#what-kabir-does-not-have-yet)
 
 ## Program structure
@@ -1776,7 +1784,7 @@ Output:
 
 ## Standard library
 
-The standard library is 12 functions plus the constants `pi` and `e`, all plain globals — available in every program with no import, just like the core built-ins above. `sqrt`, `pow`, and `abs` stay in [Built-in functions](#built-in-functions) and are documented there; the functions below join them to make one math library. There are no new global string functions: string helpers are the [methods](#string-methods).
+The standard library is 21 functions plus the constants `pi` and `e`, all plain globals — available in every program with no import, just like the core built-ins above. `sqrt`, `pow`, and `abs` stay in [Built-in functions](#built-in-functions) and are documented there; the functions below join them to make one math library. There are no new global string functions: string helpers are the [methods](#string-methods). The 3.0.0 additions — file I/O, JSON, HTTP, and time — are documented after the math functions.
 
 Each run — and each REPL session — has its own random sequence (see `seed`).
 
@@ -1955,6 +1963,58 @@ Output:
 number
 ```
 
+### read_file
+
+`read_file(path)` reads a whole text file and returns its contents as a string. The argument must be a string path. A missing file, a directory, or an unreadable file is a runtime error. Paths are relative to the current working directory, not to the `.kbr` file.
+
+```kabir
+let text = read_file("notes.txt")
+print(text)
+```
+
+### write_file
+
+`write_file(path, contents)` writes a string to a file, creating it if it does not exist and replacing its contents if it does. It returns `null`. Both arguments must be strings. The parent directory must already exist — `write_file` does not create directories.
+
+```kabir
+write_file("out.txt", "hello\n")
+print(read_file("out.txt"))
+```
+
+### file_exists
+
+`file_exists(path)` returns `true` if the path exists (file or directory) and `false` otherwise. The argument must be a string. Unlike `read_file`, it never errors on a missing path.
+
+### json_parse
+
+`json_parse(text)` parses a JSON string into a Kabir value — objects become dicts, arrays become arrays, `true`/`false`/`null` become bools/null, numbers become numbers. The argument must be a string, and invalid JSON is a runtime error. One quirk: a literal `{` cannot appear inside a Kabir string (it starts interpolation), so JSON object text must come from `read_file`, `http_get`, or `json_stringify`, not from a string literal in your program.
+
+### json_stringify
+
+`json_stringify(value)` converts any Kabir value to a JSON string — dicts, arrays, strings, numbers, bools, and null all round-trip through `json_parse`. Functions cannot be stringified (a runtime error).
+
+### http_get
+
+`http_get(url)` fetches a URL over HTTP and returns the response body as a string. The argument must be a string URL. It follows redirects (up to 5), times out after 10 seconds, and a failed request (bad host, non-2xx status) is a runtime error. HTTPS is supported in the VM/interpreter path; the native backend supports `http://` only (see [Native compilation](#native-compilation)).
+
+### http_post
+
+`http_post(url, body)` sends a POST request with a string body and returns the response body as a string. Same timeout, redirect, and error rules as `http_get`.
+
+### now
+
+`now()` returns the current time as a number — seconds since the Unix epoch (1970-01-01), with fractions. It takes no arguments.
+
+```kabir
+let start = now()
+sleep(0.1)
+print(now() - start)
+```
+
+### sleep
+
+`sleep(seconds)` pauses the program for the given number of seconds (fractions allowed) and returns `null`. The argument must be a number, and negative values are an error.
+
 ## Errors
 
 Every Kabir error has the same shape: `file:line:col`, a plain-language message, the offending source line, and a caret pointing at the problem. There are no Python tracebacks. Lex errors (bad characters, unterminated strings), parse errors (missing `}`, a bad expression), and runtime errors (undefined variable, division by zero, wrong argument count) all render this way.
@@ -2063,22 +2123,174 @@ authors = ["Afrain Kabir Rafid"]
 
 plus `src/main.kbr` (the entry point — `build` compiles it and its
 imports, resolved relative to `src/`) and a `.gitignore` that ignores
-`target/`. `kabir build` type-checks first, then writes the compiled
+`target/` and `vendor/`. `kabir build` type-checks first, then writes the compiled
 bytecode to `target/<name>.kbc` — a JSON file you can run directly with
-`kabir run <file.kbc>`. There is no central package registry and no
-network fetching: projects are local, and `import` loads `.kbr` files
-by path, as always.
+`kabir run <file.kbc>`. Dependencies from the [package registry](#package-registry)
+are vendored under `vendor/` and loaded with `import` by path, as always.
+
+## Native compilation
+
+`kabir build --native` and `kabir run --native` compile a Kabir program to C99 with the system `cc` and run the resulting binary. It is the fast path: `fib(25)` runs in about 0.007 s natively versus about 3.0 s on the VM (the one-off compile takes about 1.3 s, so native wins on compute-heavy programs, not on one-liners).
+
+```console
+$ kabir build --native my_app
+Built my_app v0.1.0 (native, arena) -> ./target/my_app
+$ ./target/my_app
+Hello from my_app!
+```
+
+Memory model is **native (arena)**: values are freed all at once at exit, not refcounted. Supported: numbers, strings, bools, null, arrays, dicts, `if`/`while`/`for`, functions including recursion, all built-ins and stdlib functions, string methods, `match`, and `let mut` (no runtime effect). **Not supported**: closures and `import` — both are clear compile-time errors, never silently wrong code. Numbers are C doubles (integers beyond 2^53 lose precision), and `http_get`/`http_post` are `http://` only in native mode. Native runtime errors print `Kabir runtime error: <message>` and exit 1, without `file:line:col`.
+
+## Package registry
+
+Kabir has a GitHub-based package registry — no server. A registry is an `index.json` file served over HTTP:
+
+```json
+{"packages": {"greet": {"1.0.0": {"url": "https://example.com/greet-1.0.0.tar.gz", "sha256": "..."}}}}
+```
+
+`kabir add <name>@<version> [dir]` fetches the tarball, verifies its SHA-256, vendors it into `vendor/<name>/<version>/`, records the exact version in `[dependencies]` in `Kabir.toml`, and writes `Kabir.lock`. Versions must be exact — no ranges. `kabir publish [dir]` builds a deterministic tarball of your project (`target/<name>-<version>.tar.gz`), prints its SHA-256 and the registry-entry JSON to merge into the registry repo's `index.json`, and pushes nothing itself. The registry URL comes from the `KABIR_REGISTRY` environment variable; the built-in default points at a registry that does not exist yet, so `kabir add` refuses with a clear error until a real registry URL is set. Vendored packages are loaded with `import` by path and are ignored by git (`vendor/` is in the scaffold `.gitignore`).
+
+## Ownership-lite (`let mut`)
+
+Ownership in Kabir is opt-in. Plain `let` is unchanged — mutable, never moved. `let mut` marks a value as owned:
+
+```kabir
+let mut xs = [1, 2, 3]
+let ys = xs        # moves xs into ys; xs is unusable after this
+print(ys)          # [1, 2, 3]
+```
+
+Moving applies to arrays and dicts (Copy values — numbers, strings, bools, null — are never moved). A moved value used again is a compile-time error, and reassignment revives it (`xs = [9]` makes `xs` usable again). Passing an owned value as an argument moves it — including to `print` and `len`, which only read it; that strictness is deliberate for now, and may be relaxed for known read-only built-ins later. `let` stays mutable: the immutable-by-default break was **not** taken. `&` / `&mut` borrowing is in 4.1.0 — see [Borrowing](#borrowing---mut).
+
+## Borrowing (`&` / `&mut`)
+
+Borrowing lets a function use a value without taking ownership of it. A shared borrow `&x` lets many readers look at `x`; a mutable borrow `&mut x` lets exactly one writer change it. Borrows are checked at compile time by the checker — at run time a borrow **is** the value (`&x` compiles to just `x`), so borrowing costs nothing at run time. The REPL runs without the checker, so it does not enforce borrow rules.
+
+```kabir
+let mut xs = [1, 2, 3]
+let r = &xs        # shared borrow: read xs through r
+print(r[0])        # 1
+
+let m = &mut xs    # mutable borrow: change xs through m
+m[0] = 9
+print(m)           # [9, 2, 3]
+```
+
+Borrow types can appear in annotations:
+
+```kabir
+func first(items: &array) -> number {
+    return items[0]
+}
+
+func set_first(items: &mut array) {
+    items[0] = 99
+}
+```
+
+Rules the checker enforces (compile-time errors otherwise):
+
+1. While a mutable borrow of a place is live, no other access to that place — no read, no write, no move.
+2. While shared borrows of a place are live, no mutation or move of that place.
+3. A borrowed place cannot be moved while it is borrowed.
+4. A borrow ends at its last use (NLL-lite: liveness is a simple last-use walk within a function body). A borrow whose holder is never used ends at once.
+5. Lifetime elision only: a function returning a borrow must have exactly one borrowed input, otherwise it is a clear error. Returning a borrow of a local is an error — only a borrow of a borrowed parameter (or of a top-level binding) may be returned.
+
+Documented limits:
+
+- **No explicit lifetime parameters** — there is no `'a` syntax in 4.1.0.
+- **Borrows of `a[i]` are treated as borrowing the whole container** — borrowing one element borrows the array.
+- **No reborrowing** — borrowing a borrow-typed value (including `&a` on a borrowed parameter) is an error.
+- **No dereference operator** — the biggest usability limit: a borrowed value can be printed, compared, indexed (arrays and dicts), passed on, or returned, but not used in arithmetic, in method calls, or where the plain type is expected. `len(&x)` and `push(m, 4)` through a borrow are type errors; pass the original binding instead.
+- **No interprocedural tracking beyond signatures** — what a function does with a borrow is checked only through its declared parameter and return types. A borrow is tracked within one function body only.
+
+## Async/await + tasks and channels
+
+Concurrency in Kabir is cooperative tasks, not threads. Mark a function `async`, run it as a task with `spawn`, and pass values between tasks through a channel. `await` suspends the current task until the thing it waits on is ready.
+
+```kabir
+async func worker(ch) {
+    send(ch, 42)
+}
+
+async func main() {
+    let ch = chan()
+    let t = spawn(worker(ch))
+    let answer = recv(ch)
+    print(answer)     # 42
+    await t           # wait for the task to finish
+}
+
+main()
+```
+
+- `async func f() { ... }` declares an async function. `async` and `await` are real keywords in 4.1.0 (like `import` became reserved in 1.1.0) — they cannot be used as variable names.
+- `spawn(<call>)` starts a task and returns it. `await <task>` suspends the current task until that task completes.
+- `chan()` creates a channel. `send(ch, v)` sends a value; `recv(ch)` receives one — `recv` on an empty channel blocks the task until a send arrives.
+- The scheduler round-robins tasks cooperatively in 1000-instruction quanta: a task runs until it `await`s or blocks on `recv`, then another task gets a turn. A run waits for every spawned task before exiting; if the only live tasks are blocked with nothing able to wake them, the run fails with a deadlock error instead of hanging. At most 1000 live tasks.
+
+Limits:
+
+- **VM only.** Async runs on the bytecode VM; native async is out of scope — the native backend refuses async programs with a clear error before compiling.
+- **The interpreter/REPL path rejects `async`** with a clear error ("async needs the VM path — run with `kabir run`").
+- Channels are unbounded (no backpressure). There are no threads, so `input()` and `sleep()` block the whole scheduler.
+- `await` is only legal inside an `async func` (a compile-time error otherwise, including at the top level). A demo program with two tasks and a channel lives in `examples/async-demo.kbr` (output: `main done` / `received: [10, 11, 12]` / `sum: 42`).
+
+## Language server (`kabir lsp` + VS Code)
+
+`kabir lsp` runs a Language Server over stdio, speaking LSP (JSON-RPC with `Content-Length` framing) so an editor can offer Kabir support: diagnostics, completion, hover, go-to-definition, and formatting.
+
+```console
+$ kabir lsp
+```
+
+Methods implemented:
+
+- `initialize`, `initialized`, `shutdown`, `exit` — server lifecycle. Unknown methods get a proper `MethodNotFound` response, never a crash.
+- `textDocument/didOpen`, `didChange`, `didClose` — the server tracks open files and re-checks them on every change.
+- Diagnostics: on open/change the server runs the parser and the type checker and publishes diagnostics with file/line/col and a plain message — so type and borrow errors show in the editor as you type.
+- `textDocument/completion` — keywords, built-ins, stdlib functions, and in-scope names.
+- `textDocument/hover` — for a variable, its declared/inferred type and its definition line.
+- `textDocument/definition` — jump to the `let`/func definition in the same file.
+- `textDocument/formatting` — delegates to `kabir fmt` (`format_source`).
+
+The VS Code extension lives in `editors/vscode/` in the repo: `package.json` (language id `kabir`, `.kbr` files), `syntaxes/kabir.tmLanguage.json` (syntax highlighting), a minimal client that launches `kabir lsp`, and a README for installing it locally. Publishing it to the VS Code Marketplace is out of scope — that needs the author's account.
+
+## WebAssembly target
+
+`kabir build --target wasm` compiles a Kabir program to WebAssembly so it runs in a browser page. The backend is a **direct WASM backend for the bytecode VM**, written in Python — no Emscripten (it is not available in this environment). It emits a real `.wasm` binary plus a tiny HTML harness that loads the module and wires its output to a `<pre>`.
+
+```console
+$ kabir build --target wasm examples/fibonacci.kbr
+Built fibonacci (wasm) -> target/fibonacci.wasm
+```
+
+`build --target wasm` also takes a project directory (entry from `Kabir.toml`); the outputs are `target/<name>.wasm` and `target/<name>.html`. The `.wasm` imports `print` and number formatting from an `env` module the host provides (`print_num`, `print_str`, `print_bool`, `print_nl`, `format_num`, `pow`, `parse_num`); the HTML harness implements those imports in JavaScript, and `run_wasm()` in `kabir/wasm.py` implements them in a Node harness for verification.
+
+Supported: numbers, bools, null, strings (including interpolation), arrays, arithmetic, comparisons, `if`/`while`/`for`, `break`/`continue`, functions (including recursion and first-class values), `match`, and the builtins `print`, `range`, `len`, `abs`, `sqrt`, `pow`, `int`, `float`, `num`, `type`, `str`, `push`, `pop`, plus the constants `pi` and `e`.
+
+Not supported yet: `import`, dicts, string methods, closures, `input`, and the file/JSON/HTTP/time stdlib — these are rejected with a clear error at build time. Runtime errors (wrong types, bad index, division by zero, undefined variable) trap the module instead of reporting a Kabir error message. Numbers are 64-bit floats, so integers are exact only up to 2^53.
+
+Verified: `examples/fibonacci.kbr` and `examples/fizzbuzz.kbr` compile to `.wasm` and produce output byte-identical to the VM run (38 tests in `tests/test_wasm.py`).
+
+## Self-hosting, step 1 (the lexer)
+
+4.1.0 starts self-hosting: the Kabir lexer is written in Kabir itself, in `selfhost/lexer.kbr`, using the 3.0.0 file I/O (`read_file`) and string methods. It produces the same token set as the Python lexer in `kabir/lexer.py`: keywords, identifiers, numbers, strings (escapes and interpolation markers), comments, and operators.
+
+The proof it works is a **bootstrap check**: the Kabir lexer, run through the Python VM over the full test corpus (every `.kbr` in the repo plus the test fixtures), produces token streams — kind, value, line, column — identical to the Python lexer's. Verified: exact match over all 11 `.kbr` files in the repo (3,899 tokens, zero mismatches), including lexing itself; the lexer also matches on borrow programs (`&`, `&mut`) and async programs (`async`, `await`), whose keywords it knows.
+
+Full self-hosting (the whole compiler in Kabir) is a multi-release project — 4.1.0 only starts it, with the lexer. The parser in Kabir was not written in this release: a half-written parser would be dead weight, so it stays a follow-up wave of its own.
 
 ## What Kabir does not have (yet)
 
-To avoid surprises, the things people most often expect that are **not** in 2.0.0:
+To avoid surprises, the things people most often expect that are **not** in 4.1.0:
 
-- **File I/O, dates, networking** — `print` and `input` are the only way in or out (plus `import`, which reads `.kbr` files).
 - **Dot access on dicts** — write `user["name"]`, not `user.name`.
 - **`else` on loops, ternary `?:`** — none of these exist; `if`/`elif`/`else` covers the conditional ground.
 - **A step argument for `range()`** — `range(a, b)` only; there is no `range(a, b, step)`.
 - **Assignment as an expression** — `let x = y = 1` and `print(x = 1)` are errors.
 - **Tail-call optimisation** — recursion is capped at 500 nested calls.
-- **A JIT or native compilation** — programs compile to bytecode and run on a stack VM (see [ARCHITECTURE.md](ARCHITECTURE.md)); there is no machine-code backend.
+- **Closures and `import` in native mode** — both are compile-time errors there; the VM path supports them.
 
 The roadmap for these lives in the [README](../README.md#roadmap).

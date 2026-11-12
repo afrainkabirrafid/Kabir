@@ -7,8 +7,13 @@ errors via interp.error). This module must not import the interpreter
 (no circular import).
 """
 
+import json
 import math
+import os
 import random
+import time
+import urllib.error
+import urllib.request
 
 from .builtins import BuiltinFunction, _is_number, _need, _type_name
 
@@ -243,6 +248,168 @@ def _stdlib_exp(interp, node, args):
         interp.error(node, "That power is too large to calculate")
 
 
+# --- file I/O ---------------------------------------------------------
+# Paths are plain strings. Every failure is a friendly KabirError
+# (missing file, directory, permission, bad UTF-8) -- never a Python
+# traceback. file_exists() reports False for a directory: it answers
+# "is there a file here", not "does this path exist".
+
+def _stdlib_read_file(interp, node, args):
+    _need(interp, node, args, "read_file", 1)
+    path = args[0]
+    if not isinstance(path, str):
+        interp.error(node, "read_file() needs a string path, not %s"
+                     % _type_name(path))
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        interp.error(node, "Cannot read file %r -- no such file" % path)
+    except IsADirectoryError:
+        interp.error(node, "Cannot read file %r -- it is a directory"
+                     % path)
+    except PermissionError:
+        interp.error(node, "Cannot read file %r -- permission denied"
+                     % path)
+    except UnicodeDecodeError:
+        interp.error(node, "Cannot read file %r -- it is not valid "
+                     "UTF-8 text" % path)
+    except OSError as exc:
+        interp.error(node, "Cannot read file %r -- %s"
+                     % (path, exc.strerror or exc))
+
+
+def _stdlib_write_file(interp, node, args):
+    _need(interp, node, args, "write_file", 2)
+    path, text = args
+    if not isinstance(path, str):
+        interp.error(node, "write_file() needs a string path, not %s"
+                     % _type_name(path))
+    if not isinstance(text, str):
+        interp.error(node, "write_file() needs a string to write, not %s"
+                     % _type_name(text))
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except IsADirectoryError:
+        interp.error(node, "Cannot write file %r -- it is a directory"
+                     % path)
+    except PermissionError:
+        interp.error(node, "Cannot write file %r -- permission denied"
+                     % path)
+    except OSError as exc:
+        interp.error(node, "Cannot write file %r -- %s"
+                     % (path, exc.strerror or exc))
+    return None
+
+
+def _stdlib_file_exists(interp, node, args):
+    _need(interp, node, args, "file_exists", 1)
+    path = args[0]
+    if not isinstance(path, str):
+        interp.error(node, "file_exists() needs a string path, not %s"
+                     % _type_name(path))
+    return os.path.isfile(path)
+
+
+# --- JSON -------------------------------------------------------------
+# json_parse maps JSON null/bool/number/string/array/object onto
+# Kabir null/bool/number/string/array/dict. json_stringify is the
+# reverse; values JSON cannot hold (functions) raise a KabirError.
+
+def _stdlib_json_parse(interp, node, args):
+    _need(interp, node, args, "json_parse", 1)
+    text = args[0]
+    if not isinstance(text, str):
+        interp.error(node, "json_parse() needs a string, not %s"
+                     % _type_name(text))
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        interp.error(node, "Cannot parse JSON -- %s (line %d, column %d)"
+                     % (exc.msg, exc.lineno, exc.colno))
+
+
+def _stdlib_json_stringify(interp, node, args):
+    _need(interp, node, args, "json_stringify", 1)
+    try:
+        return json.dumps(args[0])
+    except (TypeError, ValueError) as exc:
+        interp.error(node, "Cannot turn %s into JSON -- %s"
+                     % (interp.format_value(args[0]), exc))
+
+
+# --- HTTP -------------------------------------------------------------
+# stdlib urllib only, 10-second timeout. The body is always a string
+# (decoded as UTF-8, invalid bytes replaced). HTTP error statuses and
+# network failures both raise a friendly KabirError.
+
+_HTTP_TIMEOUT = 10
+
+
+def _stdlib_http_get(interp, node, args):
+    _need(interp, node, args, "http_get", 1)
+    url = args[0]
+    if not isinstance(url, str):
+        interp.error(node, "http_get() needs a string URL, not %s"
+                     % _type_name(url))
+    try:
+        with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        interp.error(node, "http_get(%r) failed -- the server returned "
+                     "HTTP %d" % (url, exc.code))
+    except urllib.error.URLError as exc:
+        interp.error(node, "http_get(%r) failed -- %s" % (url, exc.reason))
+    except (OSError, ValueError) as exc:
+        interp.error(node, "http_get(%r) failed -- %s" % (url, exc))
+
+
+def _stdlib_http_post(interp, node, args):
+    _need(interp, node, args, "http_post", 2)
+    url, body = args
+    if not isinstance(url, str):
+        interp.error(node, "http_post() needs a string URL, not %s"
+                     % _type_name(url))
+    if not isinstance(body, str):
+        interp.error(node, "http_post() needs a string body, not %s"
+                     % _type_name(body))
+    request = urllib.request.Request(
+        url, data=body.encode("utf-8"), method="POST",
+        headers={"Content-Type": "text/plain; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(request,
+                                    timeout=_HTTP_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        interp.error(node, "http_post(%r) failed -- the server returned "
+                     "HTTP %d" % (url, exc.code))
+    except urllib.error.URLError as exc:
+        interp.error(node, "http_post(%r) failed -- %s" % (url, exc.reason))
+    except (OSError, ValueError) as exc:
+        interp.error(node, "http_post(%r) failed -- %s" % (url, exc))
+
+
+# --- time -------------------------------------------------------------
+
+def _stdlib_now(interp, node, args):
+    _need(interp, node, args, "now", 0)
+    return time.time()
+
+
+def _stdlib_sleep(interp, node, args):
+    _need(interp, node, args, "sleep", 1)
+    seconds = args[0]
+    if not _is_number(seconds):
+        interp.error(node, "sleep() needs a number of seconds, not %s"
+                     % _type_name(seconds))
+    if seconds < 0:
+        interp.error(node, "sleep() needs a number of seconds no less "
+                     "than 0, but got %s" % interp.format_value(seconds))
+    time.sleep(seconds)
+    return None
+
+
 STDLIB = {
     "randint": _stdlib_randint,
     "randrange": _stdlib_randrange,
@@ -256,6 +423,15 @@ STDLIB = {
     "tan": _stdlib_tan,
     "log": _stdlib_log,
     "exp": _stdlib_exp,
+    "read_file": _stdlib_read_file,
+    "write_file": _stdlib_write_file,
+    "file_exists": _stdlib_file_exists,
+    "json_parse": _stdlib_json_parse,
+    "json_stringify": _stdlib_json_stringify,
+    "http_get": _stdlib_http_get,
+    "http_post": _stdlib_http_post,
+    "now": _stdlib_now,
+    "sleep": _stdlib_sleep,
 }
 
 

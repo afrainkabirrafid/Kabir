@@ -62,7 +62,8 @@ class TestNewProject(unittest.TestCase):
                              EXPECTED_MANIFEST)
             self.assertEqual((proj / "src" / "main.kbr").read_text(),
                              EXPECTED_MAIN)
-            self.assertEqual((proj / ".gitignore").read_text(), "target/\n")
+            self.assertEqual((proj / ".gitignore").read_text(),
+                             "target/\nvendor/\n")
 
     def test_scaffold_program_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,7 +249,7 @@ class TestBuildProject(unittest.TestCase):
             with open(out, encoding="utf-8") as handle:
                 data = json.load(handle)
             self.assertEqual(data["magic"], "KBC1")
-            self.assertEqual(data["version"], 1)
+            self.assertEqual(data["version"], 2)
             code = load_bytecode(str(out))
             vm = VM()
             buf = io.StringIO()

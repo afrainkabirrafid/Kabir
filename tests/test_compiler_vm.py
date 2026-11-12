@@ -482,7 +482,7 @@ class TestBytecodeRoundTrip(unittest.TestCase):
             with open(path, encoding="utf-8") as handle:
                 data = json.load(handle)
             self.assertEqual(data["magic"], "KBC1")
-            self.assertEqual(data["version"], 1)
+            self.assertEqual(data["version"], 2)
             self.assertEqual(data["main"], code)
             loaded = load_bytecode(path)
             vm = VM()
@@ -587,7 +587,7 @@ class TestExampleEquivalence(unittest.TestCase):
     def test_hello(self):
         self.assertEqual(self._compare("hello.kbr"),
                          "Hello, Rafid!\n"
-                         "Welcome to Kabir version 2.0.0.\n2 + 3 = 5\n")
+                         "Welcome to Kabir version 4.1.0.\n2 + 3 = 5\n")
 
     def test_fizzbuzz(self):
         out = self._compare("fizzbuzz.kbr")

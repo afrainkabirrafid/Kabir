@@ -37,6 +37,12 @@ def _type_name(v):
         return "array"
     if isinstance(v, dict):
         return "dict"
+    # 4.0.0 async values (Task / Channel, defined in kabir/vm.py)
+    # name themselves through _kabir_type so this module never has
+    # to import the VM (which would be a circular import).
+    kabir_type = getattr(v, "_kabir_type", None)
+    if kabir_type is not None:
+        return kabir_type
     return "function"
 
 
@@ -212,6 +218,54 @@ def _builtin_float(interp, node, args):
                  % _type_name(v))
 
 
+# -- 4.0.0 async: spawn / chan / send / recv ---------------------------
+# These are VM-only. In the VM the interp object is the VM itself and
+# carries the _async_* helpers; the legacy interpreter has none of
+# them, so every one of these fails there with a clear "needs the VM
+# path" error instead of a traceback. `spawn(f())` normally never
+# reaches _builtin_spawn -- the compiler turns it into a SPAWN_TASK
+# instruction so the call does not run first -- but `spawn` called
+# through a variable (or with a bare function value) lands here and
+# the VM helper still does the right thing.
+
+_VM_ONLY_MSG = ("%s needs the VM path -- run with `kabir run` "
+                "(the legacy interpreter cannot run tasks or channels)")
+
+
+def _builtin_spawn(interp, node, args):
+    impl = getattr(interp, "_async_spawn_value", None)
+    if impl is None:
+        interp.error(node, _VM_ONLY_MSG % "spawn()")
+    if len(args) != 1:
+        interp.error(node, "spawn() takes exactly 1 argument, but got %d"
+                     % len(args))
+    return impl(args[0], node)
+
+
+def _builtin_chan(interp, node, args):
+    _need(interp, node, args, "chan", 0)
+    impl = getattr(interp, "_async_new_channel", None)
+    if impl is None:
+        interp.error(node, _VM_ONLY_MSG % "chan()")
+    return impl(node)
+
+
+def _builtin_send(interp, node, args):
+    _need(interp, node, args, "send", 2)
+    impl = getattr(interp, "_async_send", None)
+    if impl is None:
+        interp.error(node, _VM_ONLY_MSG % "send()")
+    return impl(args[0], args[1], node)
+
+
+def _builtin_recv(interp, node, args):
+    _need(interp, node, args, "recv", 1)
+    impl = getattr(interp, "_async_recv", None)
+    if impl is None:
+        interp.error(node, _VM_ONLY_MSG % "recv()")
+    return impl(args[0], node)
+
+
 BUILTINS = {
     "print": _builtin_print,
     "input": _builtin_input,
@@ -228,6 +282,10 @@ BUILTINS = {
     "keys": _builtin_keys,
     "int": _builtin_int,
     "float": _builtin_float,
+    "spawn": _builtin_spawn,
+    "chan": _builtin_chan,
+    "send": _builtin_send,
+    "recv": _builtin_recv,
 }
 
 
