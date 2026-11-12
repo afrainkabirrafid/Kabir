@@ -3,7 +3,6 @@
 
 let name = "Rafid"
 let language = "Kabir"
-
 print("Hello, {name}!")
-print("Welcome to {language} version 1.1.0.")
+print("Welcome to {language} version 1.2.0.")
 print("2 + 3 = {2 + 3}")

@@ -1,6 +1,6 @@
 # Kabir Architecture — how the interpreter works
 
-This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 1.1.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
+This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 1.2.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
 
 ## The big picture
 
@@ -14,11 +14,12 @@ source text ──► Lexer ──► tokens ──► Parser ──► AST ─�
 - `kabir/lexer.py` (~206 lines) — source text → token stream.
 - `kabir/parser.py` (~400 lines) — tokens → AST (recursive descent).
 - `kabir/ast_nodes.py` (~167 lines) — one small class per AST node.
-- `kabir/interpreter.py` (~668 lines) — walks the AST and runs it.
+- `kabir/interpreter.py` (~674 lines) — walks the AST and runs it.
 - `kabir/builtins.py` (~237 lines) — the 15 core built-in functions.
 - `kabir/stdlib.py` (~265 lines) — the 12 standard-library functions (`random`, `math`) and the `STRING_METHODS` table.
 - `kabir/errors.py` (~49 lines) — the `KabirError` type and its rendering.
-- `kabir/cli.py` (~165 lines) — `run` / `repl` / `--help` / `--version`.
+- `kabir/formatter.py` (~499 lines) — the canonical formatter (`kabir fmt`): parses the file, then re-prints the AST with deterministic spacing, indentation and blank lines; comments are extracted from the source first and re-attached by line number.
+- `kabir/cli.py` (~277 lines) — `run` / `fmt` / `repl` / `--help` / `--version`.
 - `kabir/__init__.py` — version, author, and the public API (`Interpreter`, `parse`, `tokenize`, `KabirError`).
 - `kabir/__main__.py` — the `python -m kabir` entry point (calls `kabir.cli:main`).
 
@@ -100,7 +101,7 @@ Each level is a method (`_or`, `_and`, `_equality`, `_comparison`, `_additive`, 
 - `{` → **the dict-literal disambiguation**: the parser peeks at the next two tokens, and if they are a `STRING` followed by `:`, the `{` starts a dict literal expression (`{"a": 1}`), not a block. Otherwise it is a block statement. This is the only two-token lookahead in the parser, and it is why a statement can never be a bare dict literal with a non-string first key — dict keys are strings by definition.
 - Anything else → `_expr_or_assign_stmt()`: parse an expression, and if `=`, `+=`, or `-=` follows, it must be an assignment whose target is a `Var` or an `Index` — anything else is an error (*"Only a variable or an index can be assigned to"*). Assignment is therefore a statement, never an expression.
 
-`_block()` expects `{`, skips separators, parses statements until `}`, and reports a missing `}` with the position of the opening brace.
+`_block()` expects `{`, skips separators, parses statements until `}`, and reports a missing `}` with the position of the opening brace. It also records the closing brace's line on the block as `end_line` — the interpreter ignores it, but the formatter uses it to place comments that sit inside the block or on the `}` line.
 
 ### Expressions
 
@@ -247,16 +248,21 @@ file:line:col: message
 3. `-v` / `--version` / `version` → print `kabir <version>`, exit `0`.
 4. `run <file>` → `run_file(path)`; exactly one file, else a usage error (exit `2`).
 5. `repl` → `repl()`; no extra arguments.
-6. An argument ending in `.kbr` → `run_file` directly (a convenience shortcut not shown in `--help`).
-7. Anything else → usage error (exit `2`), help text printed to stderr.
+6. `fmt [--check] <file> ...` → `fmt_files(paths, check)`; at least one file, else a usage error (exit `2`). `--check` only reports files that would change and exits `1` when any would; otherwise files are rewritten in place and the exit code is `0`, or `1` if any file could not be read, parsed, or written.
+7. An argument ending in `.kbr` → `run_file` directly (a convenience shortcut not shown in `--help`).
+8. Anything else → usage error (exit `2`), help text printed to stderr.
 
 `run_file()` reads the file as UTF-8, runs it through `Interpreter.run_source`, and on `KabirError` prints `err.render()` to stderr and returns `1`. It also catches `RecursionError` (deep expression nesting) and reports it as the recursion error. A missing or unreadable file is a usage error (exit `2`), not a Kabir error.
 
 `repl()` prints the banner, then loops on `input()` with prompt `kabir> ` (or `... ` while a multi-line construct is open). Multi-line input is brace-aware: `_braces_balanced()` counts `{`/`}` outside strings and comments, and the REPL keeps reading until the depth returns to zero — that is how you type a `func` definition across lines. `exit`/`quit` (typed on an empty buffer), Ctrl-D (`EOFError`), and Ctrl-C (`KeyboardInterrupt`, which clears the buffer) all leave cleanly. Each parsed statement is run with `run_stmt` against one long-lived `Interpreter`, so variables persist between lines; if a statement is an `ExprStmt`, its value is printed with `format_value` — that is why typing `x + 1` in the REPL prints `6`.
 
+History is stdlib `readline`, wired up by `_setup_history()` / `_save_history()` in `cli.py` (both never raise: without `readline` the REPL just runs without history). The history file is `~/.kabir_history` (loaded at startup, written back on exit, up to 1000 lines); importing `readline` is what makes `input()` offer up/down-arrow recall, so there is no other REPL change.
+
+`fmt_files()` reads each file, formats it through `formatter.format_source()` (which parses it first — a syntax error is reported and the file is skipped, never written), and writes the result back only when it differs. With `--check` nothing is written; the files that would change are printed and the exit code is `1`.
+
 ## 8. Testing
 
-`python tests/run_tests.py` discovers `tests/test_*.py` with plain `unittest` (verbosity 2) and exits non-zero on any failure. The 176 tests are split by layer, mirroring this document:
+`python tests/run_tests.py` discovers `tests/test_*.py` with plain `unittest` (verbosity 2) and exits non-zero on any failure. The 211 tests are split by layer, mirroring this document:
 
 | File | Covers |
 | --- | --- |
@@ -268,6 +274,8 @@ file:line:col: message
 | `tests/test_string_methods.py` | All 9 string methods, chaining, method values, member errors |
 | `tests/test_import.py` | `import`, module cache, cycles, import errors, the import example |
 | `tests/test_errors.py` | Error format (location, source line, caret) |
+| `tests/test_formatter.py` | `kabir fmt` rules, idempotency, `--check`, invalid files, meaning preserved across formatting |
+| `tests/test_repl_history.py` | REPL history setup/save across restarts, missing and unwritable history files |
 | `tests/test_examples.py` | Every file in `examples/` runs and produces its expected output |
 
 There is no test framework dependency and no mocking — tests drive the real `Interpreter` and compare real output.
@@ -282,5 +290,6 @@ There is no test framework dependency and no mocking — tests drive the real `I
 | Add a string method | One function + one `STRING_METHODS` entry in `stdlib.py`, docs, tests in `tests/test_string_methods.py` |
 | Add `import` | A new statement type end-to-end (lexer keyword, AST node, parser rule, interpreter `_load_module` + module cache + file stack), docs, tests in `tests/test_import.py` |
 | Add an operator | Lexer op tables, a parser precedence level, `_binary()`/`_compute_UnaryOp`, docs, tests |
+| Change the canonical style | The style rules in `kabir/formatter.py` (`_Printer`), docs in `docs/LANGUAGE.md` (Formatter section), tests in `tests/test_formatter.py` |
 | Change error wording | The message string where it is raised — rendering is centralised in `errors.py` |
 | Change number formatting | `format_value()` in `interpreter.py` — it is the single formatting path |

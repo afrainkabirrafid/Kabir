@@ -25,7 +25,7 @@ $ git clone https://github.com/afrainkabirrafid/kabir.git
 $ cd kabir
 $ python -m kabir run examples/hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 1.1.0.
+Welcome to Kabir version 1.2.0.
 2 + 3 = 5
 ```
 
@@ -40,7 +40,7 @@ let name = "Rafid"
 let language = "Kabir"
 
 print("Hello, {name}!")
-print("Welcome to {language} version 1.1.0.")
+print("Welcome to {language} version 1.2.0.")
 print("2 + 3 = {2 + 3}")
 ```
 
@@ -49,7 +49,7 @@ Run it:
 ```console
 $ python -m kabir run hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 1.1.0.
+Welcome to Kabir version 1.2.0.
 2 + 3 = 5
 ```
 
@@ -61,6 +61,7 @@ All commands work both as `python -m kabir ...` (zero-install, from a fresh clon
 | --- | --- |
 | `python -m kabir run <file.kbr>` | Run a Kabir program |
 | `python -m kabir <file.kbr>` | Same — a bare `.kbr` argument is run directly |
+| `python -m kabir fmt <file.kbr> ...` | Format `.kbr` files in place (`--check` only reports) |
 | `python -m kabir repl` | Start the interactive REPL |
 | `python -m kabir` | Start the REPL (no arguments) |
 | `python -m kabir --help` | Show help (`-h` and `help` work too) |
@@ -68,7 +69,7 @@ All commands work both as `python -m kabir ...` (zero-install, from a fresh clon
 
 ```console
 $ python -m kabir --version
-kabir 1.1.0
+kabir 1.2.0
 ```
 
 ### The `kabir` command
@@ -77,7 +78,7 @@ The repository ships an executable launcher at `bin/kabir`:
 
 ```console
 $ ./bin/kabir --version
-kabir 1.1.0
+kabir 1.2.0
 $ ./bin/kabir run examples/fizzbuzz.kbr
 ```
 
@@ -87,7 +88,7 @@ It lives in `bin/` for a real reason: a repo-root file named `kabir` cannot coex
 
 ```console
 $ python -m kabir repl
-Kabir 1.1.0 -- type 'exit' or press Ctrl-D to leave.
+Kabir 1.2.0 -- type 'exit' or press Ctrl-D to leave.
 kabir> let x = 5
 kabir> x + 1
 6
@@ -97,6 +98,19 @@ kabir> exit
 ```
 
 Expression statements print their value; other statements print nothing. Multi-line input (for example a `func` definition) is supported — the REPL waits with a `... ` prompt until the braces balance. Type `exit` or `quit`, or press Ctrl-D, to leave.
+
+The REPL remembers your lines: up/down arrows recall previous lines, and the history is saved to `~/.kabir_history` so it survives restarts (it is loaded when the REPL starts and written back when it exits).
+
+### The formatter
+
+`kabir fmt` rewrites `.kbr` files in canonical style — 4-space indentation, one space around operators and after commas, `if`/`while`/`for`/`func` braces on the header line, one blank line around top-level function declarations, short arrays and dicts on one line (long ones break to one element per line), no trailing whitespace, one trailing newline. Comments and string literals are preserved exactly, and formatting never changes what a program prints — `kabir fmt` then `kabir run` gives the same output as before.
+
+```console
+$ kabir fmt my_program.kbr          # format in place
+$ kabir fmt --check examples/*.kbr  # list files that would change, change nothing
+```
+
+`--check` exits `1` when any file would change (handy in a script or pre-commit check) and `0` when everything is already formatted. A file with a syntax error is reported and skipped — it is never written. Formatting twice is a no-op: the second run changes nothing.
 
 ### Exit codes
 
@@ -284,16 +298,16 @@ Zero dependencies here too — the suite is plain `unittest`, run by a small run
 
 ```console
 $ python tests/run_tests.py
-Ran 176 tests in 0.818s
+Ran 211 tests in 1.918s
 
 OK
 ```
 
-The 176 tests cover the lexer, parser, interpreter, built-ins, standard library, string methods, imports, errors, and every example in `examples/`. Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+The 211 tests cover the lexer, parser, interpreter, built-ins, standard library, string methods, imports, errors, the formatter, REPL history, and every example in `examples/`. Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Honest limits
 
-Kabir 1.1.0 is a small language, and it is honest about what it is not:
+Kabir 1.2.0 is a small language, and it is honest about what it is not:
 
 - **No JIT, no native compilation.** It is a tree-walking interpreter; it is fast enough for scripts and learning, not for number-crunching.
 - **`import` loads other `.kbr` files** — a program can be split across files, and each file runs once (see the [roadmap](#roadmap) for what is still missing).
@@ -308,9 +322,9 @@ Roughly in order, and open to discussion:
 
 1. **`import` for `.kbr` files** — load and reuse code across files. — done in 1.1.0
 2. **Standard-library modules** — starting with `random` (so the guessing game gets a real secret), then string helpers and math. — done in 1.1.0 (random, math, and string methods as built-ins)
-3. **A formatter** (`kabir fmt`) for canonical `.kbr` style.
-4. **Pip packaging** — `pyproject.toml` is already in the repo; publishing to PyPI so `pip install kabir` gives you the `kabir` command.
-5. **More of the language** — `else` on loops is not planned; instead: string methods — done in 1.1.0, a `switch`-style construct only if it earns its place, and better REPL history.
+3. **A formatter** (`kabir fmt`) for canonical `.kbr` style. — done in 1.2.0
+4. **Pip packaging** — published to PyPI as `kabir-lang` in 1.1.0, so `pip install kabir-lang` gives you the `kabir` command. (The name `kabir` itself is taken on PyPI by an unrelated package.)
+5. **More of the language** — `else` on loops is not planned; instead: string methods — done in 1.1.0, better REPL history — done in 1.2.0, and a `switch`-style construct only if it earns its place.
 
 Ideas and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

@@ -71,6 +71,12 @@ class TestErrors(unittest.TestCase):
     def test_assign_to_undefined_variable(self):
         expect_error(self, "x = 5", "never defined")
 
+    def test_member_on_array_uses_an(self):
+        expect_error(self, "[1, 2].foo", "Cannot use .foo on an array")
+        expect_error(self, "let n = 5\nn.foo", "Cannot use .foo on a number")
+        expect_error(self, "let f = func() {\n}\nf.foo",
+                     "Cannot use .foo on a function")
+
 
 if __name__ == "__main__":
     unittest.main()

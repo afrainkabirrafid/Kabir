@@ -79,8 +79,12 @@ class Parser:
                 self._fail("Expected '}' to close this block", token=tok)
             statements.append(self._statement())
             self._skip_separators()
-        self._advance()  # consume "}"
-        return ast.Block(statements, line=tok.line, col=tok.col)
+        close = self._advance()  # consume "}"
+        block = ast.Block(statements, line=tok.line, col=tok.col)
+        # The formatter needs the closing brace's line to place comments
+        # that sit inside the block or on the "}" line itself.
+        block.end_line = close.line
+        return block
 
     def _statement(self):
         tok = self.current

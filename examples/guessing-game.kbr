@@ -3,9 +3,7 @@
 
 let secret = randint(1, 100)
 let attempts = 0
-
 print("I'm thinking of a number between 1 and 100. Guess it!")
-
 while true {
     let guess = num(input("Your guess: "))
     attempts += 1

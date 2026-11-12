@@ -11,7 +11,7 @@ $ git clone https://github.com/afrainkabirrafid/kabir.git
 $ cd kabir
 $ python -m kabir run examples/hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 1.1.0.
+Welcome to Kabir version 1.2.0.
 2 + 3 = 5
 ```
 

@@ -16,6 +16,11 @@ from .errors import KabirError, error_at
 from .parser import parse as _parse_source
 
 
+def _article(word):
+    """'a' or 'an' for a type name ('an array', 'a string')."""
+    return "an" if word[:1] in "aeiou" else "a"
+
+
 class _ReturnSignal(Exception):
     def __init__(self, value):
         self.value = value
@@ -622,8 +627,9 @@ class Interpreter:
             self.error(expr, "Cannot use .%s on a dict -- write "
                        'dict["%s"] instead (for example, user["name"])'
                        % (expr.name, expr.name))
-        self.error(expr, "Cannot use .%s on a %s -- only strings have "
-                   "methods" % (expr.name, _type_name(receiver)))
+        self.error(expr, "Cannot use .%s on %s %s -- only strings have "
+                   "methods" % (expr.name, _article(_type_name(receiver)),
+                                _type_name(receiver)))
 
     def _compute_Index(self, expr):
         target = self.compute(expr.target)

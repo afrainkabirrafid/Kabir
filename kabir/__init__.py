@@ -1,9 +1,9 @@
 """Kabir -- a small programming language, built from scratch in Python.
 
-Version 1.1.0. Author: Afrain Kabir Rafid.
+Version 1.2.0. Author: Afrain Kabir Rafid.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __author__ = "Afrain Kabir Rafid"
 
 from .interpreter import Interpreter  # noqa: F401

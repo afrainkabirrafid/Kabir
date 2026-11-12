@@ -22,7 +22,6 @@ func calc(a, op, b) {
 }
 
 print("Calculator -- type like '2 + 3', or 'quit' to stop.")
-
 while true {
     let line = input("calc> ")
     if line == "quit" {

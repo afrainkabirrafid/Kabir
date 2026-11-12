@@ -20,7 +20,6 @@ func show_todos() {
 }
 
 print("Todo list -- type 'add <task>', 'list', 'done <number>', or 'quit'.")
-
 while true {
     let line = input("todo> ")
     if line == "quit" {

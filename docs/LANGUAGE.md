@@ -1,4 +1,4 @@
-# Kabir Language Reference — version 1.1.0
+# Kabir Language Reference — version 1.2.0
 
 This is the complete reference for the Kabir language. Every code block in this document is a real, runnable Kabir program, and every output block is the exact output it produces. Run any example with:
 
@@ -35,6 +35,8 @@ For how to run programs, start the REPL, and read error messages, see the [READM
 - [Built-in functions](#built-in-functions)
 - [Standard library](#standard-library)
 - [Errors](#errors)
+- [Formatter](#formatter)
+- [REPL history](#repl-history)
 - [What Kabir does not have (yet)](#what-kabir-does-not-have-yet)
 
 ## Program structure
@@ -1853,9 +1855,40 @@ Common errors and what they mean:
 
 Exit code is `1` for a Kabir error, `2` for a usage error (unknown command, missing file). A program that runs cleanly exits `0`.
 
+## Formatter
+
+`kabir fmt` rewrites `.kbr` files in one canonical style. It parses the file first, so a file with a syntax error is reported and left untouched — the formatter never writes a file it cannot parse.
+
+```console
+$ kabir fmt my_program.kbr          # format in place
+$ kabir fmt --check examples/*.kbr  # list files that would change, change nothing
+```
+
+With `--check`, `kabir fmt` prints each file that would change (`kabir fmt: <file> would change`) and exits `1`; it exits `0` when everything is already formatted. Formatting twice is a no-op: the second run changes nothing.
+
+The canonical style:
+
+- **Indentation** — 4 spaces per level, one statement per line.
+- **Spacing** — one space around binary operators (`a + b`, not `a+b`) and after commas (`f(1, 2)`, not `f(1,2)`); no space before a comma, `(` or `[` in calls and indexing.
+- **Braces** — the `{` of `if` / `elif` / `else` / `while` / `for` / `func` stays on the header line; the closing `}` sits on its own line at the header's indent.
+- **Blank lines** — at the top level, function declarations are separated from their neighbours by exactly one blank line, and a blank line after a comment block (the file header, a section note) is kept; no blank lines are inserted anywhere else (blank lines inside blocks are removed).
+- **Collections** — short arrays and dicts stay on one line (up to 80 characters); longer ones break to one element per line, with no trailing comma (Kabir does not allow trailing commas).
+- **Whitespace** — no trailing whitespace; the file ends with exactly one newline.
+
+Two things the formatter never touches:
+
+- **Comments** — a comment on its own line stays on its own line before the statement it preceded; a comment after code on a line stays at the end of that line. A comment it cannot place exactly (for example one inside a multi-line array literal) is kept as its own line right after the statement it was inside. Comments are never dropped.
+- **Strings** — literal parts come back character for character (including `#` inside a string, which is text, not a comment), and interpolation expressions are re-formatted the same way as any other expression (`"{a+1}"` becomes `"{a + 1}"`).
+
+Parentheses are added only where meaning needs them: `(a + b) * c` keeps its parentheses, `a + (b + c)` keeps them too (dropping them would change the grouping), and `a ** b ** c` stays unparenthesised because `**` is right-associative. Formatting never changes what a program prints — `kabir fmt` followed by `kabir run` gives exactly the same output as the unformatted file.
+
+## REPL history
+
+The REPL remembers your lines. Press up/down to recall previous lines, and the history is saved to `~/.kabir_history` when the REPL exits, so it is still there next time you start it. If `readline` is not available (or the history file cannot be read or written), the REPL simply runs without history — nothing else changes.
+
 ## What Kabir does not have (yet)
 
-To avoid surprises, the things people most often expect that are **not** in 1.1.0:
+To avoid surprises, the things people most often expect that are **not** in 1.2.0:
 
 - **File I/O, dates, networking** — `print` and `input` are the only way in or out (plus `import`, which reads `.kbr` files).
 - **Dot access on dicts** — write `user["name"]`, not `user.name`.
