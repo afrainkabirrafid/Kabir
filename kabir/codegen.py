@@ -68,6 +68,7 @@ Public API:
       (exit_code, stdout, stderr)
 """
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -836,6 +837,18 @@ def compile_native(source, filename="<stdin>", out_path=None):
     if out_path is None:
         fd, out_path = tempfile.mkstemp(prefix="kabir-native-")
         os.close(fd)
+    return _compile_c(c_source, cc, out_path)
+
+
+def _compile_c(c_source, cc, out_path):
+    """Compile already-generated C source *c_source* to *out_path*.
+
+    The runtime (``kabir/native/rt.c``) is compiled once per
+    (rt.c content, compiler) and the object file reused from the
+    cache (see _cached_rt_object): compiling rt.c took ~1.25 s of
+    every ~1.3 s native compile, while the generated program code
+    itself compiles in ~0.1 s.
+    """
     out_path = os.path.abspath(out_path)
     parent = os.path.dirname(out_path)
     if parent:
@@ -845,7 +858,7 @@ def compile_native(source, filename="<stdin>", out_path=None):
         with open(c_path, "w", encoding="utf-8") as handle:
             handle.write(c_source)
         cmd = [cc, "-std=c99", "-O2", "-I" + _NATIVE_DIR,
-               c_path, _RT_C, "-lm", "-o", out_path]
+               c_path, _cached_rt_object(cc), "-lm", "-o", out_path]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             raise KabirError(
@@ -855,17 +868,205 @@ def compile_native(source, filename="<stdin>", out_path=None):
     return out_path
 
 
-def run_native(source, filename="<stdin>", input_text=""):
-    """Compile *source* to a temp binary, run it, return the result.
+# ----------------------------------------------------------------------
+# Native binary cache (5.0.0 Leap 3)
+# ----------------------------------------------------------------------
+#
+# `kabir run --native` used to pay the full ~1.3 s C compile on
+# every run, so it lost ~11x to the VM on short programs. The cache
+# below stores the compiled binary under ~/.kabir/cache/native
+# (or $KABIR_CACHE_DIR/native) keyed by a fingerprint of EVERYTHING
+# that can change the binary: the generated C source (which covers
+# the Kabir source and the transpiler), kabir/native/rt.c and rt.h,
+# the Kabir version, and the C compiler's identity. A source change,
+# a runtime change, or a compiler change all miss the cache and
+# recompile; --no-cache (use_cache=False) always recompiles.
+# Binaries are written atomically (temp file + os.replace), so a
+# crash mid-compile can never leave a half-written binary behind,
+# and a stale binary can never be served: the key IS the content.
+
+def _native_cache_dir():
+    """Directory holding cached native binaries and rt.o files."""
+    override = os.environ.get("KABIR_CACHE_DIR")
+    if override:
+        return os.path.join(override, "native")
+    return os.path.join(os.path.expanduser("~"), ".kabir", "cache",
+                        "native")
+
+
+def _cc_fingerprint(cc):
+    """Identify the C compiler: resolved path + version line."""
+    try:
+        proc = subprocess.run([cc, "--version"], capture_output=True,
+                              text=True, timeout=10)
+        first = proc.stdout.split("\n")[0].strip() if proc.stdout else ""
+    except Exception:
+        first = ""
+    return "%s|%s" % (cc, first)
+
+
+def _native_cache_key(c_source, cc):
+    """Fingerprint of everything that determines the binary."""
+    from . import __version__ as kabir_version
+    digest = hashlib.sha256()
+    digest.update(b"kabir-native-cache-v1\n")
+    digest.update(kabir_version.encode("utf-8"))
+    digest.update(b"\n")
+    digest.update(_cc_fingerprint(cc).encode("utf-8"))
+    digest.update(b"\n")
+    for path in (_RT_C, _RT_H):
+        try:
+            with open(path, "rb") as handle:
+                digest.update(handle.read())
+        except OSError as exc:
+            raise KabirError("Cannot compile native code -- cannot read "
+                             "%s: %s" % (path, exc))
+    digest.update(b"\n")
+    digest.update(c_source.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _cached_rt_object(cc):
+    """Compile rt.c once per (rt.c content, compiler); reuse the .o.
+
+    The object file lives in the native cache dir, named by a hash
+    of rt.c + the compiler fingerprint, so a runtime or compiler
+    change rebuilds it automatically. Written atomically.
+    """
+    try:
+        with open(_RT_C, "rb") as handle:
+            rt_hash = hashlib.sha256(handle.read()).hexdigest()[:16]
+    except OSError as exc:
+        raise KabirError("Cannot compile native code -- cannot read "
+                         "%s: %s" % (_RT_C, exc))
+    cc_hash = hashlib.sha256(
+        _cc_fingerprint(cc).encode("utf-8")).hexdigest()[:8]
+    cache_dir = _native_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    obj_path = os.path.join(cache_dir, "rt-%s-%s.o" % (rt_hash, cc_hash))
+    if os.path.isfile(obj_path):
+        return obj_path
+    tmp_path = "%s.tmp-%d" % (obj_path, os.getpid())
+    proc = subprocess.run([cc, "-std=c99", "-O2", "-c", _RT_C,
+                           "-o", tmp_path],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise KabirError(
+            "Native compilation failed:\n%s"
+            % (proc.stderr.strip() or proc.stdout.strip()
+               or "unknown cc error"))
+    os.replace(tmp_path, obj_path)
+    return obj_path
+
+
+def _cached_binary_ok(cached_path):
+    """True if the cached binary matches its stored sha256 sidecar.
+
+    The sidecar is written at compile time; a cached binary whose
+    bytes no longer match it (disk corruption, a half-written file
+    from a killed older build, tampering) is treated as a miss and
+    recompiled instead of ever being executed.
+    """
+    try:
+        with open(cached_path + ".sha256", "r",
+                  encoding="utf-8") as handle:
+            expected = handle.read().strip()
+        digest = hashlib.sha256()
+        with open(cached_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest() == expected
+    except OSError:
+        return False
+
+
+def _store_binary_sidecar(cached_path):
+    """Write the sha256 sidecar for a freshly compiled binary."""
+    digest = hashlib.sha256()
+    with open(cached_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    sidecar = cached_path + ".sha256"
+    tmp_sidecar = "%s.tmp-%d" % (sidecar, os.getpid())
+    with open(tmp_sidecar, "w", encoding="utf-8") as handle:
+        handle.write(digest.hexdigest() + "\n")
+    os.replace(tmp_sidecar, sidecar)
+
+
+def cached_compile_native(source, filename="<stdin>", out_path=None,
+                          use_cache=True):
+    """Like compile_native, but reuse a cached binary on repeat runs.
+
+    On a cache hit with no *out_path* (``kabir run --native``), the
+    cached binary's path is returned directly -- nothing is copied
+    and nothing recompiles. With an *out_path* (``kabir build
+    --native``), the cached binary is copied there. On a miss the
+    program is compiled (with the cached rt.o) and the result is
+    stored in the cache before being returned/copied. A cached
+    binary is only trusted when its sha256 sidecar matches its
+    bytes; a damaged entry is recompiled, never executed.
+    With use_cache=False the cache is bypassed entirely (the
+    ``--no-cache`` flag) and compile_native runs instead.
+    """
+    if not use_cache:
+        return compile_native(source, filename, out_path)
+    cc = _find_cc()
+    if cc is None:
+        raise KabirError(
+            "Cannot compile native code -- no C compiler found "
+            "('cc', 'gcc' or 'clang'). Install gcc to use native mode.")
+    c_source = transpile(source, filename)
+    key = _native_cache_key(c_source, cc)
+    cache_dir = _native_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    cached_path = os.path.join(cache_dir, "prog-%s" % key)
+    if os.path.isfile(cached_path) and _cached_binary_ok(cached_path):
+        if out_path is None:
+            return cached_path
+        return _copy_cached_binary(cached_path, out_path)
+    tmp_path = os.path.join(cache_dir,
+                            ".tmp-prog-%s-%d" % (key[:12], os.getpid()))
+    try:
+        _compile_c(c_source, cc, tmp_path)
+        os.replace(tmp_path, cached_path)
+        os.chmod(cached_path, 0o755)
+        _store_binary_sidecar(cached_path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    if out_path is None:
+        return cached_path
+    return _copy_cached_binary(cached_path, out_path)
+
+
+def _copy_cached_binary(cached_path, out_path):
+    """Copy a cached binary to *out_path* (build --native)."""
+    out_path = os.path.abspath(out_path)
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    shutil.copyfile(cached_path, out_path)
+    os.chmod(out_path, 0o755)
+    return out_path
+
+
+def run_native(source, filename="<stdin>", input_text="",
+               use_cache=True):
+    """Compile *source* to a native binary (cached), run it, return the result.
 
     Returns (exit_code, stdout, stderr). A non-zero exit code means
     the program hit a runtime error (message in stderr); a KabirError
     is raised only for transpile/compile failures (no compiler, bad
     C) -- exactly like compile_native.
     """
-    with tempfile.TemporaryDirectory(prefix="kabir-native-run-") as tmp:
-        binary = os.path.join(tmp, "program")
-        compile_native(source, filename, binary)
-        proc = subprocess.run([binary], input=input_text,
-                              capture_output=True, text=True, timeout=30)
-        return proc.returncode, proc.stdout, proc.stderr
+    binary = cached_compile_native(source, filename, use_cache=use_cache)
+    proc = subprocess.run([binary], input=input_text,
+                          capture_output=True, text=True, timeout=30)
+    return proc.returncode, proc.stdout, proc.stderr

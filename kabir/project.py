@@ -4,12 +4,14 @@ Creates new projects (``kabir new``), builds them to bytecode
 (``kabir build``), and resolves a project's entry point (``kabir run``).
 
 It also implements the 3.0.0 package registry (``kabir add`` /
-``kabir publish``): a ``[dependencies]`` section in the manifest,
-a GitHub-hosted (or local-directory) ``index.json`` registry, and
-vendoring into ``vendor/<name>/<version>/`` plus a ``Kabir.lock``
-lockfile. No server is involved and ``publish`` never pushes
-anything anywhere -- it only builds the tarball and prints the
-registry entry to submit.
+``kabir publish``), extended in 5.0.0: a ``[dependencies]`` section
+in the manifest, a GitHub-hosted (or local-directory) ``index.json``
+registry, and vendoring into ``vendor/<name>/<version>/`` plus a
+``Kabir.lock`` lockfile. No server is involved and ``publish``
+never pushes anything anywhere -- it only builds the tarball and
+stages the exact registry update (``stage_publish``) for the user
+to push by hand. The index format is documented in
+docs/REGISTRY.md.
 
 The manifest (``Kabir.toml``) is read with a hand-rolled minimal
 parser for the exact format :func:`new_project` writes -- ``tomllib``
@@ -37,7 +39,8 @@ from .errors import KabirError
 
 __all__ = ["new_project", "build_project", "run_project",
            "parse_manifest", "read_manifest",
-           "add_package", "publish_package", "read_lockfile"]
+           "add_package", "publish_package", "stage_publish",
+           "read_lockfile", "validate_index"]
 
 # Project names: start with a letter, then letters, digits, "-" or "_".
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
@@ -49,12 +52,23 @@ TARGET_DIR = "target"
 DEFAULT_VERSION = "0.1.0"
 DEFAULT_AUTHOR = "Afrain Kabir Rafid"
 
-# --- Package registry (3.0.0 Wave 2) -------------------------------------
-# Registry index format (index.json in the registry):
-#   {"packages": {"name": {"1.0.0": {"url": ..., "sha256": ...}}}}
+# --- Package registry (3.0.0 Wave 2, extended in 5.0.0 Wave 2) ---------
+# Registry index format (index.json in the registry) -- see
+# docs/REGISTRY.md for the full schema. Short version::
+#
+#   {"packages": {"name": {"1.0.0": {"url": ..., "sha256": ...,
+#                                    "description": ...,
+#                                    "dependencies": {...}}}}}
+#
 # ``url`` is either an absolute http(s) URL, or a path relative to
 # the registry (a directory inside a local registry, or a path under
-# the URL base of a remote registry).
+# the URL base of a remote registry). ``sha256`` is the hex digest
+# of the package tarball; when present it is verified before
+# anything is installed, and when absent the digest of the
+# downloaded file is recorded in the lockfile instead.
+# ``description`` is free text from the package's Kabir.toml.
+# ``dependencies`` maps a package name to an exact version and is
+# installed transitively by ``add_package``.
 REGISTRY_ENV_VAR = "KABIR_REGISTRY"
 # The future registry repo. It does not exist yet: against this
 # default, add_package() refuses with a clear error telling the user
@@ -71,7 +85,7 @@ VENDOR_DIR = "vendor"
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 # Keys allowed in the [package] section of Kabir.toml.
-_PACKAGE_KEYS = ("name", "version", "authors")
+_PACKAGE_KEYS = ("name", "version", "authors", "description")
 
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 _SECTION_RE = re.compile(r"^\[([A-Za-z_][A-Za-z0-9_-]*)\]$")
@@ -139,12 +153,13 @@ def parse_manifest(text, filename="Kabir.toml"):
     """Parse the text of a ``Kabir.toml`` manifest.
 
     Returns a dict with ``name`` (str), ``version`` (str),
-    ``authors`` (list of str) and ``dependencies`` (dict mapping a
-    package name to an exact version string, e.g.
-    ``{"greet": "1.0.0"}``). ``version`` defaults to ``"0.1.0"``,
-    ``authors`` to ``[]`` and ``dependencies`` to ``{}`` when they
-    are absent. Dependency versions must be exact (``"1.0.0"`` --
-    no ranges). Raises :class:`KabirError` on any malformed manifest.
+    ``authors`` (list of str), ``description`` (str) and
+    ``dependencies`` (dict mapping a package name to an exact
+    version string, e.g. ``{"greet": "1.0.0"}``). ``version``
+    defaults to ``"0.1.0"``, ``authors`` to ``[]``, ``description``
+    to ``""`` and ``dependencies`` to ``{}`` when they are absent.
+    Dependency versions must be exact (``"1.0.0"`` -- no ranges).
+    Raises :class:`KabirError` on any malformed manifest.
     """
     section = None
     seen_sections = set()
@@ -218,7 +233,7 @@ def parse_manifest(text, filename="Kabir.toml"):
     if "name" not in package:
         raise _manifest_error(
             'Missing "name" in [package] of %s' % filename, filename)
-    for key in ("name", "version"):
+    for key in ("name", "version", "description"):
         if key in package and not isinstance(package[key], str):
             raise _manifest_error(
                 'Key "%s" in [package] of %s must be a quoted string'
@@ -237,6 +252,7 @@ def parse_manifest(text, filename="Kabir.toml"):
         "name": name,
         "version": package.get("version", DEFAULT_VERSION),
         "authors": package.get("authors", []),
+        "description": package.get("description", ""),
         "dependencies": dependencies,
     }
 
@@ -385,11 +401,18 @@ def build_project(path="."):
 
 
 # ---------------------------------------------------------------------------
-# Package registry (3.0.0 Wave 2)
+# Package registry (3.0.0 Wave 2, extended in 5.0.0 Wave 2)
 #
-# Registry index format (``index.json`` at the registry root)::
+# The registry is a static GitHub repo (or a local directory with
+# the same layout): an ``index.json`` at the root plus one tarball
+# per package version, normally under ``packages/``. The full
+# schema and the hosting model are documented in docs/REGISTRY.md.
+# Short version of the index format::
 #
-#     {"packages": {"name": {"1.0.0": {"url": ..., "sha256": ...}}}}
+#     {"packages": {"name": {"1.0.0": {"url": ...,
+#                                      "sha256": ...,
+#                                      "description": ...,
+#                                      "dependencies": {...}}}}}
 #
 # ``url`` is an absolute http(s) URL, or a path relative to the
 # registry: a file inside a local registry directory, or a path
@@ -397,13 +420,118 @@ def build_project(path="."):
 # digest of the package tarball; when present it is verified before
 # anything is installed, and when absent the digest of the
 # downloaded file is recorded in the lockfile instead.
+# ``description`` is free text from the package's Kabir.toml.
+# ``dependencies`` maps a package name to an exact version string
+# and is installed transitively by ``add_package``.
 #
 # The registry source is the ``KABIR_REGISTRY`` environment variable
 # (a local directory, used by tests, or a URL base). The default is
 # the GitHub raw URL of the future registry repo, which does not
-# exist yet -- ``add_package`` refuses it with a clear error. There
-# is no server and nothing here pushes anywhere.
+# exist yet -- ``add_package`` refuses it with a clear error.
+# ``stage_publish`` stages against an empty index when no registry
+# is configured yet (a first publish). There is no server and
+# nothing here pushes anywhere.
 # ---------------------------------------------------------------------------
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def validate_index(index):
+    """Validate a parsed registry ``index.json``.
+
+    The index must be ``{"packages": {name: {version: entry}}}``
+    where each entry is a dict with a non-empty ``"url"`` string,
+    an optional ``"sha256"`` (64 lowercase hex chars), an optional
+    ``"description"`` string and optional ``"dependencies"``
+    mapping a package name to an exact version string. Unknown
+    extra keys are ignored, so the format can grow without
+    breaking old readers. Returns the index unchanged. Raises
+    :class:`KabirError` on any malformed part, naming the
+    offending package/version.
+    """
+    if not isinstance(index, dict) or not isinstance(
+            index.get("packages"), dict):
+        raise KabirError(
+            "Registry index is malformed -- expected "
+            '{"packages": {"name": {"1.0.0": {"url": ..., '
+            '"sha256": ...}}}}', filename="<registry>")
+    for name, versions in index["packages"].items():
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            raise KabirError(
+                'Registry index has an invalid package name %r'
+                % (name,), filename="<registry>")
+        if not isinstance(versions, dict):
+            raise KabirError(
+                'Registry index entry for package "%s" is malformed '
+                "-- expected a mapping of version to entry" % name,
+                filename="<registry>")
+        for version, entry in versions.items():
+            where = 'package "%s" version %s' % (name, version)
+            if not isinstance(version, str) or not _VERSION_RE.match(
+                    version):
+                raise KabirError(
+                    'Registry index has an invalid version %r for '
+                    'package "%s" -- versions must be exact, e.g. '
+                    '"1.0.0"' % (version, name), filename="<registry>")
+            if not isinstance(entry, dict):
+                raise KabirError(
+                    "Registry index entry for %s is malformed -- "
+                    'expected {"url": ..., "sha256": ...}' % where,
+                    filename="<registry>")
+            url = entry.get("url")
+            if not isinstance(url, str) or not url:
+                raise KabirError(
+                    'Registry index entry for %s has no "url"'
+                    % where, filename="<registry>")
+            sha256 = entry.get("sha256")
+            if sha256 is not None and (
+                    not isinstance(sha256, str)
+                    or not _SHA256_RE.match(sha256)):
+                raise KabirError(
+                    'Registry index entry for %s has an invalid '
+                    '"sha256" -- expected 64 lowercase hex chars'
+                    % where, filename="<registry>")
+            description = entry.get("description")
+            if description is not None and not isinstance(
+                    description, str):
+                raise KabirError(
+                    'Registry index entry for %s has a non-string '
+                    '"description"' % where, filename="<registry>")
+            dependencies = entry.get("dependencies")
+            if dependencies is not None:
+                if not isinstance(dependencies, dict):
+                    raise KabirError(
+                        'Registry index entry for %s has a '
+                        'non-mapping "dependencies"' % where,
+                        filename="<registry>")
+                for dep_name, dep_version in dependencies.items():
+                    if not isinstance(dep_name, str) or not NAME_RE.match(
+                            dep_name):
+                        raise KabirError(
+                            'Registry index entry for %s has an invalid '
+                            'dependency name %r' % (where, dep_name),
+                            filename="<registry>")
+                    if not isinstance(dep_version, str) or not (
+                            _VERSION_RE.match(dep_version)):
+                        raise KabirError(
+                            'Registry index entry for %s has an invalid '
+                            'version %r for dependency "%s" -- versions '
+                            'must be exact, e.g. "1.0.0"'
+                            % (where, dep_version, dep_name),
+                            filename="<registry>")
+    return index
+
+
+def _latest_version(versions):
+    """Return the highest exact version in *versions* (a dict).
+
+    Versions are compared as (major, minor, patch) number tuples.
+    Raises :class:`KabirError` when the dict is empty.
+    """
+    if not versions:
+        return None
+    return max(versions,
+               key=lambda v: tuple(int(part) for part in v.split(".")))
 
 
 def _resolve_registry(registry=None):
@@ -452,14 +580,24 @@ def _http_get_bytes(url, what):
             filename=url)
 
 
-def _read_index(source):
-    """Load and validate the registry ``index.json`` for *source*."""
+def _read_index(source, missing_ok=False):
+    """Load and validate the registry ``index.json`` for *source*.
+
+    With ``missing_ok=True`` a missing index (no ``index.json``
+    in a local registry directory, or HTTP 404 on a URL base)
+    returns an empty index ``{"packages": {}}`` instead of
+    raising -- used by :func:`stage_publish` for a first publish
+    into a fresh registry. Any other failure (unreadable file,
+    invalid JSON, malformed index) still raises.
+    """
     kind, base = source
     if kind == "local":
         index_path = base / REGISTRY_INDEX_FILENAME
         try:
             raw = index_path.read_bytes()
         except FileNotFoundError:
+            if missing_ok:
+                return {"packages": {}}
             raise KabirError(
                 "Registry index not found at %s -- expected an "
                 "index.json in the registry directory" % index_path,
@@ -469,21 +607,25 @@ def _read_index(source):
                 "Cannot read registry index %s -- %s"
                 % (index_path, exc), filename=str(index_path))
     else:  # ("url", base)
-        raw = _http_get_bytes("%s/%s" % (base, REGISTRY_INDEX_FILENAME),
-                              "registry index")
+        if missing_ok:
+            try:
+                raw = _http_get_bytes(
+                    "%s/%s" % (base, REGISTRY_INDEX_FILENAME),
+                    "registry index")
+            except KabirError as exc:
+                if "HTTP 404" in str(exc):
+                    return {"packages": {}}
+                raise
+        else:
+            raw = _http_get_bytes("%s/%s" % (base, REGISTRY_INDEX_FILENAME),
+                                  "registry index")
     try:
         index = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         raise KabirError(
             "Registry index is not valid JSON -- expected "
             '{"packages": {...}}', filename="<registry>")
-    if not isinstance(index, dict) or not isinstance(
-            index.get("packages"), dict):
-        raise KabirError(
-            "Registry index is malformed -- expected "
-            '{"packages": {"name": {"1.0.0": {"url": ..., '
-            '"sha256": ...}}}}', filename="<registry>")
-    return index
+    return validate_index(index)
 
 
 def _fetch_package_bytes(entry, source):
@@ -627,43 +769,29 @@ def _write_lockfile(project_dir, packages):
     return path
 
 
-def add_package(name, version, project_dir=".", registry=None):
-    """Add an exact-version dependency to the project at *project_dir*.
+def _install_from_index(name, version, project_dir, index, source,
+                        seen_versions, installed):
+    """Install one package (and its transitive dependencies) from
+    an already-loaded *index*.
 
-    Resolves ``name``/``version`` against the registry (see
-    :func:`_resolve_registry`), verifies the package sha256 when
-    the registry entry has one, extracts the tarball into
-    ``vendor/<name>/<version>/``, records ``name = "version"`` in
-    the manifest's ``[dependencies]`` section, and writes
-    ``Kabir.lock``. Re-adding the same version re-vendors it
-    cleanly. Returns ``{"name", "version", "sha256", "vendor_dir",
-    "lockfile"}``. Prints nothing. Raises :class:`KabirError` for
-    an unknown package, an unknown version, a sha256 mismatch, a
-    missing registry/index/package file, or the not-yet-live
-    default registry.
+    *seen_versions* maps an already-requested package name to the
+    version being installed -- a second request for the same name
+    at a different version is a conflict and raises; the same
+    version twice (a diamond) installs once. *installed* is the
+    running lockfile map ``{name: {"version", "sha256"}}`` and is
+    extended in place. Returns the sha256 digest of this package.
     """
-    _check_name(name)
-    if not isinstance(version, str) or not _VERSION_RE.match(version):
-        raise KabirError(
-            'Invalid version %r for package "%s" -- versions must be '
-            'exact, e.g. "1.0.0" (no ranges like ">=1.0.0" or '
-            '"^1.0.0")' % (version, name), filename="<registry>")
-    project_dir = Path(project_dir)
-    if not project_dir.is_dir():
-        raise KabirError(
-            'Project directory "%s" does not exist' % project_dir,
-            filename=str(project_dir))
-    manifest_path = project_dir / MANIFEST_FILENAME
-    read_manifest(manifest_path)  # raises when missing or malformed
-    source = _resolve_registry(registry)
-    if source[0] == "default":
-        raise KabirError(
-            "registry not set up yet — set KABIR_REGISTRY to a local "
-            "registry dir (or a registry URL base). The default "
-            "registry (%s) does not exist yet, so no packages can "
-            "be fetched from it." % DEFAULT_REGISTRY_URL,
-            filename=REGISTRY_ENV_VAR)
-    index = _read_index(source)
+    if name in seen_versions:
+        if seen_versions[name] != version:
+            raise KabirError(
+                'Version conflict for package "%s" -- %s is required '
+                "but %s is already installed; Kabir resolves exact "
+                "versions only, so the conflicting packages must "
+                "agree on one version"
+                % (name, version, seen_versions[name]),
+                filename="<registry>")
+        return installed[name]["sha256"]
+    seen_versions[name] = version
     versions = index["packages"].get(name)
     if not isinstance(versions, dict):
         raise KabirError(
@@ -686,10 +814,73 @@ def add_package(name, version, project_dir=".", registry=None):
     if vendor_dir.exists():
         shutil.rmtree(vendor_dir)
     _extract_tarball(data, vendor_dir, name, version)
+    installed[name] = {"version": version, "sha256": digest}
+    for dep_name, dep_version in sorted(
+            (entry.get("dependencies") or {}).items()):
+        _install_from_index(dep_name, dep_version, project_dir, index,
+                            source, seen_versions, installed)
+    return digest
+
+
+def add_package(name, version, project_dir=".", registry=None):
+    """Add an exact-version dependency to the project at *project_dir*.
+
+    Resolves ``name``/``version`` against the registry (see
+    :func:`_resolve_registry`); ``version`` may also be ``"latest"``,
+    which picks the highest version in the index. Verifies the
+    package sha256 when the registry entry has one, extracts the
+    tarball into ``vendor/<name>/<version>/``, records
+    ``name = "version"`` in the manifest's ``[dependencies]``
+    section, and writes ``Kabir.lock``. Dependencies listed in
+    the registry entry are installed transitively (vendored and
+    locked, but not added to the manifest -- only the package
+    asked for is a direct dependency). Re-adding the same version
+    re-vendors it cleanly. Returns ``{"name", "version", "sha256",
+    "vendor_dir", "lockfile"}``. Prints nothing. Raises
+    :class:`KabirError` for an unknown package, an unknown
+    version, a sha256 mismatch, a version conflict between
+    transitive dependencies, a missing registry/index/package
+    file, or the not-yet-live default registry.
+    """
+    _check_name(name)
+    if not isinstance(version, str) or not (
+            version == "latest" or _VERSION_RE.match(version)):
+        raise KabirError(
+            'Invalid version %r for package "%s" -- versions must be '
+            'exact, e.g. "1.0.0" (or "latest"), no ranges like '
+            '">=1.0.0" or "^1.0.0"' % (version, name),
+            filename="<registry>")
+    project_dir = Path(project_dir)
+    if not project_dir.is_dir():
+        raise KabirError(
+            'Project directory "%s" does not exist' % project_dir,
+            filename=str(project_dir))
+    manifest_path = project_dir / MANIFEST_FILENAME
+    read_manifest(manifest_path)  # raises when missing or malformed
+    source = _resolve_registry(registry)
+    if source[0] == "default":
+        raise KabirError(
+            "registry not set up yet — set KABIR_REGISTRY to a local "
+            "registry dir (or a registry URL base). The default "
+            "registry (%s) does not exist yet, so no packages can "
+            "be fetched from it." % DEFAULT_REGISTRY_URL,
+            filename=REGISTRY_ENV_VAR)
+    index = _read_index(source)
+    if version == "latest":
+        versions = index["packages"].get(name)
+        if not isinstance(versions, dict) or not versions:
+            raise KabirError(
+                'Package "%s" not found in the registry' % name,
+                filename="<registry>")
+        version = _latest_version(versions)
+    installed = {}
+    digest = _install_from_index(name, version, project_dir, index,
+                                 source, {}, installed)
     _set_dependency(manifest_path, name, version)
     locked = read_lockfile(project_dir)
-    locked[name] = {"version": version, "sha256": digest}
+    locked.update(installed)
     lock_path = _write_lockfile(project_dir, locked)
+    vendor_dir = project_dir / VENDOR_DIR / name / version
     return {
         "name": name,
         "version": version,
@@ -704,18 +895,27 @@ def publish_package(project_dir="."):
 
     Builds a deterministic ``target/<name>-<version>.tar.gz``
     containing ``Kabir.toml`` and everything under ``src/``, and
-    returns ``{"name", "version", "tarball", "sha256", "files",
-    "registry_entry", "steps"}``. ``registry_entry`` is the exact
-    JSON fragment to merge into the registry's ``index.json``::
+    returns ``{"name", "version", "description", "dependencies",
+    "tarball", "sha256", "files", "registry_entry", "steps"}``.
+    ``registry_entry`` is the exact JSON fragment to merge into
+    the registry's ``index.json``::
 
         {"packages": {"<name>": {"<version>":
             {"url": "packages/<name>-<version>.tar.gz",
-             "sha256": "<hex>"}}}}
+             "sha256": "<hex>",
+             "description": "...",
+             "dependencies": {"other": "1.0.0"}}}}}
 
-    ``steps`` lists how to submit the tarball + entry. This
+    ``description`` and ``dependencies`` appear in the entry only
+    when the manifest sets them (``description`` in ``[package]``,
+    ``dependencies`` in ``[dependencies]``), so entries stay
+    minimal and old readers keep working. ``steps`` lists how to
+    submit the tarball + entry; use :func:`stage_publish` to get
+    the staged files and exact push commands instead. This
     function does NOT push anything anywhere. Prints nothing.
-    Raises :class:`KabirError` when the manifest or ``src/main.kbr``
-    is missing.
+    Raises :class:`KabirError` when the manifest or
+    ``src/main.kbr`` is missing, or when the version is not an
+    exact ``"1.2.3"`` version (a registry version must be exact).
     """
     project_dir = Path(project_dir)
     if not project_dir.is_dir():
@@ -726,6 +926,13 @@ def publish_package(project_dir="."):
     run_project(project_dir)  # raises when src/main.kbr is missing
     name = manifest["name"]
     version = manifest["version"]
+    if not _VERSION_RE.match(version):
+        raise KabirError(
+            'Cannot publish package "%s" -- version %r is not an '
+            'exact "1.2.3" version; fix version in Kabir.toml'
+            % (name, version), filename=str(project_dir / MANIFEST_FILENAME))
+    description = manifest.get("description", "")
+    dependencies = manifest.get("dependencies", {})
     target_dir = project_dir / TARGET_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     tarball_name = "%s-%s.tar.gz" % (name, version)
@@ -757,10 +964,15 @@ def publish_package(project_dir="."):
         raw.close()
     digest = hashlib.sha256(tarball_path.read_bytes()).hexdigest()
     url = "packages/%s" % tarball_name
+    entry = {"url": url, "sha256": digest}
+    if description:
+        entry["description"] = description
+    if dependencies:
+        entry["dependencies"] = dict(dependencies)
     registry_entry = {
         "packages": {
             name: {
-                version: {"url": url, "sha256": digest},
+                version: entry,
             },
         },
     }
@@ -775,9 +987,181 @@ def publish_package(project_dir="."):
     return {
         "name": name,
         "version": version,
+        "description": description,
+        "dependencies": dict(dependencies),
         "tarball": str(tarball_path),
         "sha256": digest,
         "files": files,
         "registry_entry": registry_entry,
+        "steps": steps,
+    }
+
+def _registry_repo_url(source):
+    """Best-effort GitHub repo URL for a registry *source*.
+
+    A ``raw.githubusercontent.com/<owner>/<repo>/<branch>`` base
+    maps to ``https://github.com/<owner>/<repo>``; anything else
+    returns ``None`` (the push commands then use a placeholder
+    for the clone path instead of guessing).
+    """
+    kind, base = source
+    if kind != "url":
+        return None
+    match = re.match(r"https://raw\.githubusercontent\.com/"
+                     r"([^/]+)/([^/]+)/([^/]+)/?$", base)
+    if match is None:
+        return None
+    return "https://github.com/%s/%s" % (match.group(1), match.group(2))
+
+
+def _push_commands(stage_dir, tarball_name, name, version, source,
+                   registry_path=None):
+    """Exact shell commands that publish the staged files.
+
+    Returns a list of single-line commands. When the registry is
+    a local directory the commands copy the staged files into it
+    and commit there; when it is a URL base (or the not-yet-live
+    default) the commands clone the index repo first. Nothing is
+    executed here -- the user runs these by hand.
+    """
+    staged_index = str(stage_dir / REGISTRY_INDEX_FILENAME)
+    staged_tarball = str(stage_dir / "packages" / tarball_name)
+    if registry_path is not None:
+        registry_dir = str(registry_path)
+        return [
+            "cp %s %s" % (staged_index,
+                          os.path.join(registry_dir, "index.json")),
+            "mkdir -p %s && cp %s %s"
+            % (os.path.join(registry_dir, "packages"), staged_tarball,
+               os.path.join(registry_dir, "packages", tarball_name)),
+            'cd %s && git add index.json packages/%s && git commit '
+            '-m "Add %s %s to the registry" && git push'
+            % (registry_dir, tarball_name, name, version),
+        ]
+    repo_url = _registry_repo_url(source)
+    if repo_url is None:
+        repo_url = _registry_repo_url(("url", DEFAULT_REGISTRY_URL))
+    repo_dir = repo_url.rsplit("/", 1)[-1]
+    if repo_dir.endswith(".git"):
+        repo_dir = repo_dir[:-4]
+    return [
+        "git clone %s.git" % repo_url,
+        "cp %s %s" % (staged_index,
+                      os.path.join(repo_dir, "index.json")),
+        "mkdir -p %s && cp %s %s"
+        % (os.path.join(repo_dir, "packages"), staged_tarball,
+           os.path.join(repo_dir, "packages", tarball_name)),
+        'cd %s && git add index.json packages/%s && git commit '
+        '-m "Add %s %s to the registry" && git push'
+        % (repo_dir, tarball_name, name, version),
+    ]
+
+
+def stage_publish(project_dir=".", registry=None, stage_dir=None):
+    """Stage a publish: build the package and prepare the exact
+    registry update, without pushing anything.
+
+    Builds the tarball with :func:`publish_package`, merges its
+    entry into the registry index (the index at *registry* /
+    ``KABIR_REGISTRY`` when one is configured, otherwise a fresh
+    empty index), and writes the updated ``index.json`` plus the
+    tarball into a staging directory (default
+    ``<project>/target/registry-stage/``). The staged index is
+    re-read with :func:`_read_index` before returning, so a
+    broken staged index can never be handed back silently.
+
+    Returns ``{"name", "version", "description", "dependencies",
+    "tarball", "sha256", "files", "registry_entry", "stage_dir",
+    "staged_index", "staged_tarball", "index", "commands",
+    "steps"}``. ``index`` is the full merged index dict;
+    ``commands`` are the exact shell lines that publish the
+    staged files (copy into the registry repo, commit, push);
+    ``steps`` is the same plan in human-readable form. Prints
+    nothing. Raises :class:`KabirError` when the package cannot
+    be built, or when the index already contains this
+    name@version (bump the version and publish again instead of
+    silently overwriting a released version).
+    """
+    project_dir = Path(project_dir)
+    published = publish_package(project_dir)
+    name = published["name"]
+    version = published["version"]
+    tarball_name = "%s-%s.tar.gz" % (name, version)
+    source = _resolve_registry(registry)
+    if source[0] == "default":
+        base_index = {"packages": {}}
+        registry_path = None
+    else:
+        base_index = _read_index(source, missing_ok=True)
+        registry_path = source[1] if source[0] == "local" else None
+    existing = base_index["packages"].get(name, {})
+    if version in existing:
+        raise KabirError(
+            'Package "%s" version %s is already in the registry '
+            "index -- bump the version in Kabir.toml and publish "
+            "again; released versions are never overwritten"
+            % (name, version), filename="<registry>")
+    merged = json.loads(json.dumps(base_index))
+    merged["packages"].setdefault(name, {})[version] = (
+        published["registry_entry"]["packages"][name][version])
+    validate_index(merged)
+    if stage_dir is None:
+        stage_dir = project_dir / TARGET_DIR / "registry-stage"
+    stage_dir = Path(stage_dir)
+    if stage_dir.is_dir():
+        shutil.rmtree(stage_dir)
+    elif stage_dir.exists():
+        stage_dir.unlink()
+    (stage_dir / "packages").mkdir(parents=True)
+    staged_index = stage_dir / REGISTRY_INDEX_FILENAME
+    staged_index.write_text(
+        json.dumps(merged, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8")
+    staged_tarball = stage_dir / "packages" / tarball_name
+    shutil.copyfile(published["tarball"], staged_tarball)
+    # Verify the staged files the same way `add` reads them.
+    staged = _read_index(("local", stage_dir))
+    staged_entry = staged["packages"][name][version]
+    if staged_entry["sha256"] != published["sha256"]:
+        raise KabirError(
+            "Staged index for %s %s does not match the built "
+            "tarball -- refusing to hand back a broken stage"
+            % (name, version), filename=str(staged_index))
+    commands = _push_commands(stage_dir, tarball_name, name, version,
+                              source, registry_path)
+    if registry_path is not None:
+        steps = [
+            "1. Staged files are in %s (index.json + packages/%s)."
+            % (stage_dir, tarball_name),
+            "2. Copy them into the registry directory %s."
+            % registry_path,
+            "3. Commit and push the registry repo (commands below).",
+            "4. Others can then run: kabir add %s@%s"
+            % (name, version),
+        ]
+    else:
+        steps = [
+            "1. Staged files are in %s (index.json + packages/%s)."
+            % (stage_dir, tarball_name),
+            "2. Copy them into the registry repo (clone it first "
+            "if needed -- commands below).",
+            "3. Commit and push the registry repo.",
+            "4. Others can then run: kabir add %s@%s"
+            % (name, version),
+        ]
+    return {
+        "name": name,
+        "version": version,
+        "description": published["description"],
+        "dependencies": published["dependencies"],
+        "tarball": published["tarball"],
+        "sha256": published["sha256"],
+        "files": published["files"],
+        "registry_entry": published["registry_entry"],
+        "stage_dir": str(stage_dir),
+        "staged_index": str(staged_index),
+        "staged_tarball": str(staged_tarball),
+        "index": merged,
+        "commands": commands,
         "steps": steps,
     }

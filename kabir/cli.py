@@ -6,6 +6,8 @@ Usage:
                             Run a Kabir program with the legacy interpreter
     kabir run --native file.kbr
                             Run by compiling to a native binary first
+    kabir run --selfhost file.kbr
+                            Run by compiling with the Kabir compiler itself
     kabir run file.kbc      Run compiled Kabir bytecode
     kabir run <dir>         Run the src/main.kbr of a Kabir project
     kabir new <name>        Create a new Kabir project
@@ -16,7 +18,10 @@ Usage:
                             Build to WebAssembly (target/<name>.wasm + .html)
     kabir add <name>@<version> [dir]
                             Add a dependency from the registry
-    kabir publish [dir]     Package a project for the registry
+                            (use @latest for the newest version)
+    kabir publish [dir] [--stage DIR]
+                            Package a project and stage the registry
+                            update (never pushes anything)
     kabir lsp               Start the language server (stdio JSON-RPC)
     kabir fmt file.kbr ...  Format .kbr files in place (--check to only check)
     kabir repl              Start the interactive REPL
@@ -29,11 +34,10 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 
 from . import __version__
 from .checker import check_program
-from .codegen import compile_native
+from .codegen import cached_compile_native
 from .compile import compile_program, load_bytecode
 from .errors import KabirError
 from .formatter import format_source
@@ -41,7 +45,9 @@ from .interpreter import Interpreter
 from .lsp import main as lsp_main
 from .parser import parse as parse_source
 from .project import (add_package, build_project, new_project,
-                      publish_package, read_manifest, run_project)
+                      publish_package, read_manifest, run_project,
+                      stage_publish)
+from .selfhost import compile_source_with_kabir
 from .wasm import compile_wasm, html_harness
 from .vm import VM
 from . import ast_nodes as ast
@@ -55,15 +61,24 @@ Usage:
   kabir run <file.kbr>           Run a Kabir program (bytecode VM)
   kabir run --interp <file.kbr>  Run with the legacy interpreter instead
   kabir run --native <file.kbr>  Run by compiling to a native binary first
+                                 (repeat runs reuse a cached binary;
+                                 add --no-cache to force a recompile)
+  kabir run --selfhost <file.kbr>  Compile with the Kabir compiler itself,
+                                 then run (slower; a proof, not the default)
   kabir run <file.kbc>           Run compiled Kabir bytecode
   kabir run <dir>                Run a project's src/main.kbr
   kabir new <name>               Create a new Kabir project
   kabir build [dir]              Build a project to target/<name>.kbc
   kabir build --native [dir]     Build a project to a native binary
+                                 (uses the native cache; --no-cache
+                                 forces a fresh compile)
   kabir build --target wasm [file|dir]
                                  Build to WebAssembly (target/<name>.wasm + .html)
   kabir add <name>@<version> [dir]  Add a dependency from the registry
-  kabir publish [dir]            Package a project for the registry
+  kabir add greet@latest         Add the newest version in the registry
+  kabir publish [dir] [--stage DIR]
+                                 Package a project, stage the registry
+                                 update (never pushes anything)
   kabir lsp                      Start the language server (stdio JSON-RPC)
   kabir fmt <file.kbr>   Format .kbr files in place (see --check)
   kabir repl             Start the interactive REPL
@@ -79,7 +94,9 @@ Examples:
   kabir build --native my_app
   kabir build --target wasm examples/fibonacci.kbr
   kabir add greet@1.0.0
+  kabir add greet@latest
   kabir publish my_app
+  kabir publish my_app --stage /tmp/my-registry-stage
   kabir lsp
   kabir fmt examples/hello.kbr
   kabir fmt --check examples/*.kbr
@@ -108,13 +125,17 @@ def _resolve_run_target(path):
     return path
 
 
-def run_file(path, use_interp=False, use_native=False):
+def run_file(path, use_interp=False, use_native=False, no_cache=False,
+             use_selfhost=False):
     """Run a .kbr file (VM path by default) or a .kbc file.
 
     Returns an exit code.
     """
     if use_native and path.endswith(".kbc"):
         return _fail("kabir: --native needs a .kbr file, not bytecode -- "
+                     "give a .kbr file or a project directory")
+    if use_selfhost and path.endswith(".kbc"):
+        return _fail("kabir: --selfhost needs a .kbr file, not bytecode -- "
                      "give a .kbr file or a project directory")
     if path.endswith(".kbc"):
         return run_bytecode(path)
@@ -137,6 +158,9 @@ def run_file(path, use_interp=False, use_native=False):
     if use_native:
         # Native path: parse -> type-check -> transpile -> cc -> run.
         # The binary inherits stdio so input() works interactively.
+        # 5.0.0: the binary comes from the native cache when the
+        # source and toolchain are unchanged, so repeat runs skip
+        # the ~1.3 s compile; --no-cache forces a fresh compile.
         lines = source.split("\n")
         try:
             program = parse_source(source, path)
@@ -145,15 +169,36 @@ def run_file(path, use_interp=False, use_native=False):
             print(err.render(), file=sys.stderr)
             return 1
         try:
-            with tempfile.TemporaryDirectory(
-                    prefix="kabir-native-run-") as tmp:
-                binary = os.path.join(tmp, "program")
-                compile_native(source, filename=path, out_path=binary)
-                proc = subprocess.run([binary])
-                return proc.returncode
+            binary = cached_compile_native(
+                source, filename=path, use_cache=not no_cache)
+            proc = subprocess.run([binary])
+            return proc.returncode
         except KabirError as err:
             print(err.render(), file=sys.stderr)
             return 1
+    if use_selfhost:
+        # Self-hosted path: type-check with the Python checker, compile
+        # with the Kabir compiler (selfhost/compiler.kbr), run on the VM.
+        # Slower than the Python compiler -- a proof, not the default.
+        lines = source.split("\n")
+        try:
+            program = parse_source(source, path)
+            check_program(program, filename=path, lines=lines)
+            code = compile_source_with_kabir(path)
+        except KabirError as err:
+            print(err.render(), file=sys.stderr)
+            return 1
+        vm = VM(source, filename=path)
+        try:
+            vm.run_code(code, filename=path, lines=lines)
+        except KabirError as err:
+            print(err.render(), file=sys.stderr)
+            return 1
+        except RecursionError:
+            print("%s: error: too many nested function calls -- check for "
+                  "infinite recursion" % path, file=sys.stderr)
+            return 1
+        return 0
     if use_interp:
         interp = Interpreter(source, filename=path)
         try:
@@ -445,15 +490,28 @@ def main(argv=None):
         rest = args[1:]
         use_interp = False
         use_native = False
-        while rest and rest[0] in ("--interp", "--native"):
+        no_cache = False
+        use_selfhost = False
+        while rest and rest[0] in ("--interp", "--native", "--no-cache",
+                                   "--selfhost"):
             if rest[0] == "--interp":
                 use_interp = True
-            else:
+            elif rest[0] == "--native":
                 use_native = True
+            elif rest[0] == "--selfhost":
+                use_selfhost = True
+            else:
+                no_cache = True
             rest = rest[1:]
         if use_interp and use_native:
             return _fail("kabir: --interp and --native cannot be used "
                          "together -- pick one")
+        if use_selfhost and (use_interp or use_native):
+            return _fail("kabir: --selfhost cannot be used with --interp "
+                         "or --native -- pick one")
+        if no_cache and not use_native:
+            return _fail("kabir: --no-cache needs --native -- "
+                         "try: kabir run --native --no-cache <file.kbr>")
         if len(rest) < 1:
             return _fail("kabir: 'run' needs a file -- "
                          "try: kabir run examples/hello.kbr")
@@ -461,7 +519,8 @@ def main(argv=None):
             return _fail("kabir: too many arguments for 'run' -- "
                          "give exactly one file")
         return run_file(rest[0], use_interp=use_interp,
-                        use_native=use_native)
+                        use_native=use_native, no_cache=no_cache,
+                        use_selfhost=use_selfhost)
     if args[0] == "new":
         if len(args) < 2:
             return _fail("kabir: 'new' needs a project name -- "
@@ -480,10 +539,14 @@ def main(argv=None):
     if args[0] == "build":
         rest = args[1:]
         native = False
+        no_cache = False
         wasm_target = False
         if rest and rest[0] == "--native":
             native = True
             rest = rest[1:]
+            if rest and rest[0] == "--no-cache":
+                no_cache = True
+                rest = rest[1:]
         elif rest and rest[0] == "--target":
             if len(rest) < 2:
                 return _fail("kabir: 'build --target' needs a target -- "
@@ -513,7 +576,9 @@ def main(argv=None):
             program = parse_source(source, str(entry))
             check_program(program, filename=str(entry), lines=lines)
             out_path = os.path.join(target, "target", manifest["name"])
-            compile_native(source, filename=str(entry), out_path=out_path)
+            cached_compile_native(source, filename=str(entry),
+                                  out_path=out_path,
+                                  use_cache=not no_cache)
         except KabirError as err:
             print(err.render(), file=sys.stderr)
             return 1
@@ -541,12 +606,35 @@ def main(argv=None):
               % (result["name"], result["version"], result["vendor_dir"]))
         return 0
     if args[0] == "publish":
-        if len(args) > 2:
+        target = "."
+        stage_dir = None
+        positional = []
+        rest = args[1:]
+        index = 0
+        while index < len(rest):
+            if rest[index] == "--stage":
+                if index + 1 >= len(rest):
+                    return _fail("kabir: 'publish --stage' needs a "
+                                 "directory -- try: kabir publish "
+                                 "--stage /tmp/stage")
+                if stage_dir is not None:
+                    return _fail("kabir: '--stage' given twice -- "
+                                 "give one staging directory")
+                stage_dir = rest[index + 1]
+                index += 2
+            elif rest[index].startswith("-"):
+                return _fail("kabir: unknown option %r for 'publish' -- "
+                             "only --stage is supported" % rest[index])
+            else:
+                positional.append(rest[index])
+                index += 1
+        if len(positional) > 1:
             return _fail("kabir: too many arguments for 'publish' -- "
                          "give at most one project directory")
-        target = args[1] if len(args) == 2 else "."
+        if positional:
+            target = positional[0]
         try:
-            result = publish_package(target)
+            result = stage_publish(target, stage_dir=stage_dir)
         except KabirError as err:
             print(err.render(), file=sys.stderr)
             return 1
@@ -556,6 +644,12 @@ def main(argv=None):
         print("Registry entry (merge into the registry repo's "
               "index.json):")
         print(json.dumps(result["registry_entry"], indent=2))
+        print("Staged registry update in %s:" % result["stage_dir"])
+        print("  %s" % result["staged_index"])
+        print("  %s" % result["staged_tarball"])
+        print("To publish it, run:")
+        for command in result["commands"]:
+            print("  %s" % command)
         for step in result["steps"]:
             print(step)
         return 0

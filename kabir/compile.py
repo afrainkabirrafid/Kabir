@@ -249,15 +249,50 @@ class _CodeBuilder:
         if track:
             self.scope_depth -= 1
 
+    def _block_defines_names(self, block):
+        """True if *block* directly defines a name into its scope.
+
+        A direct LetStmt / FuncDecl / ImportStmt defines a name, as
+        does a compound index assignment (``a[i] += v``), which the
+        compiler lowers through a hidden ``$tmp`` DEFINE_VAR. A
+        block with no such statement needs no runtime scope at all:
+        nothing is defined into it, and a nested block or branch
+        gets its own scope when it needs one. 5.0.0: skipping the
+        ENTER_SCOPE / EXIT_SCOPE pair for such blocks removes one
+        Environment allocation per loop iteration in hot loops.
+        """
+        for stmt in block.statements:
+            if isinstance(stmt, (ast.LetStmt, ast.FuncDecl,
+                                 ast.ImportStmt)):
+                return True
+            if isinstance(stmt, ast.AssignStmt) \
+                    and not isinstance(stmt.target, ast.Var) \
+                    and stmt.op != "=":
+                return True
+        return False
+
     def compile_block(self, block):
-        """A Block runs in a fresh child env (like interpreter.run_block)."""
-        self._enter_scope(block.line, block.col)
-        self._slot_scopes.append({})
+        """A Block runs in a fresh child env (like interpreter.run_block).
+
+        5.0.0: the child env (and the matching slot scope) is only
+        emitted when the block directly defines a name (see
+        _block_defines_names). A block that defines nothing reads
+        exactly the same names with or without the empty child env
+        -- the env chain and the slot scopes are searched
+        innermost-first either way -- and break/continue stay
+        consistent because scope_depth is only counted when a scope
+        is actually emitted.
+        """
+        has_defs = self._block_defines_names(block)
+        if has_defs:
+            self._enter_scope(block.line, block.col)
+            self._slot_scopes.append({})
         for stmt in block.statements:
             self.compile_stmt(stmt)
-        self._slot_scopes.pop()
-        self._exit_scope(getattr(block, "end_line", None) or block.line,
-                         block.col)
+        if has_defs:
+            self._slot_scopes.pop()
+            self._exit_scope(getattr(block, "end_line", None)
+                             or block.line, block.col)
 
     def compile_statements(self, statements):
         for stmt in statements:
