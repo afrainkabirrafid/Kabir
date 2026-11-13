@@ -1,0 +1,453 @@
+# { anchor -- the open-brace character is character 2 of this file.
+# kabir/selfhost/lexer.kbr -- the Kabir lexer, written in Kabir itself.
+#
+# Reproduces kabir/lexer.py exactly: same token kinds, values, lines
+# and columns. Token kinds: KEYWORD, IDENT, NUMBER, STRING, OP, PUNCT,
+# NEWLINE, EOF. A STRING token value is an array of parts: ["lit", text]
+# for plain text and ["expr", source] for an interpolation segment.
+# A NUMBER token value is an int when the text has no dot, else a float.
+#
+# Kabir strings cannot contain a literal open brace (it always starts
+# interpolation), so the brace character is read from this very file:
+# it is character 2 of line 1 above. find_self_path locates this file
+# (run from the kabir/ directory, the repo root, or from inside kabir/selfhost/).
+#
+# Usage: kabir run kabir/selfhost/lexer.kbr, then type the path of the file
+# to lex on stdin (one line). One token per line is printed:
+# KIND<TAB>VALUE<TAB>LINE<TAB>COL
+# Numbers print as int:<digits> or float:<digits>. Strings print their
+# parts as lit:<text> / expr:<text> joined by "|". Backslash, newline,
+# tab, carriage return and "|" inside values are backslash-escaped.
+# On a lex error a single line is printed instead:
+# ERROR<TAB><message><TAB><line><TAB><col>
+
+let brace_open = ""
+let keywords = [
+    "let",
+    "func",
+    "return",
+    "if",
+    "elif",
+    "else",
+    "while",
+    "for",
+    "in",
+    "break",
+    "continue",
+    "true",
+    "false",
+    "null",
+    "and",
+    "or",
+    "not",
+    "import",
+    "match",
+    "async",
+    "await"
+]
+let multi_ops = ["**", "==", "!=", "<=", ">=", "+=", "-=", "=>", "->"]
+
+func substr(s, a, b) {
+    if b > len(s) {
+        b = len(s)
+    }
+    let out = ""
+    let i = a
+    while i < b {
+        out = out + s[i]
+        i = i + 1
+    }
+    return out
+}
+
+func is_digit(ch) {
+    return ch >= "0" and ch <= "9"
+}
+
+func is_alpha(ch) {
+    return ch >= "a" and ch <= "z" or ch >= "A" and ch <= "Z" or ch == "_"
+}
+
+func is_alnum(ch) {
+    return is_alpha(ch) or is_digit(ch)
+}
+
+func is_space(ch) {
+    return ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+}
+
+func strip(s) {
+    let a = 0
+    let b = len(s)
+    while a < b and is_space(s[a]) {
+        a = a + 1
+    }
+    while b > a and is_space(s[b - 1]) {
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+func esc(s) {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let c = s[i]
+        if c == "\\" {
+            out = out + "\\\\"
+        } elif c == "\n" {
+            out = out + "\\n"
+        } elif c == "\t" {
+            out = out + "\\t"
+        } elif c == "\r" {
+            out = out + "\\r"
+        } elif c == "|" {
+            out = out + "\\|"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+func is_keyword(word) {
+    let i = 0
+    while i < len(keywords) {
+        if keywords[i] == word {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func is_multi_op(op) {
+    let i = 0
+    while i < len(multi_ops) {
+        if multi_ops[i] == op {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func is_single_op(ch) {
+    return "+-*/%=<>&".contains(ch)
+}
+
+func is_punct(ch) {
+    return ch == brace_open or ch == "}" or "()[],;:.".contains(ch)
+}
+
+func new_state(source) {
+    return {
+        "src": source,
+        "pos": 0,
+        "line": 1,
+        "col": 1,
+        "len": len(source),
+        "error": "",
+        "err_line": 0,
+        "err_col": 0
+    }
+}
+
+func fail(st, message, line, col) {
+    st["error"] = message
+    st["err_line"] = line
+    st["err_col"] = col
+}
+
+func peek(st, offset) {
+    let i = st["pos"] + offset
+    if i >= st["len"] {
+        return ""
+    }
+    return st["src"][i]
+}
+
+func advance(st) {
+    let ch = st["src"][st["pos"]]
+    st["pos"] = st["pos"] + 1
+    if ch == "\n" {
+        st["line"] = st["line"] + 1
+        st["col"] = 1
+    } else {
+        st["col"] = st["col"] + 1
+    }
+    return ch
+}
+
+func new_token(kind, value, line, col) {
+    return {"kind": kind, "value": value, "line": line, "col": col, "is_float": false}
+}
+
+func lex_number(st) {
+    let line = st["line"]
+    let col = st["col"]
+    let start = st["pos"]
+    while st["pos"] < st["len"] and is_digit(peek(st, 0)) {
+        advance(st)
+    }
+    let is_float = false
+    if peek(st, 0) == "." and is_digit(peek(st, 1)) {
+        is_float = true
+        advance(st)
+        while st["pos"] < st["len"] and is_digit(peek(st, 0)) {
+            advance(st)
+        }
+    }
+    let text = substr(st["src"], start, st["pos"])
+    let value = 0
+    if is_float {
+        value = float(text)
+    } else {
+        value = int(text)
+    }
+    let tok = new_token("NUMBER", value, line, col)
+    tok["is_float"] = is_float
+    return tok
+}
+
+func lex_ident(st) {
+    let line = st["line"]
+    let col = st["col"]
+    let start = st["pos"]
+    while st["pos"] < st["len"] and is_alnum(peek(st, 0)) {
+        advance(st)
+    }
+    let text = substr(st["src"], start, st["pos"])
+    let kind = "IDENT"
+    if is_keyword(text) {
+        kind = "KEYWORD"
+    }
+    return new_token(kind, text, line, col)
+}
+
+func lex_string(st) {
+    let line = st["line"]
+    let col = st["col"]
+    let quote = peek(st, 0)
+    if quote == "'" {
+        fail(st, "Strings use double quotes, not single quotes", line, col)
+        return null
+    }
+    advance(st)
+    let parts = []
+    let buf = ""
+    while true {
+        if st["pos"] >= st["len"] {
+            fail(st, "Unterminated string", line, col)
+            return null
+        }
+        let ch = peek(st, 0)
+        if ch == "\"" {
+            advance(st)
+            break
+        }
+        if ch == "\n" {
+            fail(st, "Unterminated string", line, col)
+            return null
+        }
+        if ch == "\\" {
+            advance(st)
+            let esc_ch = peek(st, 0)
+            if esc_ch == "n" {
+                buf = buf + "\n"
+            } elif esc_ch == "t" {
+                buf = buf + "\t"
+            } elif esc_ch == "r" {
+                buf = buf + "\r"
+            } elif esc_ch == "\"" {
+                buf = buf + "\""
+            } elif esc_ch == "\\" {
+                buf = buf + "\\"
+            } else {
+                fail(st, "Unknown escape sequence", line, col)
+                return null
+            }
+            advance(st)
+            continue
+        }
+        if ch == brace_open {
+            if buf != "" {
+                push(parts, ["lit", buf])
+                buf = ""
+            }
+            advance(st)
+            let expr_start = st["pos"]
+            let depth = 1
+            let in_str = false
+            while st["pos"] < st["len"] and depth > 0 {
+                let c = peek(st, 0)
+                if in_str {
+                    if c == "\\" {
+                        advance(st)
+                        if st["pos"] < st["len"] {
+                            advance(st)
+                        }
+                        continue
+                    }
+                    if c == "\"" {
+                        in_str = false
+                    }
+                } else {
+                    if c == "\"" {
+                        in_str = true
+                    } elif c == brace_open {
+                        depth = depth + 1
+                    } elif c == "}" {
+                        depth = depth - 1
+                        if depth == 0 {
+                            break
+                        }
+                    }
+                }
+                advance(st)
+            }
+            if depth != 0 {
+                fail(st, "Unterminated interpolation", line, col)
+                return null
+            }
+            let expr_text = strip(substr(st["src"], expr_start, st["pos"]))
+            if expr_text == "" {
+                fail(st, "Empty interpolation", line, col)
+                return null
+            }
+            push(parts, ["expr", expr_text])
+            advance(st)
+            continue
+        }
+        buf = buf + ch
+        advance(st)
+    }
+    if buf != "" {
+        push(parts, ["lit", buf])
+    }
+    return new_token("STRING", parts, line, col)
+}
+
+func tokenize(st) {
+    let tokens = []
+    while st["pos"] < st["len"] {
+        let ch = peek(st, 0)
+        if ch == " " or ch == "\t" or ch == "\r" {
+            advance(st)
+        } elif ch == "#" {
+            while st["pos"] < st["len"] and peek(st, 0) != "\n" {
+                advance(st)
+            }
+        } elif ch == "\n" {
+            push(tokens, new_token("NEWLINE", "\n", st["line"], st["col"]))
+            advance(st)
+        } elif is_digit(ch) {
+            push(tokens, lex_number(st))
+        } elif ch == "\"" or ch == "'" {
+            let tok = lex_string(st)
+            if st["error"] != "" {
+                return tokens
+            }
+            push(tokens, tok)
+        } elif is_alpha(ch) {
+            push(tokens, lex_ident(st))
+        } elif is_multi_op(substr(st["src"], st["pos"], st["pos"] + 2)) {
+            let op = substr(st["src"], st["pos"], st["pos"] + 2)
+            push(tokens, new_token("OP", op, st["line"], st["col"]))
+            advance(st)
+            advance(st)
+        } elif is_single_op(ch) {
+            push(tokens, new_token("OP", ch, st["line"], st["col"]))
+            advance(st)
+        } elif is_punct(ch) {
+            push(tokens, new_token("PUNCT", ch, st["line"], st["col"]))
+            advance(st)
+        } else {
+            fail(st, "Unexpected character", st["line"], st["col"])
+            return tokens
+        }
+        if st["error"] != "" {
+            return tokens
+        }
+    }
+    push(tokens, new_token("EOF", null, st["line"], st["col"]))
+    return tokens
+}
+
+func num_text(v) {
+    if v == int(v) {
+        return str(v) + ".0"
+    }
+    return str(v)
+}
+
+func parts_text(parts) {
+    let out = ""
+    let i = 0
+    while i < len(parts) {
+        if i > 0 {
+            out = out + "|"
+        }
+        let part = parts[i]
+        if part[0] == "lit" {
+            out = out + "lit:" + esc(part[1])
+        } else {
+            out = out + "expr:" + esc(part[1])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+func token_line(tok) {
+    let kind = tok["kind"]
+    let value = ""
+    if kind == "NUMBER" {
+        if tok["is_float"] {
+            value = "float:" + num_text(tok["value"])
+        } else {
+            value = "int:" + str(tok["value"])
+        }
+    } elif kind == "STRING" {
+        value = parts_text(tok["value"])
+    } elif kind == "EOF" {
+        value = "null"
+    } else {
+        value = esc(str(tok["value"]))
+    }
+    return kind + "\t" + value + "\t" + str(tok["line"]) + "\t" + str(tok["col"])
+}
+
+func find_self_path() {
+    if file_exists("kabir/selfhost/lexer.kbr") {
+        return "kabir/selfhost/lexer.kbr"
+    }
+    if file_exists("selfhost/lexer.kbr") {
+        return "selfhost/lexer.kbr"
+    }
+    if file_exists("lexer.kbr") {
+        return "lexer.kbr"
+    }
+    return ""
+}
+
+let self_path = find_self_path()
+if self_path == "" {
+    print("ERROR\tcannot find selfhost/lexer.kbr\t0\t0")
+} else {
+    brace_open = read_file(self_path)[2]
+    let target = input()
+    let source = read_file(target)
+    let st = new_state(source)
+    let tokens = tokenize(st)
+    if st["error"] != "" {
+        print("ERROR\t" + st["error"] + "\t" + str(st["err_line"]) + "\t" + str(st["err_col"]))
+    } else {
+        let i = 0
+        while i < len(tokens) {
+            print(token_line(tokens[i]))
+            i = i + 1
+        }
+    }
+}

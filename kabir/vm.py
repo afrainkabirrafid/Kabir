@@ -41,6 +41,29 @@ def _article(word):
 _UNSET = object()
 
 
+class _BoundStringMethod:
+    """A string method bound to its receiver (5.0.0).
+
+    Replaces the per-access closure ``_op_GET_MEMBER`` used to
+    build: allocating a closure (plus its default-arg cells) for
+    every ``s.upper`` was a measurable cost in method-heavy loops.
+    The call path runs it exactly like a BuiltinFunction:
+    ``STRING_METHODS[name](interp, node, recv, args)``. It carries
+    no ``_kabir_type``, so ``_type_name`` reports "function" as
+    before, and ``format_value`` prints it as
+    ``<builtin function name>`` via ``__repr__``.
+    """
+
+    __slots__ = ("name", "recv")
+
+    def __init__(self, name, recv):
+        self.name = name
+        self.recv = recv
+
+    def __repr__(self):
+        return "<builtin function %s>" % self.name
+
+
 class _CallNode:
     """Tiny node shim for builtin calls: carries line + filename."""
 
@@ -53,7 +76,8 @@ class _CallNode:
 class VMFunction:
     """A user-defined Kabir function value (a closure over bytecode)."""
 
-    def __init__(self, name, params, body, closure_env, is_async=False):
+    def __init__(self, name, params, body, closure_env, is_async=False,
+                 needs_env=None):
         self.name = name or "<anonymous>"
         self.params = params
         self.body = body  # a code dict
@@ -61,6 +85,10 @@ class VMFunction:
         # 4.0.0 async: calling an async function starts a task and
         # returns it at once instead of running the body inline.
         self.is_async = is_async
+        # 5.0.0: cached _code_needs_env(body) (None = not computed
+        # yet; computed lazily by _function_frame). Set at
+        # MAKE_FUNCTION time so calls never scan the bytecode.
+        self.needs_env = needs_env
 
     def __repr__(self):
         return "<function %s>" % self.name
@@ -334,6 +362,19 @@ class VM:
             self._blocked.discard(waiter)
             self._ready.append(waiter)
 
+    def _suspend(self, task, susp):
+        """Register *task* as waiting on *susp*'s channel or task.
+
+        Shared by the two places a suspension can surface in
+        _run_task: a handler (AWAIT / SPAWN_TASK) and a builtin call
+        (recv) reached through the inlined CALL path.
+        """
+        task.waiting_on = (susp.kind, susp.obj)
+        if susp.kind == "channel":
+            susp.obj.waiters.append(task)
+        else:
+            susp.obj.waiters.append(task)
+
     def _deadlock_error(self):
         """No task can run and some are blocked: report the first."""
         task = next(iter(self._blocked))
@@ -365,6 +406,14 @@ class VM:
                          filename=self.filename)
 
     # -- main loop -----------------------------------------------------
+    # 5.0.0 Leap 3: the hot opcodes are inlined in this loop instead of
+    # going through a handler method call per instruction. A handler
+    # call per opcode was the single hottest cost in fib(25) (the
+    # dispatch loop itself dominated the profile, then _binary and
+    # _call_value). The inlined paths are exact equivalents of the
+    # _op_* handlers they replace: same stack effects, same errors
+    # (falling back to _binary / the handler for the error cases).
+    # Rare opcodes still go through the dispatch table unchanged.
     def _run_task(self, task, quantum):
         """Run one task for up to *quantum* instructions.
 
@@ -389,8 +438,54 @@ class VM:
                 name[4:]: getattr(self, name)
                 for name in dir(self) if name.startswith("_op_")
             }
+        # Integer opcodes, built once per VM from the dispatch table:
+        # dispatching on ints is far cheaper than a chain of string
+        # comparisons (one list index + int == per instruction). The
+        # per-code-dict translation is cached on the VM (keyed by
+        # id(code), holding a strong ref to the code dict so the id
+        # can never be reused) -- code dicts are never mutated.
+        opcodes = self.__dict__.get("_opcodes")
+        if opcodes is None:
+            opcodes = self._opcodes = {
+                name: i for i, name in enumerate(sorted(dispatch))}
+        fast_cache = self.__dict__.get("_fast_cache")
+        if fast_cache is None:
+            fast_cache = self._fast_cache = {}
+        OC_LOAD_CONST = opcodes["LOAD_CONST"]
+        OC_LOAD_NULL = opcodes["LOAD_NULL"]
+        OC_LOAD_TRUE = opcodes["LOAD_TRUE"]
+        OC_LOAD_FALSE = opcodes["LOAD_FALSE"]
+        OC_LOAD_SLOT = opcodes["LOAD_SLOT"]
+        OC_DEFINE_SLOT = opcodes["DEFINE_SLOT"]
+        OC_STORE_SLOT = opcodes["STORE_SLOT"]
+        OC_LOAD_VAR = opcodes["LOAD_VAR"]
+        OC_DEFINE_VAR = opcodes["DEFINE_VAR"]
+        OC_STORE_VAR = opcodes["STORE_VAR"]
+        OC_POP = opcodes["POP"]
+        OC_DUP = opcodes["DUP"]
+        OC_ADD = opcodes["ADD"]
+        OC_SUB = opcodes["SUB"]
+        OC_MUL = opcodes["MUL"]
+        OC_DIV = opcodes["DIV"]
+        OC_MOD = opcodes["MOD"]
+        OC_LT = opcodes["LT"]
+        OC_LE = opcodes["LE"]
+        OC_GT = opcodes["GT"]
+        OC_GE = opcodes["GE"]
+        OC_EQ = opcodes["EQ"]
+        OC_NE = opcodes["NE"]
+        OC_JUMP = opcodes["JUMP"]
+        OC_JUMP_IF_FALSE = opcodes["JUMP_IF_FALSE"]
+        OC_JUMP_IF_TRUE = opcodes["JUMP_IF_TRUE"]
+        OC_FOR_ITER = opcodes["FOR_ITER"]
+        OC_GET_MEMBER = opcodes["GET_MEMBER"]
+        OC_MAKE_FUNCTION = opcodes["MAKE_FUNCTION"]
+        OC_CALL = opcodes["CALL"]
+        OC_RETURN = opcodes["RETURN"]
+        kabir_equal = _semantics.kabir_equal
         frame = None
-        instrs = instr_lines = instr_cols = None
+        fast = instrs = instr_lines = instr_cols = consts = None
+        n_instrs = 0
         steps = 0
         while frames:
             cur = frames[-1]
@@ -398,38 +493,400 @@ class VM:
                 # Frame changed (call / return): re-read its code.
                 frame = cur
                 code = frame.code
+                entry = fast_cache.get(id(code))
+                if entry is None or entry[0] is not code:
+                    entry = (code, [(opcodes.get(op, -1), arg)
+                                    for op, arg in code["instrs"]])
+                    fast_cache[id(code)] = entry
+                fast = entry[1]
                 instrs = code["instrs"]
                 instr_lines = code["lines"]
                 # v1 code dicts have no "cols"; col is then None and
                 # errors print file:line exactly as before.
                 instr_cols = code.get("cols")
-            if frame.ip >= len(instrs):
+                consts = code["consts"]
+                n_instrs = len(instrs)
+            if frame.ip >= n_instrs:
                 value = self._finish_frame(frame, None)
                 if value is _MAIN_DONE:
                     return ("done", None)
                 frame = None
                 continue
-            op, arg = instrs[frame.ip]
-            line = instr_lines[frame.ip]
-            col = instr_cols[frame.ip] \
-                if instr_cols and frame.ip < len(instr_cols) else None
-            frame.ip += 1
-            handler = dispatch.get(op)
-            if handler is None:
-                self._instr_error(frame, line, col, "Unknown instruction %r" % op)
-            try:
-                result = handler(frame, arg, line, col, stack, frames)
-            except _TaskSuspend as susp:
-                # Register the wait, then suspend: the scheduler
-                # wakes this task when the channel / task delivers.
-                task.waiting_on = (susp.kind, susp.obj)
-                if susp.kind == "channel":
-                    susp.obj.waiters.append(task)
+            idx = frame.ip
+            opc, arg = fast[idx]
+            frame.ip = idx + 1
+            # -- inlined hot opcodes (exact equivalents of _op_*) --
+            # Branches are ordered by frequency in hot programs
+            # (fib: LOAD_SLOT, LOAD_CONST, CALL, RETURN, ...).
+            if opc == OC_LOAD_SLOT:
+                slots = frame.slots
+                if arg < len(slots):
+                    value = slots[arg]
+                    if value is not _UNSET:
+                        stack.append(value)
+                    else:
+                        line = instr_lines[idx]
+                        col = instr_cols[idx] \
+                            if instr_cols and idx < len(instr_cols) \
+                            else None
+                        name = self._slot_name(frame, arg) \
+                            or ("slot %d" % arg)
+                        self._instr_error(
+                            frame, line, col,
+                            "Undefined variable '%s' -- it was never "
+                            "defined with 'let'. Check the spelling"
+                            % name)
                 else:
-                    susp.obj.waiters.append(task)
-                return ("blocked", None)
-            if isinstance(result, tuple) and result[0] is _MAIN_DONE:
-                return ("done", result[1])
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    name = self._slot_name(frame, arg) \
+                        or ("slot %d" % arg)
+                    self._instr_error(
+                        frame, line, col,
+                        "Undefined variable '%s' -- it was never "
+                        "defined with 'let'. Check the spelling"
+                        % name)
+            elif opc == OC_LOAD_CONST:
+                stack.append(consts[arg])
+            elif opc == OC_CALL:
+                if arg == 1:
+                    args = [stack.pop()]
+                elif arg:
+                    args = stack[-arg:]
+                    del stack[-arg:]
+                else:
+                    args = []
+                callee = stack.pop()
+                if type(callee) is VMFunction and not callee.is_async \
+                        and len(args) == len(callee.params) \
+                        and len(frames) - 1 < self.MAX_CALL_DEPTH:
+                    body = callee.body
+                    needs_env = callee.needs_env
+                    if needs_env is None:
+                        needs_env = self._code_needs_env(body)
+                        callee.needs_env = needs_env
+                    if needs_env:
+                        env = Environment(callee.closure_env)
+                    else:
+                        env = callee.closure_env
+                    new_frame = _Frame(body, len(stack), env)
+                    locals_list = body.get("locals") or []
+                    for i, (name, value) in enumerate(
+                            zip(callee.params, args)):
+                        if i < len(locals_list) \
+                                and locals_list[i] == name:
+                            new_frame.slots[i] = value
+                        else:
+                            env.define(name, value)
+                    frames.append(new_frame)
+                elif type(callee) is _BoundStringMethod:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    node = _CallNode(line, frame.code.get("filename")
+                                     or self.filename, col)
+                    stack.append(STRING_METHODS[callee.name](
+                        self, node, callee.recv, args))
+                else:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    try:
+                        self._call_value(callee, args, frame, line, col,
+                                         frames)
+                    except _TaskSuspend as susp:
+                        # A builtin (recv) suspended this task: the
+                        # scheduler wakes it when the channel delivers.
+                        self._suspend(task, susp)
+                        return ("blocked", None)
+            elif opc == OC_GET_MEMBER:
+                receiver = stack.pop()
+                if isinstance(receiver, str):
+                    if arg in STRING_METHODS:
+                        stack.append(_BoundStringMethod(arg, receiver))
+                    else:
+                        line = instr_lines[idx]
+                        col = instr_cols[idx] \
+                            if instr_cols and idx < len(instr_cols) \
+                            else None
+                        self._instr_error(
+                            frame, line, col,
+                            "No method '.%s' on a string -- strings "
+                            "have no method named '%s'" % (arg, arg))
+                elif isinstance(receiver, dict):
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    self._instr_error(
+                        frame, line, col,
+                        "Cannot use .%s on a dict -- write dict[\"%s\"] "
+                        "instead (for example, user[\"name\"])"
+                        % (arg, arg))
+                else:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    self._instr_error(
+                        frame, line, col,
+                        "Cannot use .%s on %s %s -- only strings have "
+                        "methods"
+                        % (arg, _article(_type_name(receiver)),
+                           _type_name(receiver)))
+            elif opc == OC_RETURN:
+                value = stack.pop() \
+                    if len(stack) > frame.stack_base else None
+                if frame.module_info is not None:
+                    result = self._finish_frame(frame, value)
+                    if result is _MAIN_DONE:
+                        return ("done", value)
+                    frame = None
+                else:
+                    del stack[frame.stack_base:]
+                    frames.pop()
+                    if not frames:
+                        return ("done", value)
+                    stack.append(value)
+                    frame = None
+            elif opc == OC_LT:
+                right = stack[-1]
+                left = stack[-2]
+                if (type(left) is int and type(right) is int) \
+                        or (type(left) is str and type(right) is str):
+                    stack.pop()
+                    stack.pop()
+                    stack.append(left < right)
+                else:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    self._binary(frame, line, col, "<", stack)
+            elif opc == OC_SUB:
+                right = stack[-1]
+                left = stack[-2]
+                if type(left) is int and type(right) is int:
+                    stack.pop()
+                    stack.pop()
+                    stack.append(left - right)
+                else:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    self._binary(frame, line, col, "-", stack)
+            elif opc == OC_JUMP_IF_FALSE:
+                # Inlined is_truthy: None/False -> false; numbers ->
+                # != 0; str/list/dict -> non-empty; anything else
+                # (functions, tasks, ...) -> true. Bool True falls
+                # through to the final else (truthy).
+                value = stack.pop()
+                if value is False or value is None:
+                    frame.ip = arg
+                elif type(value) is int or type(value) is float:
+                    if value == 0:
+                        frame.ip = arg
+                elif type(value) is str or type(value) is list \
+                        or type(value) is dict:
+                    if len(value) == 0:
+                        frame.ip = arg
+            elif opc == OC_ADD:
+                right = stack[-1]
+                left = stack[-2]
+                if type(left) is int and type(right) is int:
+                    stack.pop()
+                    stack.pop()
+                    stack.append(left + right)
+                else:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    self._binary(frame, line, col, "+", stack)
+            elif opc == OC_LOAD_NULL:
+                stack.append(None)
+            elif opc == OC_LOAD_TRUE:
+                stack.append(True)
+            elif opc == OC_LOAD_FALSE:
+                stack.append(False)
+            elif opc == OC_DEFINE_SLOT:
+                value = stack.pop()
+                slots = frame.slots
+                if arg >= len(slots):
+                    slots.extend([_UNSET] * (arg - len(slots) + 1))
+                slots[arg] = value
+            elif opc == OC_STORE_SLOT:
+                value = stack.pop()
+                slots = frame.slots
+                if arg < len(slots) and slots[arg] is not _UNSET:
+                    slots[arg] = value
+                else:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    name = self._slot_name(frame, arg) \
+                        or ("slot %d" % arg)
+                    self._instr_error(
+                        frame, line, col,
+                        "Cannot assign to '%s' -- it was never "
+                        "defined. Use 'let %s = ...' first"
+                        % (name, name))
+            elif opc == OC_LOAD_VAR:
+                # Single env-chain walk (the old handler walked it
+                # twice: has() then lookup()).
+                env = frame.env
+                while env is not None:
+                    env_vars = env.vars
+                    if arg in env_vars:
+                        stack.append(env_vars[arg])
+                        break
+                    env = env.parent
+                else:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    self._instr_error(
+                        frame, line, col,
+                        "Undefined variable '%s' -- it was never "
+                        "defined with 'let'. Check the spelling" % arg)
+            elif opc == OC_DEFINE_VAR:
+                frame.env.define(arg, stack.pop())
+            elif opc == OC_STORE_VAR:
+                value = stack.pop()
+                if not frame.env.assign(arg, value):
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    self._instr_error(
+                        frame, line, col,
+                        "Cannot assign to '%s' -- it was never "
+                        "defined. Use 'let %s = ...' first"
+                        % (arg, arg))
+            elif opc == OC_POP:
+                stack.pop()
+            elif opc == OC_DUP:
+                stack.append(stack[-1])
+            elif opc == OC_MUL or opc == OC_DIV or opc == OC_MOD:
+                # Fast path: two ints (type() is int excludes bool,
+                # exactly like binary_op's checks). Anything else
+                # falls back to _binary, which raises the same
+                # errors as before.
+                right = stack[-1]
+                left = stack[-2]
+                if type(left) is int and type(right) is int:
+                    if (opc == OC_DIV or opc == OC_MOD) and right == 0:
+                        line = instr_lines[idx]
+                        col = instr_cols[idx] \
+                            if instr_cols and idx < len(instr_cols) \
+                            else None
+                        self._binary(frame, line, col,
+                                     "/" if opc == OC_DIV else "%",
+                                     stack)
+                    else:
+                        stack.pop()
+                        stack.pop()
+                        if opc == OC_MUL:
+                            stack.append(left * right)
+                        elif opc == OC_DIV:
+                            if left % right == 0:
+                                stack.append(left // right)
+                            else:
+                                stack.append(left / right)
+                        else:  # MOD
+                            stack.append(left % right)
+                else:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    self._binary(frame, line, col,
+                                 {OC_MUL: "*", OC_DIV: "/",
+                                  OC_MOD: "%"}[opc], stack)
+            elif opc == OC_LE or opc == OC_GT or opc == OC_GE:
+                right = stack[-1]
+                left = stack[-2]
+                if (type(left) is int and type(right) is int) \
+                        or (type(left) is str and type(right) is str):
+                    stack.pop()
+                    stack.pop()
+                    if opc == OC_LE:
+                        stack.append(left <= right)
+                    elif opc == OC_GT:
+                        stack.append(left > right)
+                    else:
+                        stack.append(left >= right)
+                else:
+                    line = instr_lines[idx]
+                    col = instr_cols[idx] \
+                        if instr_cols and idx < len(instr_cols) else None
+                    self._binary(frame, line, col,
+                                 {OC_LE: "<=", OC_GT: ">",
+                                  OC_GE: ">="}[opc], stack)
+            elif opc == OC_EQ or opc == OC_NE:
+                right = stack[-1]
+                left = stack[-2]
+                if left is right:
+                    result = True
+                elif type(left) is int and type(right) is int:
+                    result = left == right
+                elif type(left) is str and type(right) is str:
+                    result = left == right
+                elif type(left) is bool or type(right) is bool:
+                    # kabir_equal: a bool only equals another bool
+                    # (handled by `left is right` above).
+                    result = False
+                elif left is None or right is None:
+                    result = False
+                else:
+                    result = kabir_equal(left, right)
+                stack.pop()
+                stack.pop()
+                stack.append(result if opc == OC_EQ else not result)
+            elif opc == OC_JUMP:
+                frame.ip = arg
+            elif opc == OC_JUMP_IF_TRUE:
+                # Inlined is_truthy (see JUMP_IF_FALSE above).
+                value = stack.pop()
+                if value is False or value is None:
+                    pass
+                elif type(value) is int or type(value) is float:
+                    if value != 0:
+                        frame.ip = arg
+                elif type(value) is str or type(value) is list \
+                        or type(value) is dict:
+                    if len(value) != 0:
+                        frame.ip = arg
+                else:
+                    frame.ip = arg
+            elif opc == OC_FOR_ITER:
+                iterator = stack[-1]
+                try:
+                    stack.append(next(iterator))
+                except StopIteration:
+                    stack.pop()
+                    frame.ip = arg
+            elif opc == OC_MAKE_FUNCTION:
+                fn_code = consts[arg]["__code__"]
+                stack.append(VMFunction(
+                    fn_code["name"], fn_code["params"], fn_code,
+                    frame.env, fn_code.get("is_async", False),
+                    self._code_needs_env(fn_code)))
+            else:
+                # Rare opcode: the handler, with its line/col.
+                op = instrs[idx][0]
+                line = instr_lines[idx]
+                col = instr_cols[idx] \
+                    if instr_cols and idx < len(instr_cols) else None
+                handler = dispatch.get(op)
+                if handler is None:
+                    self._instr_error(frame, line, col,
+                                      "Unknown instruction %r" % op)
+                try:
+                    result = handler(frame, arg, line, col, stack,
+                                     frames)
+                except _TaskSuspend as susp:
+                    # Register the wait, then suspend: the scheduler
+                    # wakes this task when the channel / task delivers.
+                    self._suspend(task, susp)
+                    return ("blocked", None)
+                if isinstance(result, tuple) and result[0] is _MAIN_DONE:
+                    return ("done", result[1])
             steps += 1
             if steps >= quantum:
                 return ("quantum", None)
@@ -456,6 +913,30 @@ class VM:
         return None
 
     # -- helpers -------------------------------------------------------
+    def _code_needs_env(self, code):
+        """True if a call frame for *code* needs its own Environment.
+
+        A frame needs one only when a name is ever defined into it
+        by name: a captured parameter (a None entry in "locals" --
+        the parameter is passed via the env, not a slot), a
+        DEFINE_VAR instruction (a captured ``let`` / function name
+        / $tmp temp), or IMPORT (module names are defined into the
+        importing frame's env). Otherwise every name the body reads
+        is either a slot or found further up the env chain, and
+        assignments either hit a slot or a name further up the
+        chain -- so the frame can share its closure env directly
+        and skip one Environment allocation per call. The result is
+        cached on the code dict (code dicts are built fresh per
+        compile, so the cache never goes stale).
+        """
+        locals_list = code.get("locals") or []
+        if None in locals_list:
+            return True
+        for op, _arg in code.get("instrs") or []:
+            if op in ("DEFINE_VAR", "IMPORT"):
+                return True
+        return False
+
     def _function_frame(self, callee, args, stack_base):
         """Build the entry frame for calling *callee* with *args*.
 
@@ -464,11 +945,22 @@ class VM:
         name) go into the frame's slots; a captured parameter is
         defined in the env so nested functions can find it through
         the env chain -- exactly as the sync call path did before
-        this helper existed.
+        this helper existed. When the body never defines a name
+        into its env (see _code_needs_env), the frame shares the
+        closure env instead of allocating a fresh Environment per
+        call -- the hottest allocation in recursive programs.
         """
-        env = Environment(callee.closure_env)
-        new_frame = _Frame(callee.body, stack_base, env)
-        locals_list = callee.body.get("locals") or []
+        body = callee.body
+        needs_env = callee.needs_env
+        if needs_env is None:
+            needs_env = self._code_needs_env(body)
+            callee.needs_env = needs_env
+        if needs_env:
+            env = Environment(callee.closure_env)
+        else:
+            env = callee.closure_env
+        new_frame = _Frame(body, stack_base, env)
+        locals_list = body.get("locals") or []
         for i, (name, value) in enumerate(zip(callee.params, args)):
             if i < len(locals_list) and locals_list[i] == name:
                 new_frame.slots[i] = value
@@ -480,6 +972,12 @@ class VM:
         """Call a value; pushes the result or a new frame. Returns True
         when a frame was pushed (caller must not push a result)."""
         stack = self._stack
+        if isinstance(callee, _BoundStringMethod):
+            node = _CallNode(line, frame.code.get("filename")
+                             or self.filename, col)
+            stack.append(STRING_METHODS[callee.name](
+                self, node, callee.recv, args))
+            return False
         if isinstance(callee, BuiltinFunction):
             node = _CallNode(line, frame.code.get("filename")
                              or self.filename, col)
@@ -636,13 +1134,18 @@ class VM:
         stack.append(False)
 
     def _op_LOAD_VAR(self, frame, arg, line, col, stack, frames):
-        if frame.env.has(arg):
-            stack.append(frame.env.lookup(arg))
-        else:
-            self._instr_error(
-                frame, line, col,
-                "Undefined variable '%s' -- it was never defined "
-                "with 'let'. Check the spelling" % arg)
+        # Single env-chain walk (has() then lookup() walked it twice).
+        env = frame.env
+        while env is not None:
+            env_vars = env.vars
+            if arg in env_vars:
+                stack.append(env_vars[arg])
+                return
+            env = env.parent
+        self._instr_error(
+            frame, line, col,
+            "Undefined variable '%s' -- it was never defined "
+            "with 'let'. Check the spelling" % arg)
 
     def _op_DEFINE_VAR(self, frame, arg, line, col, stack, frames):
         frame.env.define(arg, stack.pop())
@@ -857,7 +1360,8 @@ class VM:
         code = const["__code__"]
         stack.append(VMFunction(code["name"], code["params"], code,
                                 frame.env,
-                                code.get("is_async", False)))
+                                code.get("is_async", False),
+                                self._code_needs_env(code)))
 
     def _op_IMPORT(self, frame, arg, line, col, stack, frames):
         self._load_module(arg, frame, line, col, frames)
@@ -951,10 +1455,8 @@ class VM:
         receiver = stack.pop()
         if isinstance(receiver, str):
             if arg in STRING_METHODS:
-                def bound(interp, node, args,
-                          _name=arg, _recv=receiver):
-                    return STRING_METHODS[_name](interp, node, _recv, args)
-                stack.append(BuiltinFunction(arg, bound))
+                # 5.0.0: a bound-method value, not a fresh closure.
+                stack.append(_BoundStringMethod(arg, receiver))
                 return
             self._instr_error(
                 frame, line, col,

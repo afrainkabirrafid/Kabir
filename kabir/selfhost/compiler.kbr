@@ -1,0 +1,2443 @@
+# { anchor -- the open-brace character is character 2 of this file.
+# kabir/selfhost/compiler.kbr -- the Kabir compiler, written in Kabir itself.
+#
+# A self-contained front end + bytecode compiler: it embeds a copy of
+# the self-hosted lexer (kabir/selfhost/lexer.kbr, functions renamed lex_*)
+# and a copy of the self-hosted parser (kabir/selfhost/parser.kbr), then
+# compiles the AST to the same bytecode dicts kabir/compile.py emits
+# (code dict v2). The canonical sources are lexer.kbr and parser.kbr;
+# refresh the copies with: python3 kabir/selfhost/assemble_compiler.py
+#
+# Usage: kabir run kabir/selfhost/compiler.kbr, then type the path of the
+# .kbr source file on stdin (one line). One line of JSON is printed:
+# the main code dict (same shape as compile_source() returns).
+# On a lex / parse / compile error a single line is printed instead:
+# ERROR<TAB><message><TAB><line><TAB><col>
+#
+# Kabir strings cannot contain a literal open brace (it always
+# starts interpolation), so the brace character is read from this
+# very file: it is character 2 of line 1 above.
+
+let brace_open = ""
+let keywords = [
+    "let",
+    "func",
+    "return",
+    "if",
+    "elif",
+    "else",
+    "while",
+    "for",
+    "in",
+    "break",
+    "continue",
+    "true",
+    "false",
+    "null",
+    "and",
+    "or",
+    "not",
+    "import",
+    "match",
+    "async",
+    "await"
+]
+let multi_ops = ["**", "==", "!=", "<=", ">=", "+=", "-=", "=>", "->"]
+
+func substr(s, a, b) {
+    if b > len(s) {
+        b = len(s)
+    }
+    let out = ""
+    let i = a
+    while i < b {
+        out = out + s[i]
+        i = i + 1
+    }
+    return out
+}
+
+func is_digit(ch) {
+    return ch >= "0" and ch <= "9"
+}
+
+func is_alpha(ch) {
+    return ch >= "a" and ch <= "z" or ch >= "A" and ch <= "Z" or ch == "_"
+}
+
+func is_alnum(ch) {
+    return is_alpha(ch) or is_digit(ch)
+}
+
+func is_space(ch) {
+    return ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+}
+
+func strip(s) {
+    let a = 0
+    let b = len(s)
+    while a < b and is_space(s[a]) {
+        a = a + 1
+    }
+    while b > a and is_space(s[b - 1]) {
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+func esc(s) {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let c = s[i]
+        if c == "\\" {
+            out = out + "\\\\"
+        } elif c == "\n" {
+            out = out + "\\n"
+        } elif c == "\t" {
+            out = out + "\\t"
+        } elif c == "\r" {
+            out = out + "\\r"
+        } elif c == "|" {
+            out = out + "\\|"
+        } else {
+            out = out + c
+        }
+        i = i + 1
+    }
+    return out
+}
+
+func is_keyword(word) {
+    let i = 0
+    while i < len(keywords) {
+        if keywords[i] == word {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func is_multi_op(op) {
+    let i = 0
+    while i < len(multi_ops) {
+        if multi_ops[i] == op {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func is_single_op(ch) {
+    return "+-*/%=<>&".contains(ch)
+}
+
+func is_punct(ch) {
+    return ch == brace_open or ch == "}" or "()[],;:.".contains(ch)
+}
+
+func lex_new_state(source) {
+    return {
+        "src": source,
+        "pos": 0,
+        "line": 1,
+        "col": 1,
+        "len": len(source),
+        "error": "",
+        "err_line": 0,
+        "err_col": 0
+    }
+}
+
+func lex_fail(st, message, line, col) {
+    st["error"] = message
+    st["err_line"] = line
+    st["err_col"] = col
+}
+
+func lex_peek(st, offset) {
+    let i = st["pos"] + offset
+    if i >= st["len"] {
+        return ""
+    }
+    return st["src"][i]
+}
+
+func lex_advance(st) {
+    let ch = st["src"][st["pos"]]
+    st["pos"] = st["pos"] + 1
+    if ch == "\n" {
+        st["line"] = st["line"] + 1
+        st["col"] = 1
+    } else {
+        st["col"] = st["col"] + 1
+    }
+    return ch
+}
+
+func new_token(kind, value, line, col) {
+    return {"kind": kind, "value": value, "line": line, "col": col, "is_float": false}
+}
+
+func lex_number(st) {
+    let line = st["line"]
+    let col = st["col"]
+    let start = st["pos"]
+    while st["pos"] < st["len"] and is_digit(lex_peek(st, 0)) {
+        lex_advance(st)
+    }
+    let is_float = false
+    if lex_peek(st, 0) == "." and is_digit(lex_peek(st, 1)) {
+        is_float = true
+        lex_advance(st)
+        while st["pos"] < st["len"] and is_digit(lex_peek(st, 0)) {
+            lex_advance(st)
+        }
+    }
+    let text = substr(st["src"], start, st["pos"])
+    let value = 0
+    if is_float {
+        value = float(text)
+    } else {
+        value = int(text)
+    }
+    let tok = new_token("NUMBER", value, line, col)
+    tok["is_float"] = is_float
+    return tok
+}
+
+func lex_ident(st) {
+    let line = st["line"]
+    let col = st["col"]
+    let start = st["pos"]
+    while st["pos"] < st["len"] and is_alnum(lex_peek(st, 0)) {
+        lex_advance(st)
+    }
+    let text = substr(st["src"], start, st["pos"])
+    let kind = "IDENT"
+    if is_keyword(text) {
+        kind = "KEYWORD"
+    }
+    return new_token(kind, text, line, col)
+}
+
+func lex_string(st) {
+    let line = st["line"]
+    let col = st["col"]
+    let quote = lex_peek(st, 0)
+    if quote == "'" {
+        lex_fail(st, "Strings use double quotes, not single quotes", line, col)
+        return null
+    }
+    lex_advance(st)
+    let parts = []
+    let buf = ""
+    while true {
+        if st["pos"] >= st["len"] {
+            lex_fail(st, "Unterminated string", line, col)
+            return null
+        }
+        let ch = lex_peek(st, 0)
+        if ch == "\"" {
+            lex_advance(st)
+            break
+        }
+        if ch == "\n" {
+            lex_fail(st, "Unterminated string", line, col)
+            return null
+        }
+        if ch == "\\" {
+            lex_advance(st)
+            let esc_ch = lex_peek(st, 0)
+            if esc_ch == "n" {
+                buf = buf + "\n"
+            } elif esc_ch == "t" {
+                buf = buf + "\t"
+            } elif esc_ch == "r" {
+                buf = buf + "\r"
+            } elif esc_ch == "\"" {
+                buf = buf + "\""
+            } elif esc_ch == "\\" {
+                buf = buf + "\\"
+            } else {
+                lex_fail(st, "Unknown escape sequence", line, col)
+                return null
+            }
+            lex_advance(st)
+            continue
+        }
+        if ch == brace_open {
+            if buf != "" {
+                push(parts, ["lit", buf])
+                buf = ""
+            }
+            lex_advance(st)
+            let expr_start = st["pos"]
+            let depth = 1
+            let in_str = false
+            while st["pos"] < st["len"] and depth > 0 {
+                let c = lex_peek(st, 0)
+                if in_str {
+                    if c == "\\" {
+                        lex_advance(st)
+                        if st["pos"] < st["len"] {
+                            lex_advance(st)
+                        }
+                        continue
+                    }
+                    if c == "\"" {
+                        in_str = false
+                    }
+                } else {
+                    if c == "\"" {
+                        in_str = true
+                    } elif c == brace_open {
+                        depth = depth + 1
+                    } elif c == "}" {
+                        depth = depth - 1
+                        if depth == 0 {
+                            break
+                        }
+                    }
+                }
+                lex_advance(st)
+            }
+            if depth != 0 {
+                lex_fail(st, "Unterminated interpolation", line, col)
+                return null
+            }
+            let expr_text = strip(substr(st["src"], expr_start, st["pos"]))
+            if expr_text == "" {
+                lex_fail(st, "Empty interpolation", line, col)
+                return null
+            }
+            push(parts, ["expr", expr_text])
+            lex_advance(st)
+            continue
+        }
+        buf = buf + ch
+        lex_advance(st)
+    }
+    if buf != "" {
+        push(parts, ["lit", buf])
+    }
+    return new_token("STRING", parts, line, col)
+}
+
+func lex_tokenize(st) {
+    let tokens = []
+    while st["pos"] < st["len"] {
+        let ch = lex_peek(st, 0)
+        if ch == " " or ch == "\t" or ch == "\r" {
+            lex_advance(st)
+        } elif ch == "#" {
+            while st["pos"] < st["len"] and lex_peek(st, 0) != "\n" {
+                lex_advance(st)
+            }
+        } elif ch == "\n" {
+            push(tokens, new_token("NEWLINE", "\n", st["line"], st["col"]))
+            lex_advance(st)
+        } elif is_digit(ch) {
+            push(tokens, lex_number(st))
+        } elif ch == "\"" or ch == "'" {
+            let tok = lex_string(st)
+            if st["error"] != "" {
+                return tokens
+            }
+            push(tokens, tok)
+        } elif is_alpha(ch) {
+            push(tokens, lex_ident(st))
+        } elif is_multi_op(substr(st["src"], st["pos"], st["pos"] + 2)) {
+            let op = substr(st["src"], st["pos"], st["pos"] + 2)
+            push(tokens, new_token("OP", op, st["line"], st["col"]))
+            lex_advance(st)
+            lex_advance(st)
+        } elif is_single_op(ch) {
+            push(tokens, new_token("OP", ch, st["line"], st["col"]))
+            lex_advance(st)
+        } elif is_punct(ch) {
+            push(tokens, new_token("PUNCT", ch, st["line"], st["col"]))
+            lex_advance(st)
+        } else {
+            lex_fail(st, "Unexpected character", st["line"], st["col"])
+            return tokens
+        }
+        if st["error"] != "" {
+            return tokens
+        }
+    }
+    push(tokens, new_token("EOF", null, st["line"], st["col"]))
+    return tokens
+}
+
+func in_list(arr, v) {
+    let i = 0
+    while i < len(arr) {
+        if arr[i] == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func starts_expression(tok) {
+    if tok == null {
+        return false
+    }
+    let kind = tok["kind"]
+    if kind == "IDENT" or kind == "NUMBER" or kind == "STRING" {
+        return true
+    }
+    if kind == "PUNCT" {
+        return tok["value"] == "(" or tok["value"] == "[" or tok["value"] == brace_open
+    }
+    if kind == "KEYWORD" {
+        return in_list(["func", "match", "true", "false", "null", "not"], tok["value"])
+    }
+    if kind == "OP" {
+        return tok["value"] == "-"
+    }
+    return false
+}
+
+func mk(t, line, col) {
+    let n = {"type": t, "line": line, "col": col}
+    return n
+}
+
+func binop(op, left, right, line, col) {
+    let node = mk("BinaryOp", line, col)
+    node["op"] = op
+    node["left"] = left
+    node["right"] = right
+    return node
+}
+
+func new_state(toks) {
+    let st = {"toks": toks, "pos": 0, "error": "", "err_line": 0, "err_col": 0}
+    return st
+}
+
+func fail(st, message, line, col) {
+    if st["error"] == "" {
+        st["error"] = message
+        st["err_line"] = line
+        st["err_col"] = col
+    }
+}
+
+func cur(st) {
+    return st["toks"][st["pos"]]
+}
+
+func peek_at(st, off) {
+    let i = st["pos"] + off
+    if i >= len(st["toks"]) {
+        return null
+    }
+    return st["toks"][i]
+}
+
+func advance(st) {
+    let tok = cur(st)
+    if tok["kind"] != "EOF" {
+        st["pos"] = st["pos"] + 1
+    }
+    return tok
+}
+
+func check(st, kind, value) {
+    let tok = cur(st)
+    if tok["kind"] != kind {
+        return false
+    }
+    if value == "" {
+        return true
+    }
+    return tok["value"] == value
+}
+
+func match_tok(st, kind, value) {
+    if check(st, kind, value) {
+        return advance(st)
+    }
+    return null
+}
+
+func expect(st, kind, value, what) {
+    if check(st, kind, value) {
+        return advance(st)
+    }
+    let tok = cur(st)
+    if tok["kind"] == "EOF" {
+        fail(st, "Expected " + what + " but reached the end of the file", tok["line"], tok["col"])
+    } else {
+        fail(st, "Expected " + what, tok["line"], tok["col"])
+    }
+    return null
+}
+
+func skip_newlines(st) {
+    while check(st, "NEWLINE", "") {
+        advance(st)
+    }
+}
+
+func skip_seps(st) {
+    while check(st, "NEWLINE", "") or check(st, "PUNCT", ";") {
+        advance(st)
+    }
+}
+
+func parse_program(st) {
+    let stmts = []
+    skip_seps(st)
+    while not check(st, "EOF", "") {
+        let stmt = parse_statement(st)
+        if stmt == null {
+            return null
+        }
+        push(stmts, stmt)
+        skip_seps(st)
+    }
+    let node = mk("Program", 1, 1)
+    node["statements"] = stmts
+    return node
+}
+
+func parse_block(st) {
+    let tok = expect(st, "PUNCT", brace_open, "open brace to start a block")
+    if tok == null {
+        return null
+    }
+    let stmts = []
+    skip_seps(st)
+    while not check(st, "PUNCT", "}") {
+        if check(st, "EOF", "") {
+            fail(st, "Expected close brace to close this block", tok["line"], tok["col"])
+            return null
+        }
+        let stmt = parse_statement(st)
+        if stmt == null {
+            return null
+        }
+        push(stmts, stmt)
+        skip_seps(st)
+    }
+    let close = advance(st)
+    let node = mk("Block", tok["line"], tok["col"])
+    node["end_line"] = close["line"]
+    node["statements"] = stmts
+    return node
+}
+
+func parse_statement(st) {
+    let tok = cur(st)
+    if check(st, "KEYWORD", "let") {
+        return parse_let(st)
+    }
+    if check(st, "KEYWORD", "func") {
+        return parse_func(st, false, null)
+    }
+    if check(st, "KEYWORD", "async") {
+        let atok = advance(st)
+        return parse_func(st, true, atok)
+    }
+    if check(st, "KEYWORD", "return") {
+        advance(st)
+        let value = null
+        if not (check(st, "NEWLINE", "") or check(st, "PUNCT", ";") or check(st, "PUNCT", "}") or check(st, "EOF", "")) {
+            value = parse_expression(st)
+            if st["error"] != "" {
+                return null
+            }
+        }
+        let node = mk("ReturnStmt", tok["line"], tok["col"])
+        node["value"] = value
+        return node
+    }
+    if check(st, "KEYWORD", "if") {
+        return parse_if(st)
+    }
+    if check(st, "KEYWORD", "while") {
+        advance(st)
+        let cond = parse_expression(st)
+        if cond == null {
+            return null
+        }
+        let body = parse_block(st)
+        if body == null {
+            return null
+        }
+        let node = mk("WhileStmt", tok["line"], tok["col"])
+        node["condition"] = cond
+        node["body"] = body
+        return node
+    }
+    if check(st, "KEYWORD", "for") {
+        return parse_for(st)
+    }
+    if check(st, "KEYWORD", "break") {
+        advance(st)
+        return mk("BreakStmt", tok["line"], tok["col"])
+    }
+    if check(st, "KEYWORD", "continue") {
+        advance(st)
+        return mk("ContinueStmt", tok["line"], tok["col"])
+    }
+    if check(st, "KEYWORD", "import") {
+        return parse_import(st)
+    }
+    if check(st, "PUNCT", brace_open) {
+        let nxt = peek_at(st, 1)
+        let nxt2 = peek_at(st, 2)
+        if nxt != null and nxt["kind"] == "STRING" and nxt2 != null and nxt2["kind"] == "PUNCT" and nxt2["value"] == ":" {
+            return parse_expr_or_assign(st)
+        }
+        return parse_block(st)
+    }
+    return parse_expr_or_assign(st)
+}
+
+func parse_import(st) {
+    let tok = advance(st)
+    let path_tok = expect(st, "STRING", "", "a file path in double quotes after import")
+    if path_tok == null {
+        return null
+    }
+    let parts = path_tok["value"]
+    if len(parts) != 1 or parts[0][0] != "lit" {
+        fail(st, "import paths must be plain strings, not interpolated ones", path_tok["line"], path_tok["col"])
+        return null
+    }
+    let path = parts[0][1]
+    if not path.ends_with(".kbr") {
+        fail(st, "import path must name a .kbr file", path_tok["line"], path_tok["col"])
+        return null
+    }
+    let node = mk("ImportStmt", tok["line"], tok["col"])
+    node["path"] = path
+    return node
+}
+
+func parse_type_ann(st) {
+    let borrow = null
+    if match_tok(st, "OP", "&") != null {
+        borrow = "shared"
+        if check(st, "IDENT", "mut") {
+            let nxt = peek_at(st, 1)
+            if nxt != null and nxt["kind"] == "IDENT" {
+                advance(st)
+                borrow = "mut"
+            }
+        }
+    }
+    let tok = expect(st, "IDENT", "", "a type name, like number")
+    if tok == null {
+        return null
+    }
+    let node = mk("TypeAnn", tok["line"], tok["col"])
+    node["name"] = tok["value"]
+    node["borrow"] = borrow
+    return node
+}
+
+func parse_let(st) {
+    let tok = advance(st)
+    let mutable = false
+    if check(st, "IDENT", "mut") {
+        let nxt = peek_at(st, 1)
+        if nxt != null and nxt["kind"] == "IDENT" {
+            advance(st)
+            mutable = true
+        }
+    }
+    let name_tok = expect(st, "IDENT", "", "a variable name after let")
+    if name_tok == null {
+        return null
+    }
+    let type_ann = null
+    if match_tok(st, "PUNCT", ":") != null {
+        type_ann = parse_type_ann(st)
+        if st["error"] != "" {
+            return null
+        }
+    }
+    let eq = expect(st, "OP", "=", "equals sign after the variable name in let")
+    if eq == null {
+        return null
+    }
+    let value = parse_expression(st)
+    if value == null {
+        return null
+    }
+    let node = mk("LetStmt", tok["line"], tok["col"])
+    node["name"] = name_tok["value"]
+    node["value"] = value
+    node["type_ann"] = type_ann
+    node["mutable"] = mutable
+    return node
+}
+
+func parse_func(st, is_async, async_tok) {
+    let tok = null
+    if async_tok != null {
+        tok = expect(st, "KEYWORD", "func", "func after async")
+        if tok == null {
+            return null
+        }
+    } else {
+        tok = advance(st)
+    }
+    let name = null
+    if check(st, "IDENT", "") {
+        let nt = advance(st)
+        name = nt["value"]
+    }
+    let open = expect(st, "PUNCT", "(", "open paren after the function name")
+    if open == null {
+        return null
+    }
+    let params = []
+    let param_types = []
+    if not check(st, "PUNCT", ")") {
+        while true {
+            let p = expect(st, "IDENT", "", "a parameter name")
+            if p == null {
+                return null
+            }
+            push(params, p["value"])
+            if match_tok(st, "PUNCT", ":") != null {
+                let pt = parse_type_ann(st)
+                if st["error"] != "" {
+                    return null
+                }
+                push(param_types, pt)
+            } else {
+                push(param_types, null)
+            }
+            if match_tok(st, "PUNCT", ",") == null {
+                break
+            }
+        }
+    }
+    let close = expect(st, "PUNCT", ")", "close paren after the parameter list")
+    if close == null {
+        return null
+    }
+    let return_type = null
+    if match_tok(st, "OP", "->") != null {
+        return_type = parse_type_ann(st)
+        if st["error"] != "" {
+            return null
+        }
+    }
+    let body = parse_block(st)
+    if body == null {
+        return null
+    }
+    let line = tok["line"]
+    let col = tok["col"]
+    if async_tok != null {
+        line = async_tok["line"]
+        col = async_tok["col"]
+    }
+    let node = mk("FuncDecl", line, col)
+    node["name"] = name
+    node["params"] = params
+    node["param_types"] = param_types
+    node["return_type"] = return_type
+    node["is_async"] = is_async
+    node["body"] = body
+    return node
+}
+
+func parse_match_expr(st) {
+    let tok = advance(st)
+    let scrut = parse_expression(st)
+    if scrut == null {
+        return null
+    }
+    let open = expect(st, "PUNCT", brace_open, "open brace after the value in match")
+    if open == null {
+        return null
+    }
+    let arms = []
+    skip_newlines(st)
+    if not check(st, "PUNCT", "}") {
+        while true {
+            let arm = parse_match_arm(st)
+            if arm == null {
+                return null
+            }
+            push(arms, arm)
+            skip_newlines(st)
+            if match_tok(st, "PUNCT", ",") == null {
+                break
+            }
+            skip_newlines(st)
+            if check(st, "PUNCT", "}") {
+                break
+            }
+        }
+    }
+    let close = expect(st, "PUNCT", "}", "close brace to close the match")
+    if close == null {
+        return null
+    }
+    let node = mk("MatchExpr", tok["line"], tok["col"])
+    node["scrutinee"] = scrut
+    node["arms"] = arms
+    return node
+}
+
+func parse_match_arm(st) {
+    let tok = cur(st)
+    let pattern = parse_pattern(st)
+    if pattern == null {
+        return null
+    }
+    let guard = null
+    if check(st, "KEYWORD", "if") {
+        advance(st)
+        guard = parse_expression(st)
+        if st["error"] != "" {
+            return null
+        }
+    }
+    let arrow = expect(st, "OP", "=>", "fat arrow after the pattern in a match arm")
+    if arrow == null {
+        return null
+    }
+    let body = parse_expression(st)
+    if body == null {
+        return null
+    }
+    let node = mk("MatchArm", tok["line"], tok["col"])
+    node["pattern"] = pattern
+    node["guard"] = guard
+    node["body"] = body
+    return node
+}
+
+func parse_pattern(st) {
+    let tok = cur(st)
+    if check(st, "IDENT", "") {
+        advance(st)
+        if tok["value"] == "_" {
+            return mk("Wildcard", tok["line"], tok["col"])
+        }
+        let node = mk("Var", tok["line"], tok["col"])
+        node["name"] = tok["value"]
+        return node
+    }
+    if check(st, "NUMBER", "") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = tok["value"]
+        return node
+    }
+    if check(st, "STRING", "") {
+        advance(st)
+        let parts = tok["value"]
+        if len(parts) != 1 or parts[0][0] != "lit" {
+            fail(st, "A match pattern must be a plain string, not an interpolated one", tok["line"], tok["col"])
+            return null
+        }
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = parts[0][1]
+        return node
+    }
+    if check(st, "KEYWORD", "true") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = true
+        return node
+    }
+    if check(st, "KEYWORD", "false") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = false
+        return node
+    }
+    if check(st, "KEYWORD", "null") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = null
+        return node
+    }
+    fail(st, "Expected a pattern in match -- a literal, a name, or underscore", tok["line"], tok["col"])
+    return null
+}
+
+func parse_if(st) {
+    let tok = advance(st)
+    let cond = parse_expression(st)
+    if cond == null {
+        return null
+    }
+    let body = parse_block(st)
+    if body == null {
+        return null
+    }
+    let branches = [[cond, body]]
+    let else_body = null
+    while true {
+        let save = st["pos"]
+        skip_newlines(st)
+        if check(st, "KEYWORD", "elif") {
+            advance(st)
+            let c = parse_expression(st)
+            if c == null {
+                return null
+            }
+            let b = parse_block(st)
+            if b == null {
+                return null
+            }
+            push(branches, [c, b])
+        } elif check(st, "KEYWORD", "else") {
+            advance(st)
+            else_body = parse_block(st)
+            if else_body == null {
+                return null
+            }
+            break
+        } else {
+            st["pos"] = save
+            break
+        }
+    }
+    let node = mk("IfStmt", tok["line"], tok["col"])
+    node["branches"] = branches
+    node["else_body"] = else_body
+    return node
+}
+
+func parse_for(st) {
+    let tok = advance(st)
+    let var_tok = expect(st, "IDENT", "", "a loop variable after for")
+    if var_tok == null {
+        return null
+    }
+    let in_tok = expect(st, "KEYWORD", "in", "in after the loop variable")
+    if in_tok == null {
+        return null
+    }
+    let iterable = parse_expression(st)
+    if iterable == null {
+        return null
+    }
+    let body = parse_block(st)
+    if body == null {
+        return null
+    }
+    let node = mk("ForStmt", tok["line"], tok["col"])
+    node["var"] = var_tok["value"]
+    node["iterable"] = iterable
+    node["body"] = body
+    return node
+}
+
+func parse_expr_or_assign(st) {
+    let tok = cur(st)
+    let expr = parse_expression(st)
+    if expr == null {
+        return null
+    }
+    if check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op == "=" or op == "+=" or op == "-=" {
+            advance(st)
+            if expr["type"] != "Var" and expr["type"] != "Index" {
+                fail(st, "Only a variable or an index can be assigned to", tok["line"], tok["col"])
+                return null
+            }
+            let value = parse_expression(st)
+            if value == null {
+                return null
+            }
+            let node = mk("AssignStmt", tok["line"], tok["col"])
+            node["target"] = expr
+            node["op"] = op
+            node["value"] = value
+            return node
+        }
+    }
+    let node = mk("ExprStmt", tok["line"], tok["col"])
+    node["expr"] = expr
+    return node
+}
+
+func parse_expression(st) {
+    return parse_or(st)
+}
+
+func parse_or(st) {
+    let left = parse_and(st)
+    if left == null {
+        return null
+    }
+    while check(st, "KEYWORD", "or") {
+        let tok = advance(st)
+        let right = parse_and(st)
+        if right == null {
+            return null
+        }
+        left = binop("or", left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_and(st) {
+    let left = parse_equality(st)
+    if left == null {
+        return null
+    }
+    while check(st, "KEYWORD", "and") {
+        let tok = advance(st)
+        let right = parse_equality(st)
+        if right == null {
+            return null
+        }
+        left = binop("and", left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_equality(st) {
+    let left = parse_comparison(st)
+    if left == null {
+        return null
+    }
+    while check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op != "==" and op != "!=" {
+            break
+        }
+        let tok = advance(st)
+        let right = parse_comparison(st)
+        if right == null {
+            return null
+        }
+        left = binop(op, left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_comparison(st) {
+    let left = parse_additive(st)
+    if left == null {
+        return null
+    }
+    while check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op != "<" and op != "<=" and op != ">" and op != ">=" {
+            break
+        }
+        let tok = advance(st)
+        let right = parse_additive(st)
+        if right == null {
+            return null
+        }
+        left = binop(op, left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_additive(st) {
+    let left = parse_multiplicative(st)
+    if left == null {
+        return null
+    }
+    while check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op != "+" and op != "-" {
+            break
+        }
+        let tok = advance(st)
+        let right = parse_multiplicative(st)
+        if right == null {
+            return null
+        }
+        left = binop(op, left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_multiplicative(st) {
+    let left = parse_unary(st)
+    if left == null {
+        return null
+    }
+    while check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op != "*" and op != "/" and op != "%" {
+            break
+        }
+        let tok = advance(st)
+        let right = parse_unary(st)
+        if right == null {
+            return null
+        }
+        left = binop(op, left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_unary(st) {
+    let tok = cur(st)
+    if check(st, "KEYWORD", "await") {
+        advance(st)
+        let inner = parse_unary(st)
+        if inner == null {
+            return null
+        }
+        let node = mk("AwaitExpr", tok["line"], tok["col"])
+        node["expr"] = inner
+        return node
+    }
+    if check(st, "OP", "&") {
+        advance(st)
+        let mutable = false
+        if check(st, "IDENT", "mut") {
+            let nxt = peek_at(st, 1)
+            if nxt != null and starts_expression(nxt) {
+                advance(st)
+                mutable = true
+            }
+        }
+        let inner = parse_unary(st)
+        if inner == null {
+            return null
+        }
+        let node = mk("BorrowExpr", tok["line"], tok["col"])
+        node["expr"] = inner
+        node["mutable"] = mutable
+        return node
+    }
+    if check(st, "OP", "-") {
+        advance(st)
+        let inner = parse_unary(st)
+        if inner == null {
+            return null
+        }
+        let node = mk("UnaryOp", tok["line"], tok["col"])
+        node["op"] = "-"
+        node["operand"] = inner
+        return node
+    }
+    if check(st, "KEYWORD", "not") {
+        advance(st)
+        let inner = parse_unary(st)
+        if inner == null {
+            return null
+        }
+        let node = mk("UnaryOp", tok["line"], tok["col"])
+        node["op"] = "not"
+        node["operand"] = inner
+        return node
+    }
+    return parse_power(st)
+}
+
+func parse_power(st) {
+    let left = parse_postfix(st)
+    if left == null {
+        return null
+    }
+    if check(st, "OP", "**") {
+        let tok = advance(st)
+        let right = parse_unary(st)
+        if right == null {
+            return null
+        }
+        return binop("**", left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_postfix(st) {
+    let expr = parse_primary(st)
+    if expr == null {
+        return null
+    }
+    while true {
+        if check(st, "PUNCT", "(") {
+            let tok = advance(st)
+            let args = []
+            skip_newlines(st)
+            if not check(st, "PUNCT", ")") {
+                while true {
+                    let arg = parse_expression(st)
+                    if arg == null {
+                        return null
+                    }
+                    push(args, arg)
+                    skip_newlines(st)
+                    if match_tok(st, "PUNCT", ",") == null {
+                        break
+                    }
+                    skip_newlines(st)
+                }
+            }
+            let close = expect(st, "PUNCT", ")", "close paren after the arguments")
+            if close == null {
+                return null
+            }
+            let node = mk("Call", tok["line"], tok["col"])
+            node["callee"] = expr
+            node["args"] = args
+            expr = node
+        } elif check(st, "PUNCT", "[") {
+            let tok = advance(st)
+            skip_newlines(st)
+            let index = parse_expression(st)
+            if index == null {
+                return null
+            }
+            skip_newlines(st)
+            let close = expect(st, "PUNCT", "]", "close bracket after the index")
+            if close == null {
+                return null
+            }
+            let node = mk("Index", tok["line"], tok["col"])
+            node["target"] = expr
+            node["index"] = index
+            expr = node
+        } elif check(st, "PUNCT", ".") {
+            let dot = advance(st)
+            let name_tok = expect(st, "IDENT", "", "a method name after dot")
+            if name_tok == null {
+                return null
+            }
+            let node = mk("Member", dot["line"], dot["col"])
+            node["object"] = expr
+            node["name"] = name_tok["value"]
+            expr = node
+        } else {
+            break
+        }
+    }
+    return expr
+}
+
+func parse_primary(st) {
+    let tok = cur(st)
+    if check(st, "NUMBER", "") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = tok["value"]
+        return node
+    }
+    if check(st, "STRING", "") {
+        advance(st)
+        let node = mk("StringLiteral", tok["line"], tok["col"])
+        node["parts"] = tok["value"]
+        return node
+    }
+    if check(st, "KEYWORD", "true") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = true
+        return node
+    }
+    if check(st, "KEYWORD", "false") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = false
+        return node
+    }
+    if check(st, "KEYWORD", "null") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = null
+        return node
+    }
+    if check(st, "KEYWORD", "func") {
+        return parse_func(st, false, null)
+    }
+    if check(st, "KEYWORD", "async") {
+        let atok = advance(st)
+        return parse_func(st, true, atok)
+    }
+    if check(st, "KEYWORD", "match") {
+        return parse_match_expr(st)
+    }
+    if check(st, "IDENT", "") {
+        advance(st)
+        let node = mk("Var", tok["line"], tok["col"])
+        node["name"] = tok["value"]
+        return node
+    }
+    if check(st, "PUNCT", "(") {
+        advance(st)
+        skip_newlines(st)
+        let expr = parse_expression(st)
+        if expr == null {
+            return null
+        }
+        skip_newlines(st)
+        let close = expect(st, "PUNCT", ")", "close paren to close the parentheses")
+        if close == null {
+            return null
+        }
+        return expr
+    }
+    if check(st, "PUNCT", "[") {
+        advance(st)
+        let elements = []
+        skip_newlines(st)
+        if not check(st, "PUNCT", "]") {
+            while true {
+                let el = parse_expression(st)
+                if el == null {
+                    return null
+                }
+                push(elements, el)
+                skip_newlines(st)
+                if match_tok(st, "PUNCT", ",") == null {
+                    break
+                }
+                skip_newlines(st)
+            }
+        }
+        let close = expect(st, "PUNCT", "]", "close bracket to close the array")
+        if close == null {
+            return null
+        }
+        let node = mk("ArrayLiteral", tok["line"], tok["col"])
+        node["elements"] = elements
+        return node
+    }
+    if check(st, "PUNCT", brace_open) {
+        advance(st)
+        let pairs = []
+        skip_newlines(st)
+        if not check(st, "PUNCT", "}") {
+            while true {
+                let key_tok = cur(st)
+                if not check(st, "STRING", "") {
+                    fail(st, "Dict keys must be strings", key_tok["line"], key_tok["col"])
+                    return null
+                }
+                advance(st)
+                let parts = key_tok["value"]
+                if len(parts) != 1 or parts[0][0] != "lit" {
+                    fail(st, "Dict keys must be plain strings, not interpolated ones", key_tok["line"], key_tok["col"])
+                    return null
+                }
+                let key = parts[0][1]
+                let colon = expect(st, "PUNCT", ":", "colon after the dict key")
+                if colon == null {
+                    return null
+                }
+                let value = parse_expression(st)
+                if value == null {
+                    return null
+                }
+                push(pairs, [key, value])
+                skip_newlines(st)
+                if match_tok(st, "PUNCT", ",") == null {
+                    break
+                }
+                skip_newlines(st)
+            }
+        }
+        let close = expect(st, "PUNCT", "}", "close brace to close the dict")
+        if close == null {
+            return null
+        }
+        let node = mk("DictLiteral", tok["line"], tok["col"])
+        node["pairs"] = pairs
+        return node
+    }
+    if tok["kind"] == "EOF" {
+        fail(st, "Unexpected end of file -- an expression was expected here", tok["line"], tok["col"])
+        return null
+    }
+    fail(st, "Unexpected token -- an expression was expected here", tok["line"], tok["col"])
+    return null
+}
+
+# --- compiler (mirrors kabir/compile.py) ------------------------------
+# The compiler state is a dict ("builder"); compile errors are
+# reported through the global cerr dict, like the parser's st error.
+
+let cerr = {"message": "", "line": 0, "col": 0}
+let binops = {
+    "+": "ADD",
+    "-": "SUB",
+    "*": "MUL",
+    "/": "DIV",
+    "%": "MOD",
+    "**": "POW",
+    "==": "EQ",
+    "!=": "NE",
+    "<": "LT",
+    "<=": "LE",
+    ">": "GT",
+    ">=": "GE"
+}
+
+func comp_fail_at(message, line, col) {
+    if cerr["message"] == "" {
+        cerr["message"] = message
+        cerr["line"] = line
+        cerr["col"] = col
+    }
+}
+
+func comp_fail(node, message) {
+    let line = node["line"]
+    let col = node["col"]
+    if line == null {
+        line = 1
+    }
+    if col == null {
+        col = 1
+    }
+    comp_fail_at(message, line, col)
+}
+
+func comp_children(node) {
+    let t = node["type"]
+    if t == "Program" or t == "Block" {
+        return node["statements"]
+    }
+    if t == "LetStmt" {
+        let out = [node["value"]]
+        if node["type_ann"] != null {
+            push(out, node["type_ann"])
+        }
+        return out
+    }
+    if t == "AssignStmt" {
+        return [node["target"], node["value"]]
+    }
+    if t == "ExprStmt" {
+        return [node["expr"]]
+    }
+    if t == "FuncDecl" {
+        let out = [node["body"]]
+        let pts = node["param_types"]
+        let i = 0
+        while i < len(pts) {
+            if pts[i] != null {
+                push(out, pts[i])
+            }
+            i = i + 1
+        }
+        if node["return_type"] != null {
+            push(out, node["return_type"])
+        }
+        return out
+    }
+    if t == "ReturnStmt" {
+        if node["value"] == null {
+            return []
+        }
+        return [node["value"]]
+    }
+    if t == "IfStmt" {
+        let out = []
+        let branches = node["branches"]
+        let i = 0
+        while i < len(branches) {
+            push(out, branches[i][0])
+            push(out, branches[i][1])
+            i = i + 1
+        }
+        if node["else_body"] != null {
+            push(out, node["else_body"])
+        }
+        return out
+    }
+    if t == "WhileStmt" {
+        return [node["condition"], node["body"]]
+    }
+    if t == "ForStmt" {
+        return [node["iterable"], node["body"]]
+    }
+    if t == "ArrayLiteral" {
+        return node["elements"]
+    }
+    if t == "DictLiteral" {
+        let out = []
+        let pairs = node["pairs"]
+        let i = 0
+        while i < len(pairs) {
+            push(out, pairs[i][1])
+            i = i + 1
+        }
+        return out
+    }
+    if t == "BinaryOp" {
+        return [node["left"], node["right"]]
+    }
+    if t == "UnaryOp" {
+        return [node["operand"]]
+    }
+    if t == "AwaitExpr" {
+        return [node["expr"]]
+    }
+    if t == "Call" {
+        let out = [node["callee"]]
+        let args = node["args"]
+        let i = 0
+        while i < len(args) {
+            push(out, args[i])
+            i = i + 1
+        }
+        return out
+    }
+    if t == "Index" {
+        return [node["target"], node["index"]]
+    }
+    if t == "Member" {
+        return [node["object"]]
+    }
+    if t == "BorrowExpr" {
+        return [node["expr"]]
+    }
+    if t == "MatchArm" {
+        let out = [node["pattern"], node["body"]]
+        if node["guard"] != null {
+            push(out, node["guard"])
+        }
+        return out
+    }
+    if t == "MatchExpr" {
+        let out = [node["scrutinee"]]
+        let arms = node["arms"]
+        let i = 0
+        while i < len(arms) {
+            push(out, arms[i])
+            i = i + 1
+        }
+        return out
+    }
+    return []
+}
+
+func comp_reline(node, line, col) {
+    node["line"] = line
+    node["col"] = col
+    let kids = comp_children(node)
+    let i = 0
+    while i < len(kids) {
+        comp_reline(kids[i], line, col)
+        i = i + 1
+    }
+}
+
+func comp_parse_interp_stmts(text) {
+    let lst = lex_new_state(text)
+    let toks = lex_tokenize(lst)
+    if lst["error"] != "" {
+        return null
+    }
+    let pst = new_state(toks)
+    let prog = parse_program(pst)
+    if pst["error"] != "" or prog == null {
+        return null
+    }
+    return prog["statements"]
+}
+
+func comp_captured_names(statements, filename) {
+    let captured = []
+    let stack = []
+    let i = 0
+    while i < len(statements) {
+        push(stack, [statements[i], false])
+        i = i + 1
+    }
+    while len(stack) > 0 {
+        let item = pop(stack)
+        let node = item[0]
+        let in_func = item[1]
+        if node["type"] == "FuncDecl" {
+            in_func = true
+        }
+        if in_func and node["type"] == "Var" {
+            if not in_list(captured, node["name"]) {
+                push(captured, node["name"])
+            }
+        }
+        if in_func and node["type"] == "StringLiteral" {
+            let parts = node["parts"]
+            let j = 0
+            while j < len(parts) {
+                let part = parts[j]
+                if part[0] == "expr" {
+                    let inner = comp_parse_interp_stmts(part[1])
+                    if inner != null {
+                        let k = 0
+                        while k < len(inner) {
+                            push(stack, [inner[k], true])
+                            k = k + 1
+                        }
+                    }
+                }
+                j = j + 1
+            }
+        }
+        let kids = comp_children(node)
+        let k = 0
+        while k < len(kids) {
+            push(stack, [kids[k], in_func])
+            k = k + 1
+        }
+    }
+    return captured
+}
+
+func comp_new_builder(name, params, filename, lines, depth, statements, is_async) {
+    let b = {
+        "name": name,
+        "params": params,
+        "filename": filename,
+        "lines": lines,
+        "function_depth": depth,
+        "is_async": is_async,
+        "instrs": [],
+        "consts": [],
+        "instr_lines": [],
+        "instr_cols": [],
+        "locals": [],
+        "captured": [],
+        "use_slots": false,
+        "slot_scopes": [{}],
+        "scope_depth": 0,
+        "loop_stack": [],
+        "temp_counter": 0,
+        "last_line": 1,
+        "last_col": 1
+    }
+    b["captured"] = comp_captured_names(statements, filename)
+    if depth > 0 {
+        b["use_slots"] = true
+    }
+    let scopes = b["slot_scopes"]
+    let root_scope = scopes[0]
+    let i = 0
+    while i < len(params) {
+        let p = params[i]
+        if not b["use_slots"] or in_list(b["captured"], p) {
+            push(b["locals"], null)
+        } else {
+            push(b["locals"], p)
+            root_scope[p] = len(b["locals"]) - 1
+        }
+        i = i + 1
+    }
+    return b
+}
+
+func comp_emit(b, op, arg, line, col) {
+    if line == null {
+        line = 1
+    }
+    if col == null {
+        col = 1
+    }
+    push(b["instrs"], [op, arg])
+    push(b["instr_lines"], line)
+    push(b["instr_cols"], col)
+    b["last_line"] = line
+    b["last_col"] = col
+    return len(b["instrs"]) - 1
+}
+
+func comp_add_const(b, value) {
+    push(b["consts"], value)
+    return len(b["consts"]) - 1
+}
+
+func comp_patch(b, index, target) {
+    b["instrs"][index][1] = target
+}
+
+func comp_fresh_temp(b) {
+    b["temp_counter"] = b["temp_counter"] + 1
+    return "$tmp" + str(b["temp_counter"])
+}
+
+func comp_lookup_slot(b, name) {
+    if not b["use_slots"] {
+        return null
+    }
+    let scopes = b["slot_scopes"]
+    let i = len(scopes) - 1
+    while i >= 0 {
+        let scope = scopes[i]
+        if in_list(keys(scope), name) {
+            return scope[name]
+        }
+        i = i - 1
+    }
+    return null
+}
+
+func comp_alloc_slot(b, name) {
+    let index = len(b["locals"])
+    push(b["locals"], name)
+    let scopes = b["slot_scopes"]
+    let scope = scopes[len(scopes) - 1]
+    scope[name] = index
+    return index
+}
+
+func comp_define_name(b, name, line, col) {
+    if not b["use_slots"] or in_list(b["captured"], name) {
+        comp_emit(b, "DEFINE_VAR", name, line, col)
+        return null
+    }
+    let index = comp_alloc_slot(b, name)
+    comp_emit(b, "DEFINE_SLOT", index, line, col)
+    return index
+}
+
+func comp_store_name(b, name, line, col) {
+    let slot = comp_lookup_slot(b, name)
+    if slot != null {
+        comp_emit(b, "STORE_SLOT", slot, line, col)
+    } else {
+        comp_emit(b, "STORE_VAR", name, line, col)
+    }
+}
+
+func comp_finish(b) {
+    comp_emit(b, "LOAD_NULL", null, b["last_line"], b["last_col"])
+    comp_emit(b, "RETURN", null, b["last_line"], b["last_col"])
+    let code = {
+        "name": b["name"],
+        "params": b["params"],
+        "instrs": b["instrs"],
+        "consts": b["consts"],
+        "lines": b["instr_lines"],
+        "cols": b["instr_cols"],
+        "locals": b["locals"],
+        "filename": b["filename"],
+        "is_async": b["is_async"]
+    }
+    return code
+}
+
+func comp_enter_scope(b, line, col) {
+    comp_emit(b, "ENTER_SCOPE", null, line, col)
+    b["scope_depth"] = b["scope_depth"] + 1
+}
+
+func comp_exit_scope(b, line, col, track) {
+    comp_emit(b, "EXIT_SCOPE", null, line, col)
+    if track {
+        b["scope_depth"] = b["scope_depth"] - 1
+    }
+}
+
+func comp_block_defines_names(block) {
+    let stmts = block["statements"]
+    let i = 0
+    while i < len(stmts) {
+        let t = stmts[i]["type"]
+        if t == "LetStmt" or t == "FuncDecl" or t == "ImportStmt" {
+            return true
+        }
+        if t == "AssignStmt" {
+            let target = stmts[i]["target"]
+            if target["type"] != "Var" and stmts[i]["op"] != "=" {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func comp_compile_block(b, block) {
+    let has_defs = comp_block_defines_names(block)
+    if has_defs {
+        comp_enter_scope(b, block["line"], block["col"])
+        push(b["slot_scopes"], {})
+    }
+    let stmts = block["statements"]
+    let i = 0
+    while i < len(stmts) {
+        comp_compile_stmt(b, stmts[i])
+        if cerr["message"] != "" {
+            return
+        }
+        i = i + 1
+    }
+    if has_defs {
+        pop(b["slot_scopes"])
+        let end_line = block["line"]
+        if in_list(keys(block), "end_line") {
+            end_line = block["end_line"]
+        }
+        comp_exit_scope(b, end_line, block["col"], true)
+    }
+}
+
+func comp_compile_statements(b, statements) {
+    let i = 0
+    while i < len(statements) {
+        comp_compile_stmt(b, statements[i])
+        if cerr["message"] != "" {
+            return
+        }
+        i = i + 1
+    }
+}
+
+func comp_compile_stmt(b, stmt) {
+    let t = stmt["type"]
+    if t == "LetStmt" {
+        comp_compile_expr(b, stmt["value"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_define_name(b, stmt["name"], stmt["line"], stmt["col"])
+    } elif t == "AssignStmt" {
+        comp_stmt_assign(b, stmt)
+    } elif t == "ExprStmt" {
+        comp_compile_expr(b, stmt["expr"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_emit(b, "POP", null, stmt["line"], stmt["col"])
+    } elif t == "FuncDecl" {
+        let idx = comp_compile_function(b, stmt)
+        if cerr["message"] != "" {
+            return
+        }
+        comp_emit(b, "MAKE_FUNCTION", idx, stmt["line"], stmt["col"])
+        if stmt["name"] != null {
+            comp_define_name(b, stmt["name"], stmt["line"], stmt["col"])
+        } else {
+            comp_emit(b, "POP", null, stmt["line"], stmt["col"])
+        }
+    } elif t == "ReturnStmt" {
+        if b["function_depth"] == 0 {
+            comp_fail(stmt, "'return' can only be used inside a function")
+            return
+        }
+        if stmt["value"] != null {
+            comp_compile_expr(b, stmt["value"])
+            if cerr["message"] != "" {
+                return
+            }
+        } else {
+            comp_emit(b, "LOAD_NULL", null, stmt["line"], stmt["col"])
+        }
+        comp_emit(b, "RETURN", null, stmt["line"], stmt["col"])
+    } elif t == "IfStmt" {
+        comp_stmt_if(b, stmt)
+    } elif t == "WhileStmt" {
+        comp_stmt_while(b, stmt)
+    } elif t == "ForStmt" {
+        comp_stmt_for(b, stmt)
+    } elif t == "BreakStmt" {
+        comp_jump_out_of_loop(b, stmt, "break")
+    } elif t == "ContinueStmt" {
+        comp_jump_out_of_loop(b, stmt, "continue")
+    } elif t == "ImportStmt" {
+        comp_emit(b, "IMPORT", stmt["path"], stmt["line"], stmt["col"])
+    } elif t == "Block" {
+        comp_compile_block(b, stmt)
+    } else {
+        comp_fail(stmt, "Cannot compile this statement")
+    }
+}
+
+func comp_stmt_assign(b, stmt) {
+    let target = stmt["target"]
+    if target["type"] == "Var" {
+        if stmt["op"] == "=" {
+            comp_compile_expr(b, stmt["value"])
+        } else {
+            comp_compile_expr(b, target)
+            if cerr["message"] != "" {
+                return
+            }
+            comp_compile_expr(b, stmt["value"])
+            if cerr["message"] != "" {
+                return
+            }
+            if stmt["op"] == "+=" {
+                comp_emit(b, "ADD", null, stmt["line"], stmt["col"])
+            } else {
+                comp_emit(b, "SUB", null, stmt["line"], stmt["col"])
+            }
+        }
+        if cerr["message"] != "" {
+            return
+        }
+        comp_store_name(b, target["name"], stmt["line"], stmt["col"])
+        return
+    }
+    if stmt["op"] == "=" {
+        comp_compile_expr(b, target["target"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_compile_expr(b, target["index"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_compile_expr(b, stmt["value"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_emit(b, "SET_INDEX", null, target["index"]["line"], target["index"]["col"])
+        comp_emit(b, "POP", null, stmt["line"], stmt["col"])
+        return
+    }
+    comp_compile_expr(b, target["target"])
+    if cerr["message"] != "" {
+        return
+    }
+    comp_compile_expr(b, target["index"])
+    if cerr["message"] != "" {
+        return
+    }
+    comp_emit(b, "GET_INDEX", null, target["index"]["line"], target["index"]["col"])
+    comp_compile_expr(b, stmt["value"])
+    if cerr["message"] != "" {
+        return
+    }
+    if stmt["op"] == "+=" {
+        comp_emit(b, "ADD", null, stmt["line"], stmt["col"])
+    } else {
+        comp_emit(b, "SUB", null, stmt["line"], stmt["col"])
+    }
+    let temp = comp_fresh_temp(b)
+    comp_emit(b, "DEFINE_VAR", temp, stmt["line"], stmt["col"])
+    comp_compile_expr(b, target["target"])
+    if cerr["message"] != "" {
+        return
+    }
+    comp_compile_expr(b, target["index"])
+    if cerr["message"] != "" {
+        return
+    }
+    comp_emit(b, "LOAD_VAR", temp, stmt["line"], stmt["col"])
+    comp_emit(b, "SET_INDEX", null, target["index"]["line"], target["index"]["col"])
+    comp_emit(b, "POP", null, stmt["line"], stmt["col"])
+}
+
+func comp_stmt_if(b, stmt) {
+    let end_patches = []
+    let branches = stmt["branches"]
+    let i = 0
+    while i < len(branches) {
+        let cond = branches[i][0]
+        let body = branches[i][1]
+        comp_compile_expr(b, cond)
+        if cerr["message"] != "" {
+            return
+        }
+        let jump_false = comp_emit(b, "JUMP_IF_FALSE", null, stmt["line"], stmt["col"])
+        comp_compile_block(b, body)
+        if cerr["message"] != "" {
+            return
+        }
+        push(end_patches, comp_emit(b, "JUMP", null, stmt["line"], stmt["col"]))
+        comp_patch(b, jump_false, len(b["instrs"]))
+        i = i + 1
+    }
+    if stmt["else_body"] != null {
+        comp_compile_block(b, stmt["else_body"])
+        if cerr["message"] != "" {
+            return
+        }
+    }
+    let end = len(b["instrs"])
+    let j = 0
+    while j < len(end_patches) {
+        comp_patch(b, end_patches[j], end)
+        j = j + 1
+    }
+}
+
+func comp_stmt_while(b, stmt) {
+    let cond_start = len(b["instrs"])
+    comp_compile_expr(b, stmt["condition"])
+    if cerr["message"] != "" {
+        return
+    }
+    let jump_false = comp_emit(b, "JUMP_IF_FALSE", null, stmt["line"], stmt["col"])
+    let loop = {
+        "kind": "while",
+        "base": b["scope_depth"],
+        "breaks": [],
+        "continue_target": cond_start,
+        "has_iter": false
+    }
+    push(b["loop_stack"], loop)
+    comp_compile_block(b, stmt["body"])
+    if cerr["message"] != "" {
+        return
+    }
+    pop(b["loop_stack"])
+    comp_emit(b, "JUMP", cond_start, stmt["line"], stmt["col"])
+    let end = len(b["instrs"])
+    comp_patch(b, jump_false, end)
+    let breaks = loop["breaks"]
+    let i = 0
+    while i < len(breaks) {
+        comp_patch(b, breaks[i], end)
+        i = i + 1
+    }
+}
+
+func comp_stmt_for(b, stmt) {
+    comp_compile_expr(b, stmt["iterable"])
+    if cerr["message"] != "" {
+        return
+    }
+    comp_emit(b, "GET_ITER", null, stmt["iterable"]["line"], stmt["iterable"]["col"])
+    let loop_start = len(b["instrs"])
+    let for_iter = comp_emit(b, "FOR_ITER", null, stmt["line"], stmt["col"])
+    let loop = {
+        "kind": "for",
+        "base": b["scope_depth"],
+        "breaks": [],
+        "continue_target": loop_start,
+        "has_iter": true
+    }
+    push(b["loop_stack"], loop)
+    comp_enter_scope(b, stmt["line"], stmt["col"])
+    push(b["slot_scopes"], {})
+    comp_define_name(b, stmt["var"], stmt["line"], stmt["col"])
+    comp_compile_block(b, stmt["body"])
+    if cerr["message"] != "" {
+        return
+    }
+    pop(b["slot_scopes"])
+    comp_exit_scope(b, stmt["line"], stmt["col"], true)
+    pop(b["loop_stack"])
+    comp_emit(b, "JUMP", loop_start, stmt["line"], stmt["col"])
+    let end = len(b["instrs"])
+    comp_patch(b, for_iter, end)
+    let breaks = loop["breaks"]
+    let i = 0
+    while i < len(breaks) {
+        comp_patch(b, breaks[i], end)
+        i = i + 1
+    }
+}
+
+func comp_jump_out_of_loop(b, stmt, kind) {
+    if len(b["loop_stack"]) == 0 {
+        comp_fail(stmt, "'" + kind + "' can only be used inside a loop")
+        return
+    }
+    let loops = b["loop_stack"]
+    let loop = loops[len(loops) - 1]
+    let n = b["scope_depth"] - loop["base"]
+    let i = 0
+    while i < n {
+        comp_emit(b, "EXIT_SCOPE", null, stmt["line"], stmt["col"])
+        i = i + 1
+    }
+    if kind == "break" {
+        if loop["has_iter"] {
+            comp_emit(b, "POP", null, stmt["line"], stmt["col"])
+        }
+        push(loop["breaks"], comp_emit(b, "JUMP", null, stmt["line"], stmt["col"]))
+    } else {
+        comp_emit(b, "JUMP", loop["continue_target"], stmt["line"], stmt["col"])
+    }
+}
+
+func comp_compile_function(b, node) {
+    let nm = node["name"]
+    if nm == null {
+        nm = "<anonymous>"
+    }
+    let builder = comp_new_builder(nm, node["params"], b["filename"], b["lines"], 1, node["body"]["statements"], node["is_async"])
+    comp_compile_statements(builder, node["body"]["statements"])
+    if cerr["message"] != "" {
+        return null
+    }
+    let code = comp_finish(builder)
+    let wrap = {"__code__": code}
+    return comp_add_const(b, wrap)
+}
+
+func comp_compile_expr(b, expr) {
+    let t = expr["type"]
+    if t == "Literal" {
+        comp_emit_literal(b, expr["value"], expr["line"], expr["col"])
+    } elif t == "StringLiteral" {
+        comp_expr_string(b, expr)
+    } elif t == "Var" {
+        let slot = comp_lookup_slot(b, expr["name"])
+        if slot != null {
+            comp_emit(b, "LOAD_SLOT", slot, expr["line"], expr["col"])
+        } else {
+            comp_emit(b, "LOAD_VAR", expr["name"], expr["line"], expr["col"])
+        }
+    } elif t == "BorrowExpr" {
+        comp_compile_expr(b, expr["expr"])
+    } elif t == "ArrayLiteral" {
+        let els = expr["elements"]
+        let i = 0
+        while i < len(els) {
+            comp_compile_expr(b, els[i])
+            if cerr["message"] != "" {
+                return
+            }
+            i = i + 1
+        }
+        comp_emit(b, "BUILD_LIST", len(els), expr["line"], expr["col"])
+    } elif t == "DictLiteral" {
+        let pairs = expr["pairs"]
+        let i = 0
+        while i < len(pairs) {
+            comp_emit(b, "LOAD_CONST", comp_add_const(b, pairs[i][0]), expr["line"], expr["col"])
+            comp_compile_expr(b, pairs[i][1])
+            if cerr["message"] != "" {
+                return
+            }
+            i = i + 1
+        }
+        comp_emit(b, "BUILD_DICT", len(pairs), expr["line"], expr["col"])
+    } elif t == "BinaryOp" {
+        comp_expr_binary(b, expr)
+    } elif t == "UnaryOp" {
+        comp_compile_expr(b, expr["operand"])
+        if cerr["message"] != "" {
+            return
+        }
+        if expr["op"] == "-" {
+            comp_emit(b, "NEG", null, expr["operand"]["line"], expr["operand"]["col"])
+        } else {
+            comp_emit(b, "NOT", null, expr["line"], expr["col"])
+        }
+    } elif t == "Call" {
+        comp_expr_call(b, expr)
+    } elif t == "AwaitExpr" {
+        if not b["is_async"] {
+            comp_fail(expr, "'await' can only be used inside an 'async func' -- this is a sync function (or the top level)")
+            return
+        }
+        comp_compile_expr(b, expr["expr"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_emit(b, "AWAIT", null, expr["line"], expr["col"])
+    } elif t == "Index" {
+        comp_compile_expr(b, expr["target"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_compile_expr(b, expr["index"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_emit(b, "GET_INDEX", null, expr["index"]["line"], expr["index"]["col"])
+    } elif t == "Member" {
+        comp_compile_expr(b, expr["object"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_emit(b, "GET_MEMBER", expr["name"], expr["line"], expr["col"])
+    } elif t == "MatchExpr" {
+        comp_expr_match(b, expr)
+    } elif t == "FuncDecl" {
+        let idx = comp_compile_function(b, expr)
+        if cerr["message"] != "" {
+            return
+        }
+        comp_emit(b, "MAKE_FUNCTION", idx, expr["line"], expr["col"])
+    } else {
+        comp_fail(expr, "Cannot compile this expression")
+    }
+}
+
+func comp_emit_literal(b, value, line, col) {
+    if value == null {
+        comp_emit(b, "LOAD_NULL", null, line, col)
+    } elif value == true {
+        comp_emit(b, "LOAD_TRUE", null, line, col)
+    } elif value == false {
+        comp_emit(b, "LOAD_FALSE", null, line, col)
+    } else {
+        comp_emit(b, "LOAD_CONST", comp_add_const(b, value), line, col)
+    }
+}
+
+func comp_parse_interpolation(text, node, b) {
+    let lst = lex_new_state(text)
+    let toks = lex_tokenize(lst)
+    if lst["error"] != "" {
+        comp_fail_at(lst["error"], node["line"], node["col"])
+        return null
+    }
+    let pst = new_state(toks)
+    let prog = parse_program(pst)
+    if pst["error"] != "" or prog == null {
+        comp_fail_at(pst["error"], node["line"], node["col"])
+        return null
+    }
+    let stmts = prog["statements"]
+    if len(stmts) != 1 or stmts[0]["type"] != "ExprStmt" {
+        comp_fail(node, "Only one expression is allowed inside braces")
+        return null
+    }
+    let inner = stmts[0]["expr"]
+    comp_reline(inner, node["line"], node["col"])
+    return inner
+}
+
+func comp_expr_string(b, expr) {
+    let parts = expr["parts"]
+    let all_lit = true
+    let i = 0
+    while i < len(parts) {
+        if parts[i][0] != "lit" {
+            all_lit = false
+        }
+        i = i + 1
+    }
+    if all_lit {
+        let text = ""
+        let j = 0
+        while j < len(parts) {
+            text = text + parts[j][1]
+            j = j + 1
+        }
+        comp_emit(b, "LOAD_CONST", comp_add_const(b, text), expr["line"], expr["col"])
+        return
+    }
+    let k = 0
+    while k < len(parts) {
+        if parts[k][0] == "lit" {
+            comp_emit(b, "LOAD_CONST", comp_add_const(b, parts[k][1]), expr["line"], expr["col"])
+        } else {
+            let inner = comp_parse_interpolation(parts[k][1], expr, b)
+            if inner == null {
+                return
+            }
+            comp_compile_expr(b, inner)
+            if cerr["message"] != "" {
+                return
+            }
+        }
+        k = k + 1
+    }
+    comp_emit(b, "BUILD_STRING", len(parts), expr["line"], expr["col"])
+}
+
+func comp_expr_binary(b, expr) {
+    if expr["op"] == "and" {
+        comp_compile_expr(b, expr["left"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_emit(b, "DUP", null, expr["line"], expr["col"])
+        let jump = comp_emit(b, "JUMP_IF_FALSE", null, expr["line"], expr["col"])
+        comp_emit(b, "POP", null, expr["line"], expr["col"])
+        comp_compile_expr(b, expr["right"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_patch(b, jump, len(b["instrs"]))
+        return
+    }
+    if expr["op"] == "or" {
+        comp_compile_expr(b, expr["left"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_emit(b, "DUP", null, expr["line"], expr["col"])
+        let jump = comp_emit(b, "JUMP_IF_TRUE", null, expr["line"], expr["col"])
+        comp_emit(b, "POP", null, expr["line"], expr["col"])
+        comp_compile_expr(b, expr["right"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_patch(b, jump, len(b["instrs"]))
+        return
+    }
+    comp_compile_expr(b, expr["left"])
+    if cerr["message"] != "" {
+        return
+    }
+    comp_compile_expr(b, expr["right"])
+    if cerr["message"] != "" {
+        return
+    }
+    comp_emit(b, binops[expr["op"]], null, expr["line"], expr["col"])
+}
+
+func comp_expr_call(b, expr) {
+    let callee = expr["callee"]
+    if callee["type"] == "Var" and callee["name"] == "spawn" and len(expr["args"]) == 1 {
+        let inner = expr["args"][0]
+        if inner["type"] == "Call" {
+            comp_compile_expr(b, inner["callee"])
+            if cerr["message"] != "" {
+                return
+            }
+            let args = inner["args"]
+            let i = 0
+            while i < len(args) {
+                comp_compile_expr(b, args[i])
+                if cerr["message"] != "" {
+                    return
+                }
+                i = i + 1
+            }
+            comp_emit(b, "SPAWN_TASK", len(args), expr["line"], expr["col"])
+            return
+        }
+        if inner["type"] == "Var" or inner["type"] == "FuncDecl" {
+            comp_compile_expr(b, inner)
+            if cerr["message"] != "" {
+                return
+            }
+            comp_emit(b, "SPAWN_TASK", 0, expr["line"], expr["col"])
+            return
+        }
+    }
+    comp_compile_expr(b, expr["callee"])
+    if cerr["message"] != "" {
+        return
+    }
+    let args = expr["args"]
+    let i = 0
+    while i < len(args) {
+        comp_compile_expr(b, args[i])
+        if cerr["message"] != "" {
+            return
+        }
+        i = i + 1
+    }
+    comp_emit(b, "CALL", len(args), expr["line"], expr["col"])
+}
+
+func comp_expr_match(b, expr) {
+    comp_compile_expr(b, expr["scrutinee"])
+    if cerr["message"] != "" {
+        return
+    }
+    let end_patches = []
+    let arms = expr["arms"]
+    let i = 0
+    while i < len(arms) {
+        let arm = arms[i]
+        comp_enter_scope(b, arm["line"], arm["col"])
+        push(b["slot_scopes"], {})
+        let fail_jump = null
+        let pattern = arm["pattern"]
+        if pattern["type"] == "Literal" {
+            comp_emit(b, "DUP", null, arm["line"], arm["col"])
+            comp_emit_literal(b, pattern["value"], arm["line"], arm["col"])
+            comp_emit(b, "EQ", null, arm["line"], arm["col"])
+            fail_jump = comp_emit(b, "JUMP_IF_FALSE", null, arm["line"], arm["col"])
+        } elif pattern["type"] == "Var" {
+            comp_emit(b, "DUP", null, arm["line"], arm["col"])
+            comp_define_name(b, pattern["name"], arm["line"], arm["col"])
+        } elif pattern["type"] == "Wildcard" {
+        } else {
+            comp_fail(pattern, "Invalid pattern in 'match'")
+            return
+        }
+        let guard_jump = null
+        if arm["guard"] != null {
+            comp_compile_expr(b, arm["guard"])
+            if cerr["message"] != "" {
+                return
+            }
+            guard_jump = comp_emit(b, "JUMP_IF_FALSE", null, arm["line"], arm["col"])
+        }
+        comp_emit(b, "POP", null, arm["line"], arm["col"])
+        comp_compile_expr(b, arm["body"])
+        if cerr["message"] != "" {
+            return
+        }
+        comp_exit_scope(b, arm["line"], arm["col"], true)
+        pop(b["slot_scopes"])
+        push(end_patches, comp_emit(b, "JUMP", null, arm["line"], arm["col"]))
+        let fail_stub = len(b["instrs"])
+        comp_emit(b, "EXIT_SCOPE", null, arm["line"], arm["col"])
+        if fail_jump != null {
+            comp_patch(b, fail_jump, fail_stub)
+        }
+        if guard_jump != null {
+            comp_patch(b, guard_jump, fail_stub)
+        }
+        i = i + 1
+    }
+    comp_emit(b, "MATCH_FAIL", null, expr["line"], expr["col"])
+    let end = len(b["instrs"])
+    let j = 0
+    while j < len(end_patches) {
+        comp_patch(b, end_patches[j], end)
+        j = j + 1
+    }
+}
+
+func comp_compile_program(program, filename, lines) {
+    let b = comp_new_builder("<main>", [], filename, lines, 0, program["statements"], false)
+    comp_compile_statements(b, program["statements"])
+    if cerr["message"] != "" {
+        return null
+    }
+    return comp_finish(b)
+}
+
+func comp_find_self_path() {
+    if file_exists("kabir/selfhost/compiler.kbr") {
+        return "kabir/selfhost/compiler.kbr"
+    }
+    if file_exists("selfhost/compiler.kbr") {
+        return "selfhost/compiler.kbr"
+    }
+    if file_exists("compiler.kbr") {
+        return "compiler.kbr"
+    }
+    return ""
+}
+
+let comp_self_path = comp_find_self_path()
+if comp_self_path == "" {
+    print("ERROR\tcannot find selfhost/compiler.kbr\t0\t0")
+} else {
+    let comp_content = read_file(comp_self_path)
+    brace_open = comp_content[2]
+    let source_path = input()
+    let source = read_file(source_path)
+    let lst = lex_new_state(source)
+    let toks = lex_tokenize(lst)
+    if lst["error"] != "" {
+        print("ERROR\t" + lst["error"] + "\t" + str(lst["err_line"]) + "\t" + str(lst["err_col"]))
+    } else {
+        let pst = new_state(toks)
+        let prog = parse_program(pst)
+        if pst["error"] != "" {
+            print("ERROR\t" + pst["error"] + "\t" + str(pst["err_line"]) + "\t" + str(pst["err_col"]))
+        } else {
+            let lines = source.split("\n")
+            let code = comp_compile_program(prog, source_path, lines)
+            if cerr["message"] != "" {
+                print("ERROR\t" + cerr["message"] + "\t" + str(cerr["line"]) + "\t" + str(cerr["col"]))
+            } else {
+                print(json_stringify(code))
+            }
+        }
+    }
+}

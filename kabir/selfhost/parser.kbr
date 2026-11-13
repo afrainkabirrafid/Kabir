@@ -1,0 +1,1055 @@
+# { anchor -- the open-brace character is character 2 of this file.
+# kabir/selfhost/parser.kbr -- the Kabir parser, written in Kabir itself.
+#
+# Reproduces kabir/parser.py exactly: same recursive-descent grammar,
+# same precedence (or -> and -> equality -> comparison -> additive ->
+# multiplicative -> power (right-assoc) -> unary -> postfix ->
+# primary), same AST shape. The AST is printed as one JSON object
+# (see kabir/selfhost.py for the canonical form): every node is a
+# dict with "type", "line", "col" first, then its fields in a fixed
+# order, so the Python parser's AST serializes to the same JSON.
+#
+# This program does NOT lex: it reads a token stream (the format
+# kabir/selfhost/lexer.kbr prints, as JSON -- see kabir/selfhost.py
+# tokens_to_json) from a file whose path is given on stdin (one
+# line), parses it, and prints the AST with json_stringify. On a
+# parse error a single line is printed instead:
+# ERROR<TAB><message><TAB><line><TAB><col>
+#
+# Kabir strings cannot contain a literal open brace (it always
+# starts interpolation), so the brace character is read from this
+# very file: it is character 2 of line 1 above. find_self_path
+# locates this file (run from the kabir/ directory, the repo root,
+# or from inside kabir/selfhost/).
+#
+# Usage: kabir run kabir/selfhost/parser.kbr, then type the path of the
+# token JSON file on stdin (one line).
+
+let brace_open = ""
+
+func in_list(arr, v) {
+    let i = 0
+    while i < len(arr) {
+        if arr[i] == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func starts_expression(tok) {
+    if tok == null {
+        return false
+    }
+    let kind = tok["kind"]
+    if kind == "IDENT" or kind == "NUMBER" or kind == "STRING" {
+        return true
+    }
+    if kind == "PUNCT" {
+        return tok["value"] == "(" or tok["value"] == "[" or tok["value"] == brace_open
+    }
+    if kind == "KEYWORD" {
+        return in_list(["func", "match", "true", "false", "null", "not"], tok["value"])
+    }
+    if kind == "OP" {
+        return tok["value"] == "-"
+    }
+    return false
+}
+
+func mk(t, line, col) {
+    let n = {"type": t, "line": line, "col": col}
+    return n
+}
+
+func binop(op, left, right, line, col) {
+    let node = mk("BinaryOp", line, col)
+    node["op"] = op
+    node["left"] = left
+    node["right"] = right
+    return node
+}
+
+func new_state(toks) {
+    let st = {"toks": toks, "pos": 0, "error": "", "err_line": 0, "err_col": 0}
+    return st
+}
+
+func fail(st, message, line, col) {
+    if st["error"] == "" {
+        st["error"] = message
+        st["err_line"] = line
+        st["err_col"] = col
+    }
+}
+
+func cur(st) {
+    return st["toks"][st["pos"]]
+}
+
+func peek_at(st, off) {
+    let i = st["pos"] + off
+    if i >= len(st["toks"]) {
+        return null
+    }
+    return st["toks"][i]
+}
+
+func advance(st) {
+    let tok = cur(st)
+    if tok["kind"] != "EOF" {
+        st["pos"] = st["pos"] + 1
+    }
+    return tok
+}
+
+func check(st, kind, value) {
+    let tok = cur(st)
+    if tok["kind"] != kind {
+        return false
+    }
+    if value == "" {
+        return true
+    }
+    return tok["value"] == value
+}
+
+func match_tok(st, kind, value) {
+    if check(st, kind, value) {
+        return advance(st)
+    }
+    return null
+}
+
+func expect(st, kind, value, what) {
+    if check(st, kind, value) {
+        return advance(st)
+    }
+    let tok = cur(st)
+    if tok["kind"] == "EOF" {
+        fail(st, "Expected " + what + " but reached the end of the file", tok["line"], tok["col"])
+    } else {
+        fail(st, "Expected " + what, tok["line"], tok["col"])
+    }
+    return null
+}
+
+func skip_newlines(st) {
+    while check(st, "NEWLINE", "") {
+        advance(st)
+    }
+}
+
+func skip_seps(st) {
+    while check(st, "NEWLINE", "") or check(st, "PUNCT", ";") {
+        advance(st)
+    }
+}
+
+func parse_program(st) {
+    let stmts = []
+    skip_seps(st)
+    while not check(st, "EOF", "") {
+        let stmt = parse_statement(st)
+        if stmt == null {
+            return null
+        }
+        push(stmts, stmt)
+        skip_seps(st)
+    }
+    let node = mk("Program", 1, 1)
+    node["statements"] = stmts
+    return node
+}
+
+func parse_block(st) {
+    let tok = expect(st, "PUNCT", brace_open, "open brace to start a block")
+    if tok == null {
+        return null
+    }
+    let stmts = []
+    skip_seps(st)
+    while not check(st, "PUNCT", "}") {
+        if check(st, "EOF", "") {
+            fail(st, "Expected close brace to close this block", tok["line"], tok["col"])
+            return null
+        }
+        let stmt = parse_statement(st)
+        if stmt == null {
+            return null
+        }
+        push(stmts, stmt)
+        skip_seps(st)
+    }
+    let close = advance(st)
+    let node = mk("Block", tok["line"], tok["col"])
+    node["end_line"] = close["line"]
+    node["statements"] = stmts
+    return node
+}
+
+func parse_statement(st) {
+    let tok = cur(st)
+    if check(st, "KEYWORD", "let") {
+        return parse_let(st)
+    }
+    if check(st, "KEYWORD", "func") {
+        return parse_func(st, false, null)
+    }
+    if check(st, "KEYWORD", "async") {
+        let atok = advance(st)
+        return parse_func(st, true, atok)
+    }
+    if check(st, "KEYWORD", "return") {
+        advance(st)
+        let value = null
+        if not (check(st, "NEWLINE", "") or check(st, "PUNCT", ";") or check(st, "PUNCT", "}") or check(st, "EOF", "")) {
+            value = parse_expression(st)
+            if st["error"] != "" {
+                return null
+            }
+        }
+        let node = mk("ReturnStmt", tok["line"], tok["col"])
+        node["value"] = value
+        return node
+    }
+    if check(st, "KEYWORD", "if") {
+        return parse_if(st)
+    }
+    if check(st, "KEYWORD", "while") {
+        advance(st)
+        let cond = parse_expression(st)
+        if cond == null {
+            return null
+        }
+        let body = parse_block(st)
+        if body == null {
+            return null
+        }
+        let node = mk("WhileStmt", tok["line"], tok["col"])
+        node["condition"] = cond
+        node["body"] = body
+        return node
+    }
+    if check(st, "KEYWORD", "for") {
+        return parse_for(st)
+    }
+    if check(st, "KEYWORD", "break") {
+        advance(st)
+        return mk("BreakStmt", tok["line"], tok["col"])
+    }
+    if check(st, "KEYWORD", "continue") {
+        advance(st)
+        return mk("ContinueStmt", tok["line"], tok["col"])
+    }
+    if check(st, "KEYWORD", "import") {
+        return parse_import(st)
+    }
+    if check(st, "PUNCT", brace_open) {
+        let nxt = peek_at(st, 1)
+        let nxt2 = peek_at(st, 2)
+        if nxt != null and nxt["kind"] == "STRING" and nxt2 != null and nxt2["kind"] == "PUNCT" and nxt2["value"] == ":" {
+            return parse_expr_or_assign(st)
+        }
+        return parse_block(st)
+    }
+    return parse_expr_or_assign(st)
+}
+
+func parse_import(st) {
+    let tok = advance(st)
+    let path_tok = expect(st, "STRING", "", "a file path in double quotes after import")
+    if path_tok == null {
+        return null
+    }
+    let parts = path_tok["value"]
+    if len(parts) != 1 or parts[0][0] != "lit" {
+        fail(st, "import paths must be plain strings, not interpolated ones", path_tok["line"], path_tok["col"])
+        return null
+    }
+    let path = parts[0][1]
+    if not path.ends_with(".kbr") {
+        fail(st, "import path must name a .kbr file", path_tok["line"], path_tok["col"])
+        return null
+    }
+    let node = mk("ImportStmt", tok["line"], tok["col"])
+    node["path"] = path
+    return node
+}
+
+func parse_type_ann(st) {
+    let borrow = null
+    if match_tok(st, "OP", "&") != null {
+        borrow = "shared"
+        if check(st, "IDENT", "mut") {
+            let nxt = peek_at(st, 1)
+            if nxt != null and nxt["kind"] == "IDENT" {
+                advance(st)
+                borrow = "mut"
+            }
+        }
+    }
+    let tok = expect(st, "IDENT", "", "a type name, like number")
+    if tok == null {
+        return null
+    }
+    let node = mk("TypeAnn", tok["line"], tok["col"])
+    node["name"] = tok["value"]
+    node["borrow"] = borrow
+    return node
+}
+
+func parse_let(st) {
+    let tok = advance(st)
+    let mutable = false
+    if check(st, "IDENT", "mut") {
+        let nxt = peek_at(st, 1)
+        if nxt != null and nxt["kind"] == "IDENT" {
+            advance(st)
+            mutable = true
+        }
+    }
+    let name_tok = expect(st, "IDENT", "", "a variable name after let")
+    if name_tok == null {
+        return null
+    }
+    let type_ann = null
+    if match_tok(st, "PUNCT", ":") != null {
+        type_ann = parse_type_ann(st)
+        if st["error"] != "" {
+            return null
+        }
+    }
+    let eq = expect(st, "OP", "=", "equals sign after the variable name in let")
+    if eq == null {
+        return null
+    }
+    let value = parse_expression(st)
+    if value == null {
+        return null
+    }
+    let node = mk("LetStmt", tok["line"], tok["col"])
+    node["name"] = name_tok["value"]
+    node["value"] = value
+    node["type_ann"] = type_ann
+    node["mutable"] = mutable
+    return node
+}
+
+func parse_func(st, is_async, async_tok) {
+    let tok = null
+    if async_tok != null {
+        tok = expect(st, "KEYWORD", "func", "func after async")
+        if tok == null {
+            return null
+        }
+    } else {
+        tok = advance(st)
+    }
+    let name = null
+    if check(st, "IDENT", "") {
+        let nt = advance(st)
+        name = nt["value"]
+    }
+    let open = expect(st, "PUNCT", "(", "open paren after the function name")
+    if open == null {
+        return null
+    }
+    let params = []
+    let param_types = []
+    if not check(st, "PUNCT", ")") {
+        while true {
+            let p = expect(st, "IDENT", "", "a parameter name")
+            if p == null {
+                return null
+            }
+            push(params, p["value"])
+            if match_tok(st, "PUNCT", ":") != null {
+                let pt = parse_type_ann(st)
+                if st["error"] != "" {
+                    return null
+                }
+                push(param_types, pt)
+            } else {
+                push(param_types, null)
+            }
+            if match_tok(st, "PUNCT", ",") == null {
+                break
+            }
+        }
+    }
+    let close = expect(st, "PUNCT", ")", "close paren after the parameter list")
+    if close == null {
+        return null
+    }
+    let return_type = null
+    if match_tok(st, "OP", "->") != null {
+        return_type = parse_type_ann(st)
+        if st["error"] != "" {
+            return null
+        }
+    }
+    let body = parse_block(st)
+    if body == null {
+        return null
+    }
+    let line = tok["line"]
+    let col = tok["col"]
+    if async_tok != null {
+        line = async_tok["line"]
+        col = async_tok["col"]
+    }
+    let node = mk("FuncDecl", line, col)
+    node["name"] = name
+    node["params"] = params
+    node["param_types"] = param_types
+    node["return_type"] = return_type
+    node["is_async"] = is_async
+    node["body"] = body
+    return node
+}
+
+func parse_match_expr(st) {
+    let tok = advance(st)
+    let scrut = parse_expression(st)
+    if scrut == null {
+        return null
+    }
+    let open = expect(st, "PUNCT", brace_open, "open brace after the value in match")
+    if open == null {
+        return null
+    }
+    let arms = []
+    skip_newlines(st)
+    if not check(st, "PUNCT", "}") {
+        while true {
+            let arm = parse_match_arm(st)
+            if arm == null {
+                return null
+            }
+            push(arms, arm)
+            skip_newlines(st)
+            if match_tok(st, "PUNCT", ",") == null {
+                break
+            }
+            skip_newlines(st)
+            if check(st, "PUNCT", "}") {
+                break
+            }
+        }
+    }
+    let close = expect(st, "PUNCT", "}", "close brace to close the match")
+    if close == null {
+        return null
+    }
+    let node = mk("MatchExpr", tok["line"], tok["col"])
+    node["scrutinee"] = scrut
+    node["arms"] = arms
+    return node
+}
+
+func parse_match_arm(st) {
+    let tok = cur(st)
+    let pattern = parse_pattern(st)
+    if pattern == null {
+        return null
+    }
+    let guard = null
+    if check(st, "KEYWORD", "if") {
+        advance(st)
+        guard = parse_expression(st)
+        if st["error"] != "" {
+            return null
+        }
+    }
+    let arrow = expect(st, "OP", "=>", "fat arrow after the pattern in a match arm")
+    if arrow == null {
+        return null
+    }
+    let body = parse_expression(st)
+    if body == null {
+        return null
+    }
+    let node = mk("MatchArm", tok["line"], tok["col"])
+    node["pattern"] = pattern
+    node["guard"] = guard
+    node["body"] = body
+    return node
+}
+
+func parse_pattern(st) {
+    let tok = cur(st)
+    if check(st, "IDENT", "") {
+        advance(st)
+        if tok["value"] == "_" {
+            return mk("Wildcard", tok["line"], tok["col"])
+        }
+        let node = mk("Var", tok["line"], tok["col"])
+        node["name"] = tok["value"]
+        return node
+    }
+    if check(st, "NUMBER", "") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = tok["value"]
+        return node
+    }
+    if check(st, "STRING", "") {
+        advance(st)
+        let parts = tok["value"]
+        if len(parts) != 1 or parts[0][0] != "lit" {
+            fail(st, "A match pattern must be a plain string, not an interpolated one", tok["line"], tok["col"])
+            return null
+        }
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = parts[0][1]
+        return node
+    }
+    if check(st, "KEYWORD", "true") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = true
+        return node
+    }
+    if check(st, "KEYWORD", "false") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = false
+        return node
+    }
+    if check(st, "KEYWORD", "null") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = null
+        return node
+    }
+    fail(st, "Expected a pattern in match -- a literal, a name, or underscore", tok["line"], tok["col"])
+    return null
+}
+
+func parse_if(st) {
+    let tok = advance(st)
+    let cond = parse_expression(st)
+    if cond == null {
+        return null
+    }
+    let body = parse_block(st)
+    if body == null {
+        return null
+    }
+    let branches = [[cond, body]]
+    let else_body = null
+    while true {
+        let save = st["pos"]
+        skip_newlines(st)
+        if check(st, "KEYWORD", "elif") {
+            advance(st)
+            let c = parse_expression(st)
+            if c == null {
+                return null
+            }
+            let b = parse_block(st)
+            if b == null {
+                return null
+            }
+            push(branches, [c, b])
+        } elif check(st, "KEYWORD", "else") {
+            advance(st)
+            else_body = parse_block(st)
+            if else_body == null {
+                return null
+            }
+            break
+        } else {
+            st["pos"] = save
+            break
+        }
+    }
+    let node = mk("IfStmt", tok["line"], tok["col"])
+    node["branches"] = branches
+    node["else_body"] = else_body
+    return node
+}
+
+func parse_for(st) {
+    let tok = advance(st)
+    let var_tok = expect(st, "IDENT", "", "a loop variable after for")
+    if var_tok == null {
+        return null
+    }
+    let in_tok = expect(st, "KEYWORD", "in", "in after the loop variable")
+    if in_tok == null {
+        return null
+    }
+    let iterable = parse_expression(st)
+    if iterable == null {
+        return null
+    }
+    let body = parse_block(st)
+    if body == null {
+        return null
+    }
+    let node = mk("ForStmt", tok["line"], tok["col"])
+    node["var"] = var_tok["value"]
+    node["iterable"] = iterable
+    node["body"] = body
+    return node
+}
+
+func parse_expr_or_assign(st) {
+    let tok = cur(st)
+    let expr = parse_expression(st)
+    if expr == null {
+        return null
+    }
+    if check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op == "=" or op == "+=" or op == "-=" {
+            advance(st)
+            if expr["type"] != "Var" and expr["type"] != "Index" {
+                fail(st, "Only a variable or an index can be assigned to", tok["line"], tok["col"])
+                return null
+            }
+            let value = parse_expression(st)
+            if value == null {
+                return null
+            }
+            let node = mk("AssignStmt", tok["line"], tok["col"])
+            node["target"] = expr
+            node["op"] = op
+            node["value"] = value
+            return node
+        }
+    }
+    let node = mk("ExprStmt", tok["line"], tok["col"])
+    node["expr"] = expr
+    return node
+}
+
+func parse_expression(st) {
+    return parse_or(st)
+}
+
+func parse_or(st) {
+    let left = parse_and(st)
+    if left == null {
+        return null
+    }
+    while check(st, "KEYWORD", "or") {
+        let tok = advance(st)
+        let right = parse_and(st)
+        if right == null {
+            return null
+        }
+        left = binop("or", left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_and(st) {
+    let left = parse_equality(st)
+    if left == null {
+        return null
+    }
+    while check(st, "KEYWORD", "and") {
+        let tok = advance(st)
+        let right = parse_equality(st)
+        if right == null {
+            return null
+        }
+        left = binop("and", left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_equality(st) {
+    let left = parse_comparison(st)
+    if left == null {
+        return null
+    }
+    while check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op != "==" and op != "!=" {
+            break
+        }
+        let tok = advance(st)
+        let right = parse_comparison(st)
+        if right == null {
+            return null
+        }
+        left = binop(op, left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_comparison(st) {
+    let left = parse_additive(st)
+    if left == null {
+        return null
+    }
+    while check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op != "<" and op != "<=" and op != ">" and op != ">=" {
+            break
+        }
+        let tok = advance(st)
+        let right = parse_additive(st)
+        if right == null {
+            return null
+        }
+        left = binop(op, left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_additive(st) {
+    let left = parse_multiplicative(st)
+    if left == null {
+        return null
+    }
+    while check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op != "+" and op != "-" {
+            break
+        }
+        let tok = advance(st)
+        let right = parse_multiplicative(st)
+        if right == null {
+            return null
+        }
+        left = binop(op, left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_multiplicative(st) {
+    let left = parse_unary(st)
+    if left == null {
+        return null
+    }
+    while check(st, "OP", "") {
+        let ctok = cur(st)
+        let op = ctok["value"]
+        if op != "*" and op != "/" and op != "%" {
+            break
+        }
+        let tok = advance(st)
+        let right = parse_unary(st)
+        if right == null {
+            return null
+        }
+        left = binop(op, left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_unary(st) {
+    let tok = cur(st)
+    if check(st, "KEYWORD", "await") {
+        advance(st)
+        let inner = parse_unary(st)
+        if inner == null {
+            return null
+        }
+        let node = mk("AwaitExpr", tok["line"], tok["col"])
+        node["expr"] = inner
+        return node
+    }
+    if check(st, "OP", "&") {
+        advance(st)
+        let mutable = false
+        if check(st, "IDENT", "mut") {
+            let nxt = peek_at(st, 1)
+            if nxt != null and starts_expression(nxt) {
+                advance(st)
+                mutable = true
+            }
+        }
+        let inner = parse_unary(st)
+        if inner == null {
+            return null
+        }
+        let node = mk("BorrowExpr", tok["line"], tok["col"])
+        node["expr"] = inner
+        node["mutable"] = mutable
+        return node
+    }
+    if check(st, "OP", "-") {
+        advance(st)
+        let inner = parse_unary(st)
+        if inner == null {
+            return null
+        }
+        let node = mk("UnaryOp", tok["line"], tok["col"])
+        node["op"] = "-"
+        node["operand"] = inner
+        return node
+    }
+    if check(st, "KEYWORD", "not") {
+        advance(st)
+        let inner = parse_unary(st)
+        if inner == null {
+            return null
+        }
+        let node = mk("UnaryOp", tok["line"], tok["col"])
+        node["op"] = "not"
+        node["operand"] = inner
+        return node
+    }
+    return parse_power(st)
+}
+
+func parse_power(st) {
+    let left = parse_postfix(st)
+    if left == null {
+        return null
+    }
+    if check(st, "OP", "**") {
+        let tok = advance(st)
+        let right = parse_unary(st)
+        if right == null {
+            return null
+        }
+        return binop("**", left, right, tok["line"], tok["col"])
+    }
+    return left
+}
+
+func parse_postfix(st) {
+    let expr = parse_primary(st)
+    if expr == null {
+        return null
+    }
+    while true {
+        if check(st, "PUNCT", "(") {
+            let tok = advance(st)
+            let args = []
+            skip_newlines(st)
+            if not check(st, "PUNCT", ")") {
+                while true {
+                    let arg = parse_expression(st)
+                    if arg == null {
+                        return null
+                    }
+                    push(args, arg)
+                    skip_newlines(st)
+                    if match_tok(st, "PUNCT", ",") == null {
+                        break
+                    }
+                    skip_newlines(st)
+                }
+            }
+            let close = expect(st, "PUNCT", ")", "close paren after the arguments")
+            if close == null {
+                return null
+            }
+            let node = mk("Call", tok["line"], tok["col"])
+            node["callee"] = expr
+            node["args"] = args
+            expr = node
+        } elif check(st, "PUNCT", "[") {
+            let tok = advance(st)
+            skip_newlines(st)
+            let index = parse_expression(st)
+            if index == null {
+                return null
+            }
+            skip_newlines(st)
+            let close = expect(st, "PUNCT", "]", "close bracket after the index")
+            if close == null {
+                return null
+            }
+            let node = mk("Index", tok["line"], tok["col"])
+            node["target"] = expr
+            node["index"] = index
+            expr = node
+        } elif check(st, "PUNCT", ".") {
+            let dot = advance(st)
+            let name_tok = expect(st, "IDENT", "", "a method name after dot")
+            if name_tok == null {
+                return null
+            }
+            let node = mk("Member", dot["line"], dot["col"])
+            node["object"] = expr
+            node["name"] = name_tok["value"]
+            expr = node
+        } else {
+            break
+        }
+    }
+    return expr
+}
+
+func parse_primary(st) {
+    let tok = cur(st)
+    if check(st, "NUMBER", "") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = tok["value"]
+        return node
+    }
+    if check(st, "STRING", "") {
+        advance(st)
+        let node = mk("StringLiteral", tok["line"], tok["col"])
+        node["parts"] = tok["value"]
+        return node
+    }
+    if check(st, "KEYWORD", "true") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = true
+        return node
+    }
+    if check(st, "KEYWORD", "false") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = false
+        return node
+    }
+    if check(st, "KEYWORD", "null") {
+        advance(st)
+        let node = mk("Literal", tok["line"], tok["col"])
+        node["value"] = null
+        return node
+    }
+    if check(st, "KEYWORD", "func") {
+        return parse_func(st, false, null)
+    }
+    if check(st, "KEYWORD", "async") {
+        let atok = advance(st)
+        return parse_func(st, true, atok)
+    }
+    if check(st, "KEYWORD", "match") {
+        return parse_match_expr(st)
+    }
+    if check(st, "IDENT", "") {
+        advance(st)
+        let node = mk("Var", tok["line"], tok["col"])
+        node["name"] = tok["value"]
+        return node
+    }
+    if check(st, "PUNCT", "(") {
+        advance(st)
+        skip_newlines(st)
+        let expr = parse_expression(st)
+        if expr == null {
+            return null
+        }
+        skip_newlines(st)
+        let close = expect(st, "PUNCT", ")", "close paren to close the parentheses")
+        if close == null {
+            return null
+        }
+        return expr
+    }
+    if check(st, "PUNCT", "[") {
+        advance(st)
+        let elements = []
+        skip_newlines(st)
+        if not check(st, "PUNCT", "]") {
+            while true {
+                let el = parse_expression(st)
+                if el == null {
+                    return null
+                }
+                push(elements, el)
+                skip_newlines(st)
+                if match_tok(st, "PUNCT", ",") == null {
+                    break
+                }
+                skip_newlines(st)
+            }
+        }
+        let close = expect(st, "PUNCT", "]", "close bracket to close the array")
+        if close == null {
+            return null
+        }
+        let node = mk("ArrayLiteral", tok["line"], tok["col"])
+        node["elements"] = elements
+        return node
+    }
+    if check(st, "PUNCT", brace_open) {
+        advance(st)
+        let pairs = []
+        skip_newlines(st)
+        if not check(st, "PUNCT", "}") {
+            while true {
+                let key_tok = cur(st)
+                if not check(st, "STRING", "") {
+                    fail(st, "Dict keys must be strings", key_tok["line"], key_tok["col"])
+                    return null
+                }
+                advance(st)
+                let parts = key_tok["value"]
+                if len(parts) != 1 or parts[0][0] != "lit" {
+                    fail(st, "Dict keys must be plain strings, not interpolated ones", key_tok["line"], key_tok["col"])
+                    return null
+                }
+                let key = parts[0][1]
+                let colon = expect(st, "PUNCT", ":", "colon after the dict key")
+                if colon == null {
+                    return null
+                }
+                let value = parse_expression(st)
+                if value == null {
+                    return null
+                }
+                push(pairs, [key, value])
+                skip_newlines(st)
+                if match_tok(st, "PUNCT", ",") == null {
+                    break
+                }
+                skip_newlines(st)
+            }
+        }
+        let close = expect(st, "PUNCT", "}", "close brace to close the dict")
+        if close == null {
+            return null
+        }
+        let node = mk("DictLiteral", tok["line"], tok["col"])
+        node["pairs"] = pairs
+        return node
+    }
+    if tok["kind"] == "EOF" {
+        fail(st, "Unexpected end of file -- an expression was expected here", tok["line"], tok["col"])
+        return null
+    }
+    fail(st, "Unexpected token -- an expression was expected here", tok["line"], tok["col"])
+    return null
+}
+
+func find_self_path() {
+    if file_exists("kabir/selfhost/parser.kbr") {
+        return "kabir/selfhost/parser.kbr"
+    }
+    if file_exists("selfhost/parser.kbr") {
+        return "selfhost/parser.kbr"
+    }
+    if file_exists("parser.kbr") {
+        return "parser.kbr"
+    }
+    return ""
+}
+
+let self_path = find_self_path()
+if self_path == "" {
+    print("ERROR\tcannot find selfhost/parser.kbr\t0\t0")
+} else {
+    let content = read_file(self_path)
+    brace_open = content[2]
+    let tokens_path = input()
+    let text = read_file(tokens_path)
+    let toks = json_parse(text)
+    let st = new_state(toks)
+    let prog = parse_program(st)
+    if st["error"] != "" {
+        print("ERROR\t" + st["error"] + "\t" + str(st["err_line"]) + "\t" + str(st["err_col"]))
+    } else {
+        print(json_stringify(prog))
+    }
+}

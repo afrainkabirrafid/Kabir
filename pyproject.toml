@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kabir-lang"
-version = "4.1.0"
+version = "5.0.0"
 description = "Kabir — a small, friendly programming language, built from scratch in Python."
 readme = "README.md"
 license = { text = "MIT" }
@@ -36,3 +36,6 @@ kabir = "kabir.cli:main"
 
 [tool.setuptools]
 packages = ["kabir"]
+
+[tool.setuptools.package-data]
+kabir = ["native/*", "selfhost/*"]

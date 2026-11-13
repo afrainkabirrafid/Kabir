@@ -170,6 +170,85 @@ class TestAddPublish(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("registry", err.lower())
 
+    def test_add_latest_via_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = _make_greet_registry(tmp)
+            # Add a newer version 1.1.0 to the same registry.
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                data = ('func greet(who) {\n'
+                        '    return "Hi, " + who + "!"\n'
+                        '}\n').encode("utf-8")
+                info = tarfile.TarInfo("greet.kbr")
+                info.size = len(data)
+                info.mtime = 0
+                tar.addfile(info, io.BytesIO(data))
+            blob = buf.getvalue()
+            (registry / "packages" / "greet-1.1.0.tar.gz").write_bytes(blob)
+            index = json.loads((registry / "index.json").read_text())
+            index["packages"]["greet"]["1.1.0"] = {
+                "url": "packages/greet-1.1.0.tar.gz",
+                "sha256": hashlib.sha256(blob).hexdigest()}
+            (registry / "index.json").write_text(
+                json.dumps(index, indent=2))
+            proj = Path(tmp) / "proj"
+            proj.mkdir()
+            (proj / "Kabir.toml").write_text(
+                '[package]\nname = "proj"\nversion = "0.1.0"\n')
+            code, out, err = _run_cli(
+                ["add", "greet@latest", str(proj)],
+                env={"KABIR_REGISTRY": str(registry)})
+            self.assertEqual(code, 0, err)
+            self.assertIn("Added greet 1.1.0", out)
+            self.assertTrue((proj / "vendor" / "greet" / "1.1.0"
+                             / "greet.kbr").is_file())
+            self.assertIn('greet = "1.1.0"',
+                          (proj / "Kabir.toml").read_text())
+
+    def test_publish_stages_registry_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "proj"
+            proj.mkdir()
+            (proj / "Kabir.toml").write_text(
+                '[package]\nname = "proj"\nversion = "0.1.0"\n')
+            (proj / "src").mkdir()
+            (proj / "src" / "main.kbr").write_text('print("hi")\n')
+            with mock.patch.dict(os.environ, {}, clear=True):
+                code, out, err = _run_cli(["publish", str(proj)])
+            self.assertEqual(code, 0, err)
+            self.assertIn("Published proj 0.1.0", out)
+            self.assertIn("Staged registry update", out)
+            self.assertIn("git clone", out)
+            self.assertIn("kabir-registry", out)
+            stage = proj / "target" / "registry-stage"
+            self.assertTrue((stage / "index.json").is_file())
+            self.assertTrue(
+                (stage / "packages" / "proj-0.1.0.tar.gz").is_file())
+            staged = json.loads((stage / "index.json").read_text())
+            self.assertIn("proj", staged["packages"])
+            self.assertIn("0.1.0", staged["packages"]["proj"])
+
+    def test_publish_stage_flag_and_bad_option(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "proj"
+            proj.mkdir()
+            (proj / "Kabir.toml").write_text(
+                '[package]\nname = "proj"\nversion = "0.1.0"\n')
+            (proj / "src").mkdir()
+            (proj / "src" / "main.kbr").write_text('print("hi")\n')
+            stage = Path(tmp) / "my-stage"
+            with mock.patch.dict(os.environ, {}, clear=True):
+                code, out, err = _run_cli(
+                    ["publish", str(proj), "--stage", str(stage)])
+            self.assertEqual(code, 0, err)
+            self.assertIn(str(stage), out)
+            self.assertTrue((stage / "index.json").is_file())
+            with mock.patch.dict(os.environ, {}, clear=True):
+                code, out, err = _run_cli(
+                    ["publish", str(proj), "--bogus"])
+            self.assertEqual(code, 2)
+            self.assertIn("unknown option", err)
+
     def test_add_and_publish_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             registry = _make_greet_registry(tmp)

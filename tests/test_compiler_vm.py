@@ -587,7 +587,7 @@ class TestExampleEquivalence(unittest.TestCase):
     def test_hello(self):
         self.assertEqual(self._compare("hello.kbr"),
                          "Hello, Rafid!\n"
-                         "Welcome to Kabir version 4.1.0.\n2 + 3 = 5\n")
+                         "Welcome to Kabir version 5.0.0.\n2 + 3 = 5\n")
 
     def test_fizzbuzz(self):
         out = self._compare("fizzbuzz.kbr")
