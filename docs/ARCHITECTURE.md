@@ -1,6 +1,6 @@
 # Kabir Architecture — how the compiler, VM, and interpreter work
 
-This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 4.1.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
+This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 5.0.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
 
 ## The big picture
 
@@ -53,7 +53,7 @@ source ──► Lexer ──► tokens ──► Parser ──► AST ──►
 - `kabir/lsp.py` — the language server (4.1.0, Wave 2): LSP over stdio, wired as `kabir lsp`. See §17.
 - `kabir/wasm.py` (~3,800 lines) — the WASM backend (4.1.0, Wave 3): direct WASM backend for the bytecode VM. See §18.
 - Async executor (4.1.0, Wave 1): cooperative scheduler + tasks/channels in `kabir/vm.py`. See §16.
-- `selfhost/lexer.kbr` — the Kabir lexer written in Kabir (4.1.0, Wave 4); bootstrap check passes exactly. See §19.
+- `kabir/selfhost/lexer.kbr` — the Kabir lexer written in Kabir (4.1.0, Wave 4); bootstrap check passes exactly. See §19.
 - `kabir/__init__.py` — version, author, and the public API (`Interpreter`, `parse`, `tokenize`, `KabirError`).
 - `kabir/__main__.py` — the `python -m kabir` entry point (calls `kabir.cli:main`).
 
@@ -553,14 +553,17 @@ are split by layer, mirroring this document:
 | `tests/test_checker.py` | The type checker: every rule, builtin/stdlib signatures, untyped code passes |
 | `tests/test_compiler_vm.py` | Compiler + VM: every example's output identical between VM and interpreter, closures, imports, match, bytecode round-trip, compile-time errors |
 | `tests/test_project.py` | `kabir new` scaffolding, manifest parsing, `kabir build` round-trip |
-| `tests/test_registry.py` | Registry: `add` (fetch, SHA-256, vendor, lockfile), `publish` (tarball, entry JSON), exact versions only |
+| `tests/test_registry.py` | Registry: `add` (fetch, SHA-256, vendor, lockfile), `publish` (tarball, entry JSON), exact versions only, `@latest`, transitive deps, staging |
+| `tests/test_native_cache.py` | Native cache (5.0.0): hit/miss, `--no-cache`, cache key, `rt.o` reuse, out-path copy, stale-entry handling (10 tests) |
+| `tests/test_vm_speed.py` | VM speed (5.0.0): closures, captured mutation, shadowing, non-leak, break/continue, bound methods (19 tests) |
+| `tests/test_cli_5_0.py` | CLI wiring for 5.0.0: `run --selfhost`, flag conflicts (5 tests) |
 | `tests/test_ownership.py` | Ownership-lite: `let mut` moves, use-after-move errors, revival on reassignment |
 | `tests/test_slots.py` | Slot compiler: code dict v2, `LOAD_SLOT`/`STORE_SLOT`, captured vars stay name-based, VM output equivalence |
 | `tests/test_native.py` | Native backend: transpile fragments, every builtin/method, match, recursion, JSON/file I/O/HTTP e2e, closure/import errors |
 | `tests/test_cli_2_0.py` | CLI wiring: type errors inside `kabir run`, `--interp`, `new`/`build`/project-dir/`.kbc` commands |
 | `tests/test_cli_3_0.py` | CLI wiring for 3.0.0: `run --native`, `build --native`, `add`, `publish` |
 | `tests/test_lsp.py` | LSP server (4.1.0 Wave 2): protocol framing, methods, diagnostics (31 tests) |
-| `tests/test_selfhost.py` | Self-host lexer bootstrap check (4.1.0 Wave 4): exact token-stream match (7 tests) |
+| `tests/test_selfhost.py` | Self-host bootstrap checks (5.0.0): lexer token-stream match, parser AST match, compiler bytecode match (18 tests) |
 | `tests/test_borrow.py` | Borrow checker (4.1.0 Wave 0): shared/mutable borrows, NLL-lite, annotations, limits (78 tests) |
 | `tests/test_async.py` | Async executor (4.1.0 Wave 1): async funcs, await, spawn, channels, deadlock (56 tests) |
 | `tests/test_wasm.py` | WASM backend (4.1.0 Wave 3): VM-vs-WASM parity under Node, build-time rejections (38 tests) |
@@ -579,7 +582,7 @@ There is no test framework dependency and no mocking — tests drive the real `I
 | Add `import` | A new statement type end-to-end (lexer keyword, AST node, parser rule, interpreter `_load_module` + module cache + file stack, compiler `IMPORT` + VM import handling), docs, tests in `tests/test_import.py` |
 | Add an operator | Lexer op tables, a parser precedence level, `binary_op()` in `semantics.py` (both runtimes change together), docs, tests |
 | Add a type-check rule | One rule in `checker.py`, tests in `tests/test_checker.py` |
-| Add a bytecode instruction | An emitter case in `compile.py`, a dispatch case in `vm.py` (`_loop`), docs in this file, tests in `tests/test_compiler_vm.py` |
+| Add a bytecode instruction | An emitter case in `compile.py`, a dispatch case in `vm.py` (`_run_task` — hot opcodes are inlined there, rare ones go through the handler table), docs in this file, tests in `tests/test_compiler_vm.py` |
 | Change the canonical style | The style rules in `kabir/formatter.py` (`_Printer`), docs in `docs/LANGUAGE.md` (Formatter section), tests in `tests/test_formatter.py` |
 | Change error wording | The message string where it is raised — rendering is centralised in `errors.py` |
 | Change number formatting | `format_value()` in `semantics.py` — it is the single formatting path for both runtimes |
@@ -627,10 +630,17 @@ Async/await touches the parser, AST, VM, built-ins, the interpreter's error path
 - **Partial.** Runtime errors (wrong types, bad index, division by zero, arity mismatch, undefined variable) trap the module (`unreachable`) instead of reporting a Kabir error message. Printing a function value prints `<function>` instead of `<function name>`.
 - **CLI.** `kabir build --target wasm [file|dir]` (wired in `cli.py`) writes `target/<name>.wasm` + `target/<name>.html`. 38 tests in `tests/test_wasm.py`, every parity test executing the real `.wasm` under Node v24.
 
-## 19. Self-hosting, step 1 (4.1.0 Wave 4)
+## 19. Self-hosting (5.0.0 — the compiler compiles itself)
 
-`selfhost/lexer.kbr` is the Kabir lexer written in Kabir itself, using file I/O from the 3.0.0 stdlib (`read_file`) plus string methods. It knows the full token set, including the 4.0.0 keywords (`async`, `await`) and the `&` borrow token.
+The lexer, parser, AND compiler are all written in Kabir itself: `kabir/selfhost/lexer.kbr`, `kabir/selfhost/parser.kbr` (1,052 lines, recursive descent, same precedence as `kabir/parser.py`), and `kabir/selfhost/compiler.kbr` (2,441 lines — it embeds the lexer and parser, then compiles the AST to code-dict v2 bytecode, mirroring `kabir/compile.py`: slot allocation, captured-name analysis, jump patching, `match` arms, `spawn`, `async`/`await` checks, break/continue scope unwinding). `kabir/selfhost/assemble_compiler.py` regenerates the embedded lexer/parser copies inside `compiler.kbr` (verified idempotent); `kabir/selfhost/README.md` documents the whole thing. `kabir/selfhost.py` is the bootstrap driver (canonical AST form both sides share: every node is `{"type", "line", "col", ...}` in fixed key order, compared byte-for-byte as JSON).
 
-- **Same token set as `kabir/lexer.py`:** keywords, identifiers, numbers, strings (escapes + interpolation markers), comments, operators.
-- **Bootstrap check (the proof).** Run the Kabir lexer via the Python VM over the full test corpus (every `.kbr` in the repo + the test fixtures) and compare token streams (kind/value/line/col) with the Python lexer. It matches **exactly**: 3,899 tokens, zero mismatches over all 11 `.kbr` files in the repo, including lexing itself — plus matching streams on borrow and async programs. 7 self-host tests + 17 lexer tests in `tests/test_selfhost.py` / `tests/test_lexer.py`.
-- **Scope.** The parser in Kabir was NOT written in this release — a half-written parser would be dead weight, so it stays a follow-up wave of its own. Full self-hosting is a multi-release project; 4.1.0 only starts it. Say so plainly.
+- **Bootstrap checks (the proof).** Parser: 41 grammar snippets + 11 error cases (both sides agree, including line numbers) + the full 13-file corpus, including `parser.kbr` parsing itself (~3.7 s). Compiler: 26 snippets + 6 error cases + all 11 examples + `lexer.kbr`, `parser.kbr`, and `compiler.kbr` compiling itself (~28 s) — bytecode byte-identical to `compile_source()`. Kabir-compiled bytecode is also executed in the VM in a run test, so it doesn't just match textually, it runs. 18 tests in `tests/test_selfhost.py`.
+- **CLI.** `kabir run --selfhost <file.kbr>` type-checks with the Python checker, compiles with the Kabir compiler, and runs the result on the VM (wired in `kabir/cli.py`, `run_file(use_selfhost=...)`).
+- **Scope.** The type checker and the VM are still Python-only. The Kabir compiler is much slower than Python's (self-compile ~28 s vs <1 s) — the known VM ceiling, not a correctness gap. `compiler.kbr`'s lexer/parser are copies refreshed by `assemble_compiler.py`, not imports (a Kabir `import` would execute the modules' top-level `input()`/`print()` main code).
+
+## 20. True speed and the real registry (5.0.0)
+
+- **VM (5.0.0).** Hot opcodes are handled directly in `_run_task` on integer opcodes (per-code-dict translation cached on the VM; code dicts are never mutated), with int fast paths for arithmetic/comparison, inlined truthiness for jumps, inlined `LOAD`/`STORE_SLOT`, single-walk `LOAD_VAR`, and inlined `CALL`/`RETURN`/`MAKE_FUNCTION`/`GET_MEMBER`/`FOR_ITER`. Rare opcodes still use the handler table. Frames share their closure env instead of allocating a fresh `Environment` per call when the body never defines a name into it (`_code_needs_env`, cached on the `VMFunction`). String methods are bound-method values (`_BoundStringMethod`) instead of per-access closures. Measured: fib(25) 3.23 s → 1.70 s, primes 2.12 s → 1.15 s, 1M loop 13.16 s → 6.34 s (see `~/workspace/kabir-benchmarks-5.0.0.md`).
+- **Scopeless blocks (5.0.0).** `compile_block` in `kabir/compile.py` skips `ENTER`/`EXIT_SCOPE` when the block directly defines no name — one fewer `Environment` per loop iteration. Semantics verified identical (shadowing, break/continue, compound assign, for-var and while-local non-leak).
+- **Native cache (5.0.0).** `kabir/codegen.py`: compiled binaries live in `~/.kabir/cache/native` (override `$KABIR_CACHE_DIR/native`) as `prog-<sha256>` + `.sha256` sidecar, with `rt-<hash>.o` compiled once per runtime+compiler and reused. The cache key is the generated C source + `rt.c` + `rt.h` + Kabir version + compiler identity — a source, runtime, or compiler change misses; `--no-cache` always recompiles. Binaries are written atomically and only trusted when the sidecar hash matches. Measured: repeat `kabir run --native` on fib(25) 1.44 s → 0.14 s wall clock; warm native compile 1.32 s → 0.10 s. First run on a fresh cache still costs ~1.4 s (one-time `rt.o` build).
+- **Registry (5.0.0).** `kabir/project.py`: `validate_index` (strict per-entry validation), `kabir add name@latest` (numeric semver max), transitive dependencies with diamond dedup and cycle safety, version-conflict errors, `description` in `[package]`, `publish` refusing non-exact or duplicate versions, and `stage_publish()` / `kabir publish [--stage DIR]` (re-reads and validates the staged index before returning). Index format and hosting model are documented in `docs/REGISTRY.md`; the live index repo does not exist yet. `add` vendors but does not yet wire packages into `import`.

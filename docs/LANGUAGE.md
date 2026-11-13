@@ -1,4 +1,4 @@
-# Kabir Language Reference — version 4.1.0
+# Kabir Language Reference — version 5.0.0
 
 This is the complete reference for the Kabir language. Every code block in this document is a real, runnable Kabir program, and every output block is the exact output it produces. Run any example with:
 
@@ -2274,17 +2274,19 @@ Not supported yet: `import`, dicts, string methods, closures, `input`, and the f
 
 Verified: `examples/fibonacci.kbr` and `examples/fizzbuzz.kbr` compile to `.wasm` and produce output byte-identical to the VM run (38 tests in `tests/test_wasm.py`).
 
-## Self-hosting, step 1 (the lexer)
+## Self-hosting (the compiler)
 
-4.1.0 starts self-hosting: the Kabir lexer is written in Kabir itself, in `selfhost/lexer.kbr`, using the 3.0.0 file I/O (`read_file`) and string methods. It produces the same token set as the Python lexer in `kabir/lexer.py`: keywords, identifiers, numbers, strings (escapes and interpolation markers), comments, and operators.
+5.0.0 completes self-hosting: the lexer, the parser, AND the compiler are all written in Kabir itself — `kabir/selfhost/lexer.kbr`, `kabir/selfhost/parser.kbr`, and `kabir/selfhost/compiler.kbr` (the compiler embeds the lexer and parser). The Python implementation stays as the bootstrap compiler.
 
-The proof it works is a **bootstrap check**: the Kabir lexer, run through the Python VM over the full test corpus (every `.kbr` in the repo plus the test fixtures), produces token streams — kind, value, line, column — identical to the Python lexer's. Verified: exact match over all 11 `.kbr` files in the repo (3,899 tokens, zero mismatches), including lexing itself; the lexer also matches on borrow programs (`&`, `&mut`) and async programs (`async`, `await`), whose keywords it knows.
+The proof it works is a **bootstrap check**: the Kabir parser, run through the Python VM over the full corpus (every `.kbr` in the repo plus the test fixtures), produces ASTs byte-identical to the Python parser's — 41 grammar snippets, 11 error cases (both sides agree, including line numbers), and all 13 `.kbr` files in the repo, including `parser.kbr` parsing itself. The Kabir compiler likewise produces bytecode byte-identical to `compile_source()` — 26 snippets, 6 error cases, all 11 examples, and `compiler.kbr` compiling itself (~28 s). Kabir-compiled bytecode also runs in the VM, not just matches textually.
 
-Full self-hosting (the whole compiler in Kabir) is a multi-release project — 4.1.0 only starts it, with the lexer. The parser in Kabir was not written in this release: a half-written parser would be dead weight, so it stays a follow-up wave of its own.
+Run a program with the Kabir compiler: `kabir run --selfhost <file.kbr>` — it type-checks with the Python checker, compiles with the Kabir compiler, and runs the result on the VM. The type checker and the VM are still Python-only, and the Kabir compiler is much slower than Python's, so `--selfhost` is a proof and a tool for working on the compiler, not the default path.
+
+The lexer alone was step 1 in 4.1.0; 5.0.0 finishes the compiler. What is still Python: the type checker (`kabir/checker.py`), the VM (`kabir/vm.py`), the native/WASM backends, and the LSP.
 
 ## What Kabir does not have (yet)
 
-To avoid surprises, the things people most often expect that are **not** in 4.1.0:
+To avoid surprises, the things people most often expect that are **not** in 5.0.0:
 
 - **Dot access on dicts** — write `user["name"]`, not `user.name`.
 - **`else` on loops, ternary `?:`** — none of these exist; `if`/`elif`/`else` covers the conditional ground.
