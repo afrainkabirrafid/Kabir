@@ -1,5 +1,14 @@
 # Kabir Changelog
 
+## 6.0.0 — 2026-11-14 — "The Breaking Clean-Up"
+
+The two breaking changes held since 4.1.0, taken together on the Commander's explicit "do all". **This release breaks existing programs** — see the migration note below.
+
+- **Immutable by default** — plain `let` is now immutable: reassigning a plain-`let` binding (`x = ...`, `x += ...`, `x -= ...`) is a compile-time error with a clear message ("declared with plain 'let', which is immutable; declare it with 'let mut x = ...' to make it mutable"). `let mut` stays the mutable form. Function parameters, `for` loop variables, and `match` bindings are immutable too (they were never `let mut`). The error surfaces at compile time on every checked path (`kabir run`, `kabir build`, `--native`, `--selfhost`, WASM); the REPL and `kabir run --interp` run without the checker and do not enforce it, as with all ownership rules before. Boundary, kept deliberately: index assignment (`a[i] = ...`) and `push`/`pop` mutate a value's CONTENTS, not the binding itself, so they still work on a plain `let` — only rebinding the name is forbidden.
+- **Read-only builtins borrow, they do not move** — `print`, `len`, `str`, `num`, `type`, `range`, `sqrt`, `pow`, `abs`, `keys`, `int`, `float` (and `input`), plus the read-only stdlib functions `choice` and `json_stringify`, now take a shared borrow of their arguments for the call: passing an owned array/dict to one of them no longer moves it, so `print(x)` then using `x` again compiles and runs. Everything else stays strict: assignment, user-function calls, and `return` still move, and the consuming/mutating builtins `push`, `pop`, and `send` still move. A user function that shadows a builtin name still moves, like any user function.
+- **Migration** — add `mut` to every binding you reassign (`let x = 0` ... `x = x + 1` becomes `let mut x = 0` ... `x = x + 1`). Code that only READS a value (including `print`/`len` on it) needs no change — in fact, code that used to work around the old `print`-moves rule (e.g. copying a value before printing it) can now drop the workaround. All bundled examples, docs, and the self-hosted compiler sources (`kabir/selfhost/*.kbr`, 113 `let` → `let mut` conversions plus 3 function bodies rewritten to stop assigning to parameters) were migrated in this release.
+- **Tests** — 921 tests in 5.0.0 + 21 new (read-only-borrow and immutable-by-default suites in `tests/test_ownership.py`, plus `tests/test_cli_6_0.py` for the CLI-level proof). The full suite passes.
+
 ## 5.0.0 — 2026-11-13 — "The Next Big Leap" (all three leaps)
 
 Commander Kakarot picked all three leaps for the next big release. No breaking change to existing programs.

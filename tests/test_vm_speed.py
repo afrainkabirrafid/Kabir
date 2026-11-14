@@ -88,7 +88,7 @@ print(add5(10))
     def test_closure_mutates_captured_variable(self):
         self.assert_vm_and_interp('''
 func make_counter() {
-    let n = 0
+    let mut n = 0
     func inc() {
         n = n + 1
         return n
@@ -116,7 +116,7 @@ print(fib(15))
         # Assigning a global from inside a function must still hit
         # the global -- a shared-env frame shares the globals env.
         self.assert_vm_and_interp('''
-let total = 0
+let mut total = 0
 func add_to_total(n) {
     total = total + n
 }
@@ -161,7 +161,7 @@ print(x)
 
     def test_break_continue_in_scopeless_blocks(self):
         self.assert_vm_and_interp('''
-let i = 0
+let mut i = 0
 while i < 5 {
     i = i + 1
     if i == 2 {
@@ -198,7 +198,7 @@ print(n)
 
     def test_while_loop_locals_do_not_leak(self):
         code, _out, err = run_vm('''
-let i = 0
+let mut i = 0
 while i < 2 {
     let temp = i * 10
     print(temp)

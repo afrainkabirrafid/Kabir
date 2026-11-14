@@ -25,10 +25,10 @@
 # Usage: kabir run kabir/selfhost/parser.kbr, then type the path of the
 # token JSON file on stdin (one line).
 
-let brace_open = ""
+let mut brace_open = ""
 
 func in_list(arr, v) {
-    let i = 0
+    let mut i = 0
     while i < len(arr) {
         if arr[i] == v {
             return true
@@ -203,7 +203,7 @@ func parse_statement(st) {
     }
     if check(st, "KEYWORD", "return") {
         advance(st)
-        let value = null
+        let mut value = null
         if not (check(st, "NEWLINE", "") or check(st, "PUNCT", ";") or check(st, "PUNCT", "}") or check(st, "EOF", "")) {
             value = parse_expression(st)
             if st["error"] != "" {
@@ -279,7 +279,7 @@ func parse_import(st) {
 }
 
 func parse_type_ann(st) {
-    let borrow = null
+    let mut borrow = null
     if match_tok(st, "OP", "&") != null {
         borrow = "shared"
         if check(st, "IDENT", "mut") {
@@ -302,7 +302,7 @@ func parse_type_ann(st) {
 
 func parse_let(st) {
     let tok = advance(st)
-    let mutable = false
+    let mut mutable = false
     if check(st, "IDENT", "mut") {
         let nxt = peek_at(st, 1)
         if nxt != null and nxt["kind"] == "IDENT" {
@@ -314,7 +314,7 @@ func parse_let(st) {
     if name_tok == null {
         return null
     }
-    let type_ann = null
+    let mut type_ann = null
     if match_tok(st, "PUNCT", ":") != null {
         type_ann = parse_type_ann(st)
         if st["error"] != "" {
@@ -338,7 +338,7 @@ func parse_let(st) {
 }
 
 func parse_func(st, is_async, async_tok) {
-    let tok = null
+    let mut tok = null
     if async_tok != null {
         tok = expect(st, "KEYWORD", "func", "func after async")
         if tok == null {
@@ -347,7 +347,7 @@ func parse_func(st, is_async, async_tok) {
     } else {
         tok = advance(st)
     }
-    let name = null
+    let mut name = null
     if check(st, "IDENT", "") {
         let nt = advance(st)
         name = nt["value"]
@@ -383,7 +383,7 @@ func parse_func(st, is_async, async_tok) {
     if close == null {
         return null
     }
-    let return_type = null
+    let mut return_type = null
     if match_tok(st, "OP", "->") != null {
         return_type = parse_type_ann(st)
         if st["error"] != "" {
@@ -394,8 +394,8 @@ func parse_func(st, is_async, async_tok) {
     if body == null {
         return null
     }
-    let line = tok["line"]
-    let col = tok["col"]
+    let mut line = tok["line"]
+    let mut col = tok["col"]
     if async_tok != null {
         line = async_tok["line"]
         col = async_tok["col"]
@@ -455,7 +455,7 @@ func parse_match_arm(st) {
     if pattern == null {
         return null
     }
-    let guard = null
+    let mut guard = null
     if check(st, "KEYWORD", "if") {
         advance(st)
         guard = parse_expression(st)
@@ -539,7 +539,7 @@ func parse_if(st) {
         return null
     }
     let branches = [[cond, body]]
-    let else_body = null
+    let mut else_body = null
     while true {
         let save = st["pos"]
         skip_newlines(st)
@@ -633,7 +633,7 @@ func parse_expression(st) {
 }
 
 func parse_or(st) {
-    let left = parse_and(st)
+    let mut left = parse_and(st)
     if left == null {
         return null
     }
@@ -649,7 +649,7 @@ func parse_or(st) {
 }
 
 func parse_and(st) {
-    let left = parse_equality(st)
+    let mut left = parse_equality(st)
     if left == null {
         return null
     }
@@ -665,7 +665,7 @@ func parse_and(st) {
 }
 
 func parse_equality(st) {
-    let left = parse_comparison(st)
+    let mut left = parse_comparison(st)
     if left == null {
         return null
     }
@@ -686,7 +686,7 @@ func parse_equality(st) {
 }
 
 func parse_comparison(st) {
-    let left = parse_additive(st)
+    let mut left = parse_additive(st)
     if left == null {
         return null
     }
@@ -707,7 +707,7 @@ func parse_comparison(st) {
 }
 
 func parse_additive(st) {
-    let left = parse_multiplicative(st)
+    let mut left = parse_multiplicative(st)
     if left == null {
         return null
     }
@@ -728,7 +728,7 @@ func parse_additive(st) {
 }
 
 func parse_multiplicative(st) {
-    let left = parse_unary(st)
+    let mut left = parse_unary(st)
     if left == null {
         return null
     }
@@ -762,7 +762,7 @@ func parse_unary(st) {
     }
     if check(st, "OP", "&") {
         advance(st)
-        let mutable = false
+        let mut mutable = false
         if check(st, "IDENT", "mut") {
             let nxt = peek_at(st, 1)
             if nxt != null and starts_expression(nxt) {
@@ -821,7 +821,7 @@ func parse_power(st) {
 }
 
 func parse_postfix(st) {
-    let expr = parse_primary(st)
+    let mut expr = parse_primary(st)
     if expr == null {
         return null
     }

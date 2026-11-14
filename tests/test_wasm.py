@@ -213,7 +213,7 @@ class TestWasmParity(unittest.TestCase):
 
     def test_while(self):
         self.assert_parity(
-            "let i = 0\n"
+            "let mut i = 0\n"
             "while i < 5 { print(i)\n i = i + 1 }\n"
         )
 
@@ -225,7 +225,7 @@ class TestWasmParity(unittest.TestCase):
 
     def test_loops_combined(self):
         self.assert_parity(
-            "let total = 0\n"
+            "let mut total = 0\n"
             "for i in range(10) { "
             "if i == 3 { continue } "
             "if i == 7 { break } "
@@ -275,9 +275,9 @@ class TestWasmParity(unittest.TestCase):
 
     def test_break_continue_while(self):
         self.assert_parity(
-            "let j = 0\n"
+            "let mut j = 0\n"
             "while j < 10 { if j == 3 { break } print(j)\n j = j + 1 }\n"
-            "let k = 0\n"
+            "let mut k = 0\n"
             "while k < 5 { k = k + 1\n"
             " if k == 2 { continue } print(k) }\n"
         )

@@ -30,9 +30,9 @@ while true {
     }
     # Find the operator: the first + - * / that is not a leading minus.
     # This accepts both "2 + 3" and "2+3".
-    let op = ""
-    let op_pos = -1
-    let i = 0
+    let mut op = ""
+    let mut op_pos = -1
+    let mut i = 0
     if len(line) > 0 and line[0] == "-" {
         i = 1
     }
@@ -50,8 +50,8 @@ while true {
         continue
     }
     # Collect the two operands, skipping any spaces.
-    let a_str = ""
-    let j = 0
+    let mut a_str = ""
+    let mut j = 0
     while j < op_pos {
         let ch = line[j]
         if ch != " " {
@@ -59,8 +59,8 @@ while true {
         }
         j = j + 1
     }
-    let b_str = ""
-    let k = op_pos + 1
+    let mut b_str = ""
+    let mut k = op_pos + 1
     while k < len(line) {
         let ch = line[k]
         if ch != " " {

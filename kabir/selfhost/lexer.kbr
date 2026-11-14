@@ -21,7 +21,7 @@
 # On a lex error a single line is printed instead:
 # ERROR<TAB><message><TAB><line><TAB><col>
 
-let brace_open = ""
+let mut brace_open = ""
 let keywords = [
     "let",
     "func",
@@ -48,12 +48,13 @@ let keywords = [
 let multi_ops = ["**", "==", "!=", "<=", ">=", "+=", "-=", "=>", "->"]
 
 func substr(s, a, b) {
-    if b > len(s) {
-        b = len(s)
+    let mut end = b
+    if end > len(s) {
+        end = len(s)
     }
-    let out = ""
-    let i = a
-    while i < b {
+    let mut out = ""
+    let mut i = a
+    while i < end {
         out = out + s[i]
         i = i + 1
     }
@@ -77,8 +78,8 @@ func is_space(ch) {
 }
 
 func strip(s) {
-    let a = 0
-    let b = len(s)
+    let mut a = 0
+    let mut b = len(s)
     while a < b and is_space(s[a]) {
         a = a + 1
     }
@@ -89,8 +90,8 @@ func strip(s) {
 }
 
 func esc(s) {
-    let out = ""
-    let i = 0
+    let mut out = ""
+    let mut i = 0
     while i < len(s) {
         let c = s[i]
         if c == "\\" {
@@ -112,7 +113,7 @@ func esc(s) {
 }
 
 func is_keyword(word) {
-    let i = 0
+    let mut i = 0
     while i < len(keywords) {
         if keywords[i] == word {
             return true
@@ -123,7 +124,7 @@ func is_keyword(word) {
 }
 
 func is_multi_op(op) {
-    let i = 0
+    let mut i = 0
     while i < len(multi_ops) {
         if multi_ops[i] == op {
             return true
@@ -191,7 +192,7 @@ func lex_number(st) {
     while st["pos"] < st["len"] and is_digit(peek(st, 0)) {
         advance(st)
     }
-    let is_float = false
+    let mut is_float = false
     if peek(st, 0) == "." and is_digit(peek(st, 1)) {
         is_float = true
         advance(st)
@@ -200,7 +201,7 @@ func lex_number(st) {
         }
     }
     let text = substr(st["src"], start, st["pos"])
-    let value = 0
+    let mut value = 0
     if is_float {
         value = float(text)
     } else {
@@ -219,7 +220,7 @@ func lex_ident(st) {
         advance(st)
     }
     let text = substr(st["src"], start, st["pos"])
-    let kind = "IDENT"
+    let mut kind = "IDENT"
     if is_keyword(text) {
         kind = "KEYWORD"
     }
@@ -236,7 +237,7 @@ func lex_string(st) {
     }
     advance(st)
     let parts = []
-    let buf = ""
+    let mut buf = ""
     while true {
         if st["pos"] >= st["len"] {
             fail(st, "Unterminated string", line, col)
@@ -278,8 +279,8 @@ func lex_string(st) {
             }
             advance(st)
             let expr_start = st["pos"]
-            let depth = 1
-            let in_str = false
+            let mut depth = 1
+            let mut in_str = false
             while st["pos"] < st["len"] and depth > 0 {
                 let c = peek(st, 0)
                 if in_str {
@@ -383,8 +384,8 @@ func num_text(v) {
 }
 
 func parts_text(parts) {
-    let out = ""
-    let i = 0
+    let mut out = ""
+    let mut i = 0
     while i < len(parts) {
         if i > 0 {
             out = out + "|"
@@ -402,7 +403,7 @@ func parts_text(parts) {
 
 func token_line(tok) {
     let kind = tok["kind"]
-    let value = ""
+    let mut value = ""
     if kind == "NUMBER" {
         if tok["is_float"] {
             value = "float:" + num_text(tok["value"])
@@ -444,7 +445,7 @@ if self_path == "" {
     if st["error"] != "" {
         print("ERROR\t" + st["error"] + "\t" + str(st["err_line"]) + "\t" + str(st["err_col"]))
     } else {
-        let i = 0
+        let mut i = 0
         while i < len(tokens) {
             print(token_line(tokens[i]))
             i = i + 1

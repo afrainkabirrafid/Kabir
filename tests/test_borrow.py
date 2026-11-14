@@ -289,10 +289,13 @@ class TestBorrowAndMove(unittest.TestCase):
                   "let r = &x\nlet y = f(x)\nprint(r)\n",
                   "Cannot move 'x' while it is borrowed")
 
-    def test_print_moves_owned_value_while_borrowed(self):
-        # Passing an owned value to any function moves it (3.0.0),
-        # so print(x) while x is borrowed is a move error.
-        check_err("let mut x = [1, 2]\nlet r = &x\nprint(x)\n"
+    def test_print_borrows_owned_value_while_borrowed(self):
+        # 6.0.0: `print` takes a shared borrow, not a move -- reading
+        # a shared-borrowed value is fine. A real move (assigning the
+        # value away) while borrowed is still an error.
+        check("let mut x = [1, 2]\nlet r = &x\nprint(x)\n"
+              "print(r)\n")
+        check_err("let mut x = [1, 2]\nlet r = &x\nlet y = x\n"
                   "print(r)\n",
                   "Cannot move 'x' while it is borrowed")
 
@@ -332,16 +335,17 @@ class TestBorrowHolders(unittest.TestCase):
                   "Cannot assign to 'x' while it is borrowed")
 
     def test_reassigning_holder_ends_borrow(self):
-        check("let mut x = [1]\nlet r = &x\nr = 5\nx = [9]\n"
+        # 6.0.0: reassigning the holder needs `let mut r`.
+        check("let mut x = [1]\nlet mut r = &x\nr = 5\nx = [9]\n"
               "print(x)\n")
 
     def test_reassigning_holder_to_new_borrow(self):
-        check("let mut x = [1]\nlet y = [2]\nlet r = &x\n"
+        check("let mut x = [1]\nlet y = [2]\nlet mut r = &x\n"
               "r = &y\nprint(r)\nx = [9]\n")
 
     def test_reassign_holder_to_array_holding_itself(self):
         # r = [r] still references the old borrow, so it stays live.
-        check_err("let mut x = [1]\nlet r = &x\nr = [r]\nx = [9]\n"
+        check_err("let mut x = [1]\nlet mut r = &x\nr = [r]\nx = [9]\n"
                   "print(r)\n",
                   "Cannot assign to 'x' while it is borrowed")
 

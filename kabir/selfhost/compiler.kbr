@@ -18,7 +18,7 @@
 # starts interpolation), so the brace character is read from this
 # very file: it is character 2 of line 1 above.
 
-let brace_open = ""
+let mut brace_open = ""
 let keywords = [
     "let",
     "func",
@@ -45,12 +45,13 @@ let keywords = [
 let multi_ops = ["**", "==", "!=", "<=", ">=", "+=", "-=", "=>", "->"]
 
 func substr(s, a, b) {
-    if b > len(s) {
-        b = len(s)
+    let mut end = b
+    if end > len(s) {
+        end = len(s)
     }
-    let out = ""
-    let i = a
-    while i < b {
+    let mut out = ""
+    let mut i = a
+    while i < end {
         out = out + s[i]
         i = i + 1
     }
@@ -74,8 +75,8 @@ func is_space(ch) {
 }
 
 func strip(s) {
-    let a = 0
-    let b = len(s)
+    let mut a = 0
+    let mut b = len(s)
     while a < b and is_space(s[a]) {
         a = a + 1
     }
@@ -86,8 +87,8 @@ func strip(s) {
 }
 
 func esc(s) {
-    let out = ""
-    let i = 0
+    let mut out = ""
+    let mut i = 0
     while i < len(s) {
         let c = s[i]
         if c == "\\" {
@@ -109,7 +110,7 @@ func esc(s) {
 }
 
 func is_keyword(word) {
-    let i = 0
+    let mut i = 0
     while i < len(keywords) {
         if keywords[i] == word {
             return true
@@ -120,7 +121,7 @@ func is_keyword(word) {
 }
 
 func is_multi_op(op) {
-    let i = 0
+    let mut i = 0
     while i < len(multi_ops) {
         if multi_ops[i] == op {
             return true
@@ -188,7 +189,7 @@ func lex_number(st) {
     while st["pos"] < st["len"] and is_digit(lex_peek(st, 0)) {
         lex_advance(st)
     }
-    let is_float = false
+    let mut is_float = false
     if lex_peek(st, 0) == "." and is_digit(lex_peek(st, 1)) {
         is_float = true
         lex_advance(st)
@@ -197,7 +198,7 @@ func lex_number(st) {
         }
     }
     let text = substr(st["src"], start, st["pos"])
-    let value = 0
+    let mut value = 0
     if is_float {
         value = float(text)
     } else {
@@ -216,7 +217,7 @@ func lex_ident(st) {
         lex_advance(st)
     }
     let text = substr(st["src"], start, st["pos"])
-    let kind = "IDENT"
+    let mut kind = "IDENT"
     if is_keyword(text) {
         kind = "KEYWORD"
     }
@@ -233,7 +234,7 @@ func lex_string(st) {
     }
     lex_advance(st)
     let parts = []
-    let buf = ""
+    let mut buf = ""
     while true {
         if st["pos"] >= st["len"] {
             lex_fail(st, "Unterminated string", line, col)
@@ -275,8 +276,8 @@ func lex_string(st) {
             }
             lex_advance(st)
             let expr_start = st["pos"]
-            let depth = 1
-            let in_str = false
+            let mut depth = 1
+            let mut in_str = false
             while st["pos"] < st["len"] and depth > 0 {
                 let c = lex_peek(st, 0)
                 if in_str {
@@ -373,7 +374,7 @@ func lex_tokenize(st) {
 }
 
 func in_list(arr, v) {
-    let i = 0
+    let mut i = 0
     while i < len(arr) {
         if arr[i] == v {
             return true
@@ -548,7 +549,7 @@ func parse_statement(st) {
     }
     if check(st, "KEYWORD", "return") {
         advance(st)
-        let value = null
+        let mut value = null
         if not (check(st, "NEWLINE", "") or check(st, "PUNCT", ";") or check(st, "PUNCT", "}") or check(st, "EOF", "")) {
             value = parse_expression(st)
             if st["error"] != "" {
@@ -624,7 +625,7 @@ func parse_import(st) {
 }
 
 func parse_type_ann(st) {
-    let borrow = null
+    let mut borrow = null
     if match_tok(st, "OP", "&") != null {
         borrow = "shared"
         if check(st, "IDENT", "mut") {
@@ -647,7 +648,7 @@ func parse_type_ann(st) {
 
 func parse_let(st) {
     let tok = advance(st)
-    let mutable = false
+    let mut mutable = false
     if check(st, "IDENT", "mut") {
         let nxt = peek_at(st, 1)
         if nxt != null and nxt["kind"] == "IDENT" {
@@ -659,7 +660,7 @@ func parse_let(st) {
     if name_tok == null {
         return null
     }
-    let type_ann = null
+    let mut type_ann = null
     if match_tok(st, "PUNCT", ":") != null {
         type_ann = parse_type_ann(st)
         if st["error"] != "" {
@@ -683,7 +684,7 @@ func parse_let(st) {
 }
 
 func parse_func(st, is_async, async_tok) {
-    let tok = null
+    let mut tok = null
     if async_tok != null {
         tok = expect(st, "KEYWORD", "func", "func after async")
         if tok == null {
@@ -692,7 +693,7 @@ func parse_func(st, is_async, async_tok) {
     } else {
         tok = advance(st)
     }
-    let name = null
+    let mut name = null
     if check(st, "IDENT", "") {
         let nt = advance(st)
         name = nt["value"]
@@ -728,7 +729,7 @@ func parse_func(st, is_async, async_tok) {
     if close == null {
         return null
     }
-    let return_type = null
+    let mut return_type = null
     if match_tok(st, "OP", "->") != null {
         return_type = parse_type_ann(st)
         if st["error"] != "" {
@@ -739,8 +740,8 @@ func parse_func(st, is_async, async_tok) {
     if body == null {
         return null
     }
-    let line = tok["line"]
-    let col = tok["col"]
+    let mut line = tok["line"]
+    let mut col = tok["col"]
     if async_tok != null {
         line = async_tok["line"]
         col = async_tok["col"]
@@ -800,7 +801,7 @@ func parse_match_arm(st) {
     if pattern == null {
         return null
     }
-    let guard = null
+    let mut guard = null
     if check(st, "KEYWORD", "if") {
         advance(st)
         guard = parse_expression(st)
@@ -884,7 +885,7 @@ func parse_if(st) {
         return null
     }
     let branches = [[cond, body]]
-    let else_body = null
+    let mut else_body = null
     while true {
         let save = st["pos"]
         skip_newlines(st)
@@ -978,7 +979,7 @@ func parse_expression(st) {
 }
 
 func parse_or(st) {
-    let left = parse_and(st)
+    let mut left = parse_and(st)
     if left == null {
         return null
     }
@@ -994,7 +995,7 @@ func parse_or(st) {
 }
 
 func parse_and(st) {
-    let left = parse_equality(st)
+    let mut left = parse_equality(st)
     if left == null {
         return null
     }
@@ -1010,7 +1011,7 @@ func parse_and(st) {
 }
 
 func parse_equality(st) {
-    let left = parse_comparison(st)
+    let mut left = parse_comparison(st)
     if left == null {
         return null
     }
@@ -1031,7 +1032,7 @@ func parse_equality(st) {
 }
 
 func parse_comparison(st) {
-    let left = parse_additive(st)
+    let mut left = parse_additive(st)
     if left == null {
         return null
     }
@@ -1052,7 +1053,7 @@ func parse_comparison(st) {
 }
 
 func parse_additive(st) {
-    let left = parse_multiplicative(st)
+    let mut left = parse_multiplicative(st)
     if left == null {
         return null
     }
@@ -1073,7 +1074,7 @@ func parse_additive(st) {
 }
 
 func parse_multiplicative(st) {
-    let left = parse_unary(st)
+    let mut left = parse_unary(st)
     if left == null {
         return null
     }
@@ -1107,7 +1108,7 @@ func parse_unary(st) {
     }
     if check(st, "OP", "&") {
         advance(st)
-        let mutable = false
+        let mut mutable = false
         if check(st, "IDENT", "mut") {
             let nxt = peek_at(st, 1)
             if nxt != null and starts_expression(nxt) {
@@ -1166,7 +1167,7 @@ func parse_power(st) {
 }
 
 func parse_postfix(st) {
-    let expr = parse_primary(st)
+    let mut expr = parse_primary(st)
     if expr == null {
         return null
     }
@@ -1397,8 +1398,8 @@ func comp_fail_at(message, line, col) {
 }
 
 func comp_fail(node, message) {
-    let line = node["line"]
-    let col = node["col"]
+    let mut line = node["line"]
+    let mut col = node["col"]
     if line == null {
         line = 1
     }
@@ -1429,7 +1430,7 @@ func comp_children(node) {
     if t == "FuncDecl" {
         let out = [node["body"]]
         let pts = node["param_types"]
-        let i = 0
+        let mut i = 0
         while i < len(pts) {
             if pts[i] != null {
                 push(out, pts[i])
@@ -1450,7 +1451,7 @@ func comp_children(node) {
     if t == "IfStmt" {
         let out = []
         let branches = node["branches"]
-        let i = 0
+        let mut i = 0
         while i < len(branches) {
             push(out, branches[i][0])
             push(out, branches[i][1])
@@ -1473,7 +1474,7 @@ func comp_children(node) {
     if t == "DictLiteral" {
         let out = []
         let pairs = node["pairs"]
-        let i = 0
+        let mut i = 0
         while i < len(pairs) {
             push(out, pairs[i][1])
             i = i + 1
@@ -1492,7 +1493,7 @@ func comp_children(node) {
     if t == "Call" {
         let out = [node["callee"]]
         let args = node["args"]
-        let i = 0
+        let mut i = 0
         while i < len(args) {
             push(out, args[i])
             i = i + 1
@@ -1518,7 +1519,7 @@ func comp_children(node) {
     if t == "MatchExpr" {
         let out = [node["scrutinee"]]
         let arms = node["arms"]
-        let i = 0
+        let mut i = 0
         while i < len(arms) {
             push(out, arms[i])
             i = i + 1
@@ -1532,7 +1533,7 @@ func comp_reline(node, line, col) {
     node["line"] = line
     node["col"] = col
     let kids = comp_children(node)
-    let i = 0
+    let mut i = 0
     while i < len(kids) {
         comp_reline(kids[i], line, col)
         i = i + 1
@@ -1556,7 +1557,7 @@ func comp_parse_interp_stmts(text) {
 func comp_captured_names(statements, filename) {
     let captured = []
     let stack = []
-    let i = 0
+    let mut i = 0
     while i < len(statements) {
         push(stack, [statements[i], false])
         i = i + 1
@@ -1564,7 +1565,7 @@ func comp_captured_names(statements, filename) {
     while len(stack) > 0 {
         let item = pop(stack)
         let node = item[0]
-        let in_func = item[1]
+        let mut in_func = item[1]
         if node["type"] == "FuncDecl" {
             in_func = true
         }
@@ -1575,13 +1576,13 @@ func comp_captured_names(statements, filename) {
         }
         if in_func and node["type"] == "StringLiteral" {
             let parts = node["parts"]
-            let j = 0
+            let mut j = 0
             while j < len(parts) {
                 let part = parts[j]
                 if part[0] == "expr" {
                     let inner = comp_parse_interp_stmts(part[1])
                     if inner != null {
-                        let k = 0
+                        let mut k = 0
                         while k < len(inner) {
                             push(stack, [inner[k], true])
                             k = k + 1
@@ -1592,7 +1593,7 @@ func comp_captured_names(statements, filename) {
             }
         }
         let kids = comp_children(node)
-        let k = 0
+        let mut k = 0
         while k < len(kids) {
             push(stack, [kids[k], in_func])
             k = k + 1
@@ -1629,7 +1630,7 @@ func comp_new_builder(name, params, filename, lines, depth, statements, is_async
     }
     let scopes = b["slot_scopes"]
     let root_scope = scopes[0]
-    let i = 0
+    let mut i = 0
     while i < len(params) {
         let p = params[i]
         if not b["use_slots"] or in_list(b["captured"], p) {
@@ -1644,17 +1645,19 @@ func comp_new_builder(name, params, filename, lines, depth, statements, is_async
 }
 
 func comp_emit(b, op, arg, line, col) {
-    if line == null {
-        line = 1
+    let mut ln = line
+    let mut cl = col
+    if ln == null {
+        ln = 1
     }
-    if col == null {
-        col = 1
+    if cl == null {
+        cl = 1
     }
     push(b["instrs"], [op, arg])
-    push(b["instr_lines"], line)
-    push(b["instr_cols"], col)
-    b["last_line"] = line
-    b["last_col"] = col
+    push(b["instr_lines"], ln)
+    push(b["instr_cols"], cl)
+    b["last_line"] = ln
+    b["last_col"] = cl
     return len(b["instrs"]) - 1
 }
 
@@ -1677,7 +1680,7 @@ func comp_lookup_slot(b, name) {
         return null
     }
     let scopes = b["slot_scopes"]
-    let i = len(scopes) - 1
+    let mut i = len(scopes) - 1
     while i >= 0 {
         let scope = scopes[i]
         if in_list(keys(scope), name) {
@@ -1747,7 +1750,7 @@ func comp_exit_scope(b, line, col, track) {
 
 func comp_block_defines_names(block) {
     let stmts = block["statements"]
-    let i = 0
+    let mut i = 0
     while i < len(stmts) {
         let t = stmts[i]["type"]
         if t == "LetStmt" or t == "FuncDecl" or t == "ImportStmt" {
@@ -1771,7 +1774,7 @@ func comp_compile_block(b, block) {
         push(b["slot_scopes"], {})
     }
     let stmts = block["statements"]
-    let i = 0
+    let mut i = 0
     while i < len(stmts) {
         comp_compile_stmt(b, stmts[i])
         if cerr["message"] != "" {
@@ -1781,7 +1784,7 @@ func comp_compile_block(b, block) {
     }
     if has_defs {
         pop(b["slot_scopes"])
-        let end_line = block["line"]
+        let mut end_line = block["line"]
         if in_list(keys(block), "end_line") {
             end_line = block["end_line"]
         }
@@ -1790,7 +1793,7 @@ func comp_compile_block(b, block) {
 }
 
 func comp_compile_statements(b, statements) {
-    let i = 0
+    let mut i = 0
     while i < len(statements) {
         comp_compile_stmt(b, statements[i])
         if cerr["message"] != "" {
@@ -1939,7 +1942,7 @@ func comp_stmt_assign(b, stmt) {
 func comp_stmt_if(b, stmt) {
     let end_patches = []
     let branches = stmt["branches"]
-    let i = 0
+    let mut i = 0
     while i < len(branches) {
         let cond = branches[i][0]
         let body = branches[i][1]
@@ -1963,7 +1966,7 @@ func comp_stmt_if(b, stmt) {
         }
     }
     let end = len(b["instrs"])
-    let j = 0
+    let mut j = 0
     while j < len(end_patches) {
         comp_patch(b, end_patches[j], end)
         j = j + 1
@@ -1994,7 +1997,7 @@ func comp_stmt_while(b, stmt) {
     let end = len(b["instrs"])
     comp_patch(b, jump_false, end)
     let breaks = loop["breaks"]
-    let i = 0
+    let mut i = 0
     while i < len(breaks) {
         comp_patch(b, breaks[i], end)
         i = i + 1
@@ -2031,7 +2034,7 @@ func comp_stmt_for(b, stmt) {
     let end = len(b["instrs"])
     comp_patch(b, for_iter, end)
     let breaks = loop["breaks"]
-    let i = 0
+    let mut i = 0
     while i < len(breaks) {
         comp_patch(b, breaks[i], end)
         i = i + 1
@@ -2046,7 +2049,7 @@ func comp_jump_out_of_loop(b, stmt, kind) {
     let loops = b["loop_stack"]
     let loop = loops[len(loops) - 1]
     let n = b["scope_depth"] - loop["base"]
-    let i = 0
+    let mut i = 0
     while i < n {
         comp_emit(b, "EXIT_SCOPE", null, stmt["line"], stmt["col"])
         i = i + 1
@@ -2062,7 +2065,7 @@ func comp_jump_out_of_loop(b, stmt, kind) {
 }
 
 func comp_compile_function(b, node) {
-    let nm = node["name"]
+    let mut nm = node["name"]
     if nm == null {
         nm = "<anonymous>"
     }
@@ -2093,7 +2096,7 @@ func comp_compile_expr(b, expr) {
         comp_compile_expr(b, expr["expr"])
     } elif t == "ArrayLiteral" {
         let els = expr["elements"]
-        let i = 0
+        let mut i = 0
         while i < len(els) {
             comp_compile_expr(b, els[i])
             if cerr["message"] != "" {
@@ -2104,7 +2107,7 @@ func comp_compile_expr(b, expr) {
         comp_emit(b, "BUILD_LIST", len(els), expr["line"], expr["col"])
     } elif t == "DictLiteral" {
         let pairs = expr["pairs"]
-        let i = 0
+        let mut i = 0
         while i < len(pairs) {
             comp_emit(b, "LOAD_CONST", comp_add_const(b, pairs[i][0]), expr["line"], expr["col"])
             comp_compile_expr(b, pairs[i][1])
@@ -2204,8 +2207,8 @@ func comp_parse_interpolation(text, node, b) {
 
 func comp_expr_string(b, expr) {
     let parts = expr["parts"]
-    let all_lit = true
-    let i = 0
+    let mut all_lit = true
+    let mut i = 0
     while i < len(parts) {
         if parts[i][0] != "lit" {
             all_lit = false
@@ -2213,8 +2216,8 @@ func comp_expr_string(b, expr) {
         i = i + 1
     }
     if all_lit {
-        let text = ""
-        let j = 0
+        let mut text = ""
+        let mut j = 0
         while j < len(parts) {
             text = text + parts[j][1]
             j = j + 1
@@ -2222,7 +2225,7 @@ func comp_expr_string(b, expr) {
         comp_emit(b, "LOAD_CONST", comp_add_const(b, text), expr["line"], expr["col"])
         return
     }
-    let k = 0
+    let mut k = 0
     while k < len(parts) {
         if parts[k][0] == "lit" {
             comp_emit(b, "LOAD_CONST", comp_add_const(b, parts[k][1]), expr["line"], expr["col"])
@@ -2293,7 +2296,7 @@ func comp_expr_call(b, expr) {
                 return
             }
             let args = inner["args"]
-            let i = 0
+            let mut i = 0
             while i < len(args) {
                 comp_compile_expr(b, args[i])
                 if cerr["message"] != "" {
@@ -2318,7 +2321,7 @@ func comp_expr_call(b, expr) {
         return
     }
     let args = expr["args"]
-    let i = 0
+    let mut i = 0
     while i < len(args) {
         comp_compile_expr(b, args[i])
         if cerr["message"] != "" {
@@ -2336,12 +2339,12 @@ func comp_expr_match(b, expr) {
     }
     let end_patches = []
     let arms = expr["arms"]
-    let i = 0
+    let mut i = 0
     while i < len(arms) {
         let arm = arms[i]
         comp_enter_scope(b, arm["line"], arm["col"])
         push(b["slot_scopes"], {})
-        let fail_jump = null
+        let mut fail_jump = null
         let pattern = arm["pattern"]
         if pattern["type"] == "Literal" {
             comp_emit(b, "DUP", null, arm["line"], arm["col"])
@@ -2356,7 +2359,7 @@ func comp_expr_match(b, expr) {
             comp_fail(pattern, "Invalid pattern in 'match'")
             return
         }
-        let guard_jump = null
+        let mut guard_jump = null
         if arm["guard"] != null {
             comp_compile_expr(b, arm["guard"])
             if cerr["message"] != "" {
@@ -2384,7 +2387,7 @@ func comp_expr_match(b, expr) {
     }
     comp_emit(b, "MATCH_FAIL", null, expr["line"], expr["col"])
     let end = len(b["instrs"])
-    let j = 0
+    let mut j = 0
     while j < len(end_patches) {
         comp_patch(b, end_patches[j], end)
         j = j + 1

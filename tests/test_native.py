@@ -234,7 +234,7 @@ class TestNativeEndToEnd(NativeTestCase):
 
     def test_while_break_continue(self):
         self.assert_same_output(
-            "let i = 0\nlet out = []\n"
+            "let mut i = 0\nlet out = []\n"
             "while true {\n    i += 1\n"
             "    if i == 3 {\n        continue\n    }\n"
             "    if i > 5 {\n        break\n    }\n"
@@ -246,7 +246,7 @@ class TestNativeEndToEnd(NativeTestCase):
             "for ch in \"ab\" {\n    print(ch)\n}\n"
             "let d = {\"a\": 1, \"b\": 2}\n"
             "for k in d {\n    print(k)\n}\n"
-            "let total = 0\n"
+            "let mut total = 0\n"
             "for x in [1, 2, 3] {\n    total += x\n}\nprint(total)\n")
 
     def test_recursion_and_mutual_recursion(self):
@@ -385,8 +385,9 @@ class TestNativeEndToEnd(NativeTestCase):
             input_text="Rafid\n")
 
     def test_let_mut_is_runtime_noop(self):
-        # NB: passing a `let mut` array to a function MOVES it under
-        # the checker's rules, so the test keeps the last use last.
+        # NB: `let mut` is a runtime no-op (the checker owns
+        # mutability); passing the array to `print` borrows it
+        # since 6.0.0, so the last use stays last.
         self.assert_same_output(
             "let mut xs = [1, 2]\nxs[0] = 9\nprint(xs)\n"
             "let mut n = 5\nn = 6\nprint(n)\n")

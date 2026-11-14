@@ -4,5 +4,5 @@
 let name = "Rafid"
 let language = "Kabir"
 print("Hello, {name}!")
-print("Welcome to {language} version 5.0.0.")
+print("Welcome to {language} version 6.0.0.")
 print("2 + 3 = {2 + 3}")

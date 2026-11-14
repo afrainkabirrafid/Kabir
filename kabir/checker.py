@@ -31,12 +31,35 @@ not enforced there):
   conditional block or a nested function still marks the binding
   moved afterwards. Only a bare variable as the whole moved value
   moves it (``let y = x``, ``f(x)``, ``return x``); uses inside a
-  larger expression (``x[0]``, ``x + [1]``, ``len(x)`` is a call, so
-  it DOES move) do not -- except that passing ``x`` as a call
-  argument always moves it, including ``print(x)`` and ``len(x)``.
+  larger expression (``x[0]``, ``x + [1]``) do not -- except that
+  passing ``x`` as a call argument moves it. (In 3.0.0-5.0.0 that
+  included ``print(x)`` and ``len(x)``; since 6.0.0 read-only
+  builtins borrow instead -- see below.)
   A binding whose type is statically unknown ("any") is never
   tracked; an explicit ``: array`` / ``: dict`` annotation makes a
   ``let mut`` binding owned even when its value's type is unknown.
+
+6.0.0 changes (both breaking, ordered by the user -- "do all"):
+
+- Read-only builtins borrow, they do not move: ``print``, ``len``,
+  ``str``, ``num``, ``type``, ``range``, ``sqrt``, ``pow``, ``abs``,
+  ``keys``, ``int``, ``float`` (and ``input``), plus the read-only
+  stdlib functions ``choice`` and ``json_stringify``, take a SHARED
+  BORROW of their arguments for the duration of the call -- passing
+  an owned array/dict to one of them no longer moves it, so the
+  value stays usable afterwards. Everything else still moves:
+  assignment, user-function calls, ``return``, and the consuming /
+  mutating builtins ``push``, ``pop`` and ``send``.
+- Immutable by default: plain ``let`` is now immutable. Assigning
+  to a plain-``let`` binding (``x = ...``, ``x += ...``, ``x -= ...``)
+  is a compile-time error; ``let mut`` is the mutable form.
+  Function parameters, ``for`` loop variables, and ``match`` bindings
+  are immutable too (they were never ``let mut``). Index assignment
+  (``a[i] = ...``) and ``push``/``pop`` mutate a value's CONTENTS,
+  not the binding itself, so they are still allowed on a plain
+  ``let`` -- only rebinding the name is forbidden. The REPL and
+  ``kabir run --interp`` run without the checker, so they do not
+  enforce either rule (as with all ownership rules before).
 
 4.0.0 borrow checker (honest subset -- lifetime elision only, NO
 explicit ``'a`` lifetime parameters):
@@ -142,6 +165,22 @@ _STDLIB_RETURNS = {
     "now": "number",
     "sleep": "null",
 }
+
+# 6.0.0: read-only builtins / stdlib functions. These take a SHARED
+# BORROW of their arguments (for the call only) and never move an
+# owned value. Everything not listed here moves a bare owned variable
+# passed to it: user functions, `push` / `pop` (they mutate the
+# array in place), and `send` (the value goes into the channel).
+# `spawn` / `recv` / `chan` take no owned array/dict, so they behave
+# the same either way and stay on the moving path.
+_READ_ONLY_BUILTINS = frozenset((
+    "print", "input", "len", "str", "num", "type", "range",
+    "sqrt", "pow", "abs", "keys", "int", "float",
+))
+
+_READ_ONLY_STDLIB = frozenset((
+    "choice", "json_stringify",
+))
 
 # String methods: name -> (arg-type sets per position, return type).
 # An empty arg list means the method takes no arguments.
@@ -297,6 +336,12 @@ class _Checker:
         # mut_bindings: parallel to scopes, the names in each scope
         # declared with `let mut` (params are never in here).
         self.mut_bindings = [set()]
+        # binding_kinds: parallel to scopes, the origin of each
+        # binding in its scope -- "let", "param", "for", or "match".
+        # 6.0.0 immutable-by-default needs this so an assignment to
+        # a non-`mut` binding can say WHAT it is, not just that it
+        # is not mutable.
+        self.binding_kinds = [{}]
         # borrow_frames: one {"id", "borrows"} list per function
         # being checked (the first is the top level). A borrow never
         # leaves its function: entering a function pushes a fresh
@@ -331,15 +376,28 @@ class _Checker:
         self.func_scopes.append({})
         self.owned.append({})
         self.mut_bindings.append(set())
+        self.binding_kinds.append({})
 
     def _pop_scope(self):
         self.scopes.pop()
         self.func_scopes.pop()
         self.owned.pop()
         self.mut_bindings.pop()
+        self.binding_kinds.pop()
 
-    def _define(self, name, type_):
+    def _define(self, name, type_, kind="let"):
         self.scopes[-1][name] = type_
+        self.binding_kinds[-1][name] = kind
+
+    def _binding_kind(self, name):
+        """The origin ("let" / "param" / "for" / "match") of the
+        innermost binding of *name*, or None if it is not a known
+        binding at all (the runtime owns it)."""
+        for scope, kinds in zip(reversed(self.scopes),
+                                reversed(self.binding_kinds)):
+            if name in scope:
+                return kinds.get(name, "let")
+        return None
 
     def _lookup(self, name):
         for scope in reversed(self.scopes):
@@ -787,7 +845,41 @@ class _Checker:
             if effective in ("array", "dict"):
                 self.owned[-1][node.name] = True
 
+    def _immutable_msg(self, name):
+        """The 6.0.0 error for assigning to a non-`mut` binding,
+        naming what the binding is so the fix is obvious."""
+        kind = self._binding_kind(name)
+        if kind == "param":
+            return ("Cannot assign to '%s' -- function parameters are "
+                    "immutable; use a local 'let mut' binding instead"
+                    % name)
+        if kind == "for":
+            return ("Cannot assign to '%s' -- a 'for' loop variable "
+                    "is immutable; use a local 'let mut' binding "
+                    "instead" % name)
+        if kind == "match":
+            return ("Cannot assign to '%s' -- a 'match' binding is "
+                    "immutable; use a local 'let mut' binding instead"
+                    % name)
+        if kind == "func":
+            return ("Cannot assign to '%s' -- a function cannot be "
+                    "reassigned; use a 'let mut' binding instead"
+                    % name)
+        return ("Cannot assign to '%s' -- '%s' was declared with "
+                "plain 'let', which is immutable; declare it with "
+                "'let mut %s = ...' to make it mutable"
+                % (name, name, name))
+
     def _check_assign(self, node):
+        # 6.0.0 immutable by default: a plain `let` binding (and a
+        # function parameter, `for` variable, `match` binding, or
+        # function name -- none of which can be `let mut`) cannot be
+        # reassigned. A name the checker does not know is the
+        # runtime's business, not ours, so it is left alone.
+        if (isinstance(node.target, ast.Var)
+                and self._is_mut_binding(node.target.name) is False):
+            self._fail(node.target,
+                       self._immutable_msg(node.target.name))
         # A borrowed place cannot be written while the borrow is
         # live: no reassignment, no compound assignment, no element
         # write through it.
@@ -894,7 +986,7 @@ class _Checker:
             elem_type = "any"
         self._push_scope()
         try:
-            self._define(node.var, elem_type)
+            self._define(node.var, elem_type, kind="for")
             self._check_block(node.body)
         finally:
             self._pop_scope()
@@ -923,7 +1015,7 @@ class _Checker:
                 )
         if statement and node.name is not None:
             # Register before checking the body so recursion works.
-            self._define(node.name, "function")
+            self._define(node.name, "function", kind="func")
             self._record_func(node.name, param_types, return_type)
         self._push_scope()
         # A borrow never leaves its function: fresh borrow frame,
@@ -939,11 +1031,12 @@ class _Checker:
         })
         try:
             for name, type_ in zip(node.params, param_types):
-                self._define(name, type_ if type_ is not None else "any")
+                self._define(name, type_ if type_ is not None else "any",
+                             kind="param")
             # Any params beyond the annotation list (cannot happen
             # from the parser, but be safe) are untyped.
             for name in node.params[len(param_types):]:
-                self._define(name, "any")
+                self._define(name, "any", kind="param")
             self.return_stack.append(return_type)
             try:
                 self._check_statements(node.body.statements)
@@ -1188,9 +1281,19 @@ class _Checker:
                 "needs exclusive access to '%s'"
                 % (place, callee.name, place),
             )
-        # Passing a bare owned variable as an argument moves it.
-        for arg in node.args:
-            self._maybe_move(arg)
+        # Passing a bare owned variable as an argument moves it --
+        # except to a known read-only builtin / stdlib function
+        # (6.0.0): those take a shared borrow of their arguments for
+        # the call and never move. A user function that shadows a
+        # builtin name still moves, like any user function.
+        read_only = (
+            isinstance(callee, ast.Var)
+            and self._lookup_func(callee.name) is None
+            and (callee.name in _READ_ONLY_BUILTINS
+                 or callee.name in _READ_ONLY_STDLIB))
+        if not read_only:
+            for arg in node.args:
+                self._maybe_move(arg)
         callee = node.callee
         if isinstance(callee, ast.Var):
             name = callee.name
@@ -1262,7 +1365,8 @@ class _Checker:
                         )
                 elif isinstance(pattern, ast.Var):
                     # A binding arm binds the scrutinee's type.
-                    self._define(pattern.name, scrutinee_type)
+                    self._define(pattern.name, scrutinee_type,
+                                 kind="match")
                 # Wildcard: binds nothing.
                 if arm.guard is not None:
                     guard_type = self._check_expr(arm.guard)

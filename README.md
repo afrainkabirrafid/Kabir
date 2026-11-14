@@ -27,7 +27,7 @@ $ git clone https://github.com/afrainkabirrafid/kabir.git
 $ cd kabir
 $ python -m kabir run examples/hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 5.0.0.
+Welcome to Kabir version 6.0.0.
 2 + 3 = 5
 ```
 
@@ -42,7 +42,7 @@ let name = "Rafid"
 let language = "Kabir"
 
 print("Hello, {name}!")
-print("Welcome to {language} version 5.0.0.")
+print("Welcome to {language} version 6.0.0.")
 print("2 + 3 = {2 + 3}")
 ```
 
@@ -51,7 +51,7 @@ Run it:
 ```console
 $ python -m kabir run hello.kbr
 Hello, Rafid!
-Welcome to Kabir version 5.0.0.
+Welcome to Kabir version 6.0.0.
 2 + 3 = 5
 ```
 
@@ -71,7 +71,7 @@ All commands work both as `python -m kabir ...` (zero-install, from a fresh clon
 
 ```console
 $ python -m kabir --version
-kabir 5.0.0
+kabir 6.0.0
 ```
 
 ### The `kabir` command
@@ -80,7 +80,7 @@ The repository ships an executable launcher at `bin/kabir`:
 
 ```console
 $ ./bin/kabir --version
-kabir 5.0.0
+kabir 6.0.0
 $ ./bin/kabir run examples/fizzbuzz.kbr
 ```
 
@@ -90,7 +90,7 @@ It lives in `bin/` for a real reason: a repo-root file named `kabir` cannot coex
 
 ```console
 $ python -m kabir repl
-Kabir 5.0.0 -- type 'exit' or press Ctrl-D to leave.
+Kabir 6.0.0 -- type 'exit' or press Ctrl-D to leave.
 kabir> let x = 5
 kabir> x + 1
 6
@@ -311,11 +311,11 @@ Run them before sending a pull request (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Honest limits
 
-Kabir 5.0.0 is a small language, and it is honest about what it is not:
+Kabir 6.0.0 is a small language, and it is honest about what it is not:
 
 - **Native compilation is arena, not refcounting.** `kabir build --native` frees all values at exit; there is no per-value memory management yet, and closures and `import` are compile-time errors in native mode (the VM path supports both).
 - **The live registry index does not exist yet.** `kabir add` / `kabir publish` really work (see [docs/REGISTRY.md](docs/REGISTRY.md)) against any registry you point `KABIR_REGISTRY` at — a local directory or a URL — but the default URL still points at an index repo that has not been created yet, so `kabir add` against the default refuses with a clear error until it exists.
-- **Ownership is opt-in only.** Plain `let` never moves; `let mut` moves arrays/dicts, and passing one to `print`/`len` moves it too. Borrowing (`&` / `&mut`) is checked at compile time with NLL-lite liveness — but there is no dereference operator yet, so a borrowed value cannot be used in arithmetic or where the plain type is expected (see [docs/LANGUAGE.md](docs/LANGUAGE.md#borrowing---mut)).
+- **Ownership is strict by default.** Plain `let` is immutable -- reassigning it is a compile-time error, and `let mut` is the mutable form. `let mut` arrays/dicts move on assign, call, and return (use-after-move is a compile-time error), but read-only builtins (`print`, `len`, `str`, ...) borrow instead of moving, so `print(x)` no longer consumes `x`. Borrowing (`&` / `&mut`) is checked at compile time with NLL-lite liveness — but there is no dereference operator yet, so a borrowed value cannot be used in arithmetic or where the plain type is expected (see [docs/LANGUAGE.md](docs/LANGUAGE.md#borrowing---mut)).
 - **Async is VM-only.** `async`/`await` with tasks and channels runs on the bytecode VM; the native backend refuses async programs with a clear error, and the interpreter path does too (see [docs/LANGUAGE.md](docs/LANGUAGE.md#asyncawait--tasks-and-channels)).
 - **WASM is a subset.** `kabir build --target wasm` supports numbers, bools, strings, arrays, loops, functions, `match`, and core builtins — but not `import`, dicts, string methods, or closures (clear build-time errors), and runtime errors trap without a message (see [docs/LANGUAGE.md](docs/LANGUAGE.md#webassembly-target)).
 - **Self-hosting covers the compiler, not the checker or the VM.** The lexer, parser, and compiler are all written in Kabir itself in 5.0.0 (`kabir/selfhost/`), and `kabir run --selfhost` compiles with the Kabir compiler — but the type checker and the VM are still Python, and the Kabir compiler is much slower than Python's (self-compile takes ~28 s). See [docs/LANGUAGE.md](docs/LANGUAGE.md#self-hosting-the-compiler).
@@ -335,6 +335,7 @@ Roughly in order, and open to discussion:
 7. **Goes Native (3.0.0)** — a slot-based compiler, native compilation to C99 (`kabir build --native`, `kabir run --native`, arena memory), a GitHub-based package registry (`kabir add` / `kabir publish`), opt-in ownership (`let mut`), and a bigger standard library (file I/O, JSON, HTTP, time). — done in 3.0.0 (see [CHANGELOG.md](CHANGELOG.md))
 8. **Fearless & Everywhere (4.1.0)** — a borrow checker (`&` / `&mut`), async/await with tasks and channels, an LSP + VS Code extension, a WASM target, and self-hosting step 1 (the lexer in Kabir itself). — done in 4.1.0, together with item 7 (the combined 3.0.0 + 4.0.0 release; see [CHANGELOG.md](CHANGELOG.md)).
 9. **The Next Big Leap (5.0.0)** — the compiler compiles itself (parser + compiler written in Kabir, `kabir run --selfhost`), a package registry that really works (static JSON index on GitHub, `kabir add`/`publish` end-to-end), and true speed (VM ~1.9× faster, cached native compilation so repeat `run --native` is ~10× faster on the wall clock). — done in 5.0.0 (see [CHANGELOG.md](CHANGELOG.md)).
+10. **The Breaking Clean-Up (6.0.0)** — the two breaks held since 4.1.0: immutable by default (plain `let` can no longer be reassigned; `let mut` is the mutable form) and read-only builtins borrow instead of moving (`print(x)` no longer consumes `x`). — done in 6.0.0 (see [CHANGELOG.md](CHANGELOG.md)).
 
 Ideas and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

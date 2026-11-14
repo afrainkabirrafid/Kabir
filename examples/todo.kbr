@@ -11,7 +11,7 @@ func show_todos() {
     print("Your todos:")
     for i in range(len(todos)) {
         let t = todos[i]
-        let mark = "[x]"
+        let mut mark = "[x]"
         if not t["done"] {
             mark = "[ ]"
         }
@@ -28,14 +28,14 @@ while true {
     } elif line == "list" {
         show_todos()
     } elif len(line) >= 4 and line[0] == "a" and line[1] == "d" and line[2] == "d" and line[3] == " " {
-        let title = ""
+        let mut title = ""
         for i in range(4, len(line)) {
             title = title + line[i]
         }
         push(todos, {"title": title, "done": false})
         print("Added: {title}")
     } elif len(line) >= 5 and line[0] == "d" and line[1] == "o" and line[2] == "n" and line[3] == "e" and line[4] == " " {
-        let num_text = ""
+        let mut num_text = ""
         for i in range(5, len(line)) {
             num_text = num_text + line[i]
         }

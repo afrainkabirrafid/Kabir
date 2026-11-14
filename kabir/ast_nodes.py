@@ -33,8 +33,11 @@ class LetStmt(Node):
         self.value = value
         self.type_ann = type_ann  # TypeAnn or None
         # 3.0.0 ownership lite: True for `let mut x = ...`. Plain `let`
-        # stays mutable at runtime exactly as before; this flag only
-        # marks the binding for the checker's move tracking.
+        # stays mutable at runtime exactly as before (the interpreter
+        # and VM do not enforce mutability); this flag marks the
+        # binding for the checker's move tracking and, since 6.0.0,
+        # for its immutability rule (plain `let` cannot be
+        # reassigned -- that is a compile-time checker error).
         self.mutable = mutable
 
 

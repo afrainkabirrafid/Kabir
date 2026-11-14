@@ -1,4 +1,4 @@
-# Kabir Language Reference — version 5.0.0
+# Kabir Language Reference — version 6.0.0
 
 This is the complete reference for the Kabir language. Every code block in this document is a real, runnable Kabir program, and every output block is the exact output it produces. Run any example with:
 
@@ -2151,9 +2151,9 @@ Kabir has a GitHub-based package registry — no server. A registry is an `index
 
 `kabir add <name>@<version> [dir]` fetches the tarball, verifies its SHA-256, vendors it into `vendor/<name>/<version>/`, records the exact version in `[dependencies]` in `Kabir.toml`, and writes `Kabir.lock`. Versions must be exact — no ranges. `kabir publish [dir]` builds a deterministic tarball of your project (`target/<name>-<version>.tar.gz`), prints its SHA-256 and the registry-entry JSON to merge into the registry repo's `index.json`, and pushes nothing itself. The registry URL comes from the `KABIR_REGISTRY` environment variable; the built-in default points at a registry that does not exist yet, so `kabir add` refuses with a clear error until a real registry URL is set. Vendored packages are loaded with `import` by path and are ignored by git (`vendor/` is in the scaffold `.gitignore`).
 
-## Ownership-lite (`let mut`)
+## Ownership-lite (`let mut`) and immutable-by-default
 
-Ownership in Kabir is opt-in. Plain `let` is unchanged — mutable, never moved. `let mut` marks a value as owned:
+Since 6.0.0, plain `let` is **immutable**: reassigning it (`x = ...`, `x += ...`, `x -= ...`) is a compile-time error. `let mut` is the mutable form. Function parameters, `for` loop variables, and `match` bindings are immutable too. `let mut` also marks a value as owned:
 
 ```kabir
 let mut xs = [1, 2, 3]
@@ -2161,7 +2161,16 @@ let ys = xs        # moves xs into ys; xs is unusable after this
 print(ys)          # [1, 2, 3]
 ```
 
-Moving applies to arrays and dicts (Copy values — numbers, strings, bools, null — are never moved). A moved value used again is a compile-time error, and reassignment revives it (`xs = [9]` makes `xs` usable again). Passing an owned value as an argument moves it — including to `print` and `len`, which only read it; that strictness is deliberate for now, and may be relaxed for known read-only built-ins later. `let` stays mutable: the immutable-by-default break was **not** taken. `&` / `&mut` borrowing is in 4.1.0 — see [Borrowing](#borrowing---mut).
+Moving applies to arrays and dicts (Copy values — numbers, strings, bools, null — are never moved). A moved value used again is a compile-time error, and reassignment revives it (`xs = [9]` makes `xs` usable again). Passing an owned value as an argument moves it — **except** to a read-only builtin, which borrows it instead: `print(xs)`, `len(xs)`, `str(xs)`, and the other read-only builtins (`num`, `type`, `range`, `sqrt`, `pow`, `abs`, `keys`, `int`, `float`, `input`) and read-only stdlib functions (`choice`, `json_stringify`) take a shared borrow for the call, so the value stays usable afterwards. The consuming builtins `push`, `pop`, and `send` still move. `&` / `&mut` borrowing is in 4.1.0 — see [Borrowing](#borrowing---mut).
+
+```kabir
+let mut xs = [1, 2, 3]
+print(xs)          # borrows: xs stays usable
+print(len(xs))     # 3, xs still usable
+let ys = xs        # moves xs into ys; xs is unusable after this
+```
+
+One boundary to know: index assignment (`xs[0] = 9`) and `push`/`pop` mutate a value's *contents*, not the binding itself, so they still work on a plain `let` — only rebinding the name is forbidden. Migration for older programs: add `mut` to every binding you reassign.
 
 ## Borrowing (`&` / `&mut`)
 
@@ -2286,7 +2295,7 @@ The lexer alone was step 1 in 4.1.0; 5.0.0 finishes the compiler. What is still 
 
 ## What Kabir does not have (yet)
 
-To avoid surprises, the things people most often expect that are **not** in 5.0.0:
+To avoid surprises, the things people most often expect that are **not** in 6.0.0:
 
 - **Dot access on dicts** — write `user["name"]`, not `user.name`.
 - **`else` on loops, ternary `?:`** — none of these exist; `if`/`elif`/`else` covers the conditional ground.

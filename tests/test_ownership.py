@@ -1,9 +1,12 @@
 """Ownership lite tests (Kabir 3.0.0 Wave 3, design-doc section 3).
 
-`let mut` is opt-in only: plain `let` stays mutable and is never
-move-tracked. The checker enforces moves at compile time; the VM and
-the interpreter are unchanged, and the REPL runs without the checker,
-so use-after-move is not enforced there.
+6.0.0: plain `let` is immutable (reassigning it is a compile-time
+error -- see TestImmutableByDefault), and read-only builtins borrow
+instead of moving (see TestReadOnlyBuiltinsBorrow). What has NOT
+changed: `let mut` arrays/dicts still move on assign, call, and
+return; use-after-move is still a compile-time error; the VM and the
+interpreter are unchanged, and the REPL runs without the checker, so
+use-after-move is not enforced there.
 """
 
 import os
@@ -94,7 +97,7 @@ class TestMoveOnAssign(unittest.TestCase):
                   "used after move")
 
     def test_move_on_assign_stmt_then_use_errors(self):
-        check_err("let mut x = [1, 2]\nlet y = [0]\ny = x\nprint(x)\n",
+        check_err("let mut x = [1, 2]\nlet mut y = [0]\ny = x\nprint(x)\n",
                   "used after move")
 
     def test_move_then_use_in_expression_errors(self):
@@ -122,7 +125,13 @@ class TestMoveOnAssign(unittest.TestCase):
 
 class TestMoveOnCallAndReturn(unittest.TestCase):
     def test_move_on_call_arg_then_use_errors(self):
-        check_err("let mut x = [1, 2]\nprint(len(x))\nprint(x)\n",
+        # 6.0.0: `len` is read-only, so it borrows -- no move. A user
+        # function still moves, and so does `push` (it mutates).
+        check("let mut x = [1, 2]\nprint(len(x))\nprint(x)\n")
+        check_err("func f(a) { return a }\n"
+                  "let mut x = [1]\nlet y = f(x)\nprint(x)\n",
+                  "used after move")
+        check_err("let mut x = [1]\npush(x, 2)\nprint(x)\n",
                   "used after move")
 
     def test_move_on_user_function_arg_then_use_errors(self):
@@ -171,8 +180,102 @@ class TestPlainLetUnaffected(unittest.TestCase):
         check("func f(a) { return a }\n"
               'let d = {"k": 1}\nlet e = f(d)\nprint(d)\nprint(e)\n')
 
-    def test_plain_let_reassigned_freely(self):
-        check("let x = [1]\nx = [2]\nlet y = x\nprint(x)\n")
+    def test_plain_let_reassignment_is_an_error(self):
+        # 6.0.0 immutable by default: plain `let` cannot be
+        # reassigned; `let mut` is the mutable form.
+        check_err("let x = [1]\nx = [2]\n",
+                  "declared with plain 'let', which is immutable")
+        check("let mut x = [1]\nx = [2]\nlet y = x\nprint(y)\n")
+
+
+class TestReadOnlyBuiltinsBorrow(unittest.TestCase):
+    """6.0.0 (a): read-only builtins take a shared borrow, not a move."""
+
+    def test_print_then_reuse(self):
+        check("let mut x = [1, 2]\nprint(x)\nprint(x)\nlet y = x\n"
+              "print(y)\n")
+
+    def test_len_then_reuse(self):
+        check("let mut x = [1, 2]\nprint(len(x))\nprint(x)\n")
+
+    def test_read_only_builtins_then_reuse(self):
+        check("let mut x = [1, 2]\nlet n = len(x)\nlet s = str(x)\n"
+              "let t = type(x)\nlet k = keys({\"a\": 1})\n"
+              "print(x)\nprint(n)\nprint(s)\nprint(t)\nprint(k)\n")
+        check('let mut d = {"a": 1}\nlet ks = keys(d)\nprint(d)\n'
+              "print(ks)\n")
+        check("let mut xs = [3, 1]\nlet c = choice(xs)\nprint(xs)\n"
+              "print(c)\n")
+        check('let mut xs = [1]\nlet j = json_stringify(xs)\n'
+              "print(xs)\nprint(j)\n")
+
+    def test_read_only_builtin_inside_let_value(self):
+        # A borrow taken while computing a `let` value must not leak
+        # into the new binding: the value stays usable afterwards.
+        check("let mut x = [1, 2]\nlet n = len(x)\nlet y = x\n"
+              "print(y)\nprint(n)\n")
+
+    def test_mutating_builtins_still_move(self):
+        check_err("let mut x = [1]\npop(x)\nprint(x)\n",
+                  "used after move")
+        check_err("let mut x = [1]\npush(x, 2)\nprint(x)\n",
+                  "used after move")
+
+    def test_user_function_named_like_builtin_still_moves(self):
+        # A user function shadowing a builtin name is a user function:
+        # it moves, like any user function.
+        check_err("func len(a) { return a }\n"
+                  "let mut x = [1]\nlet y = len(x)\nprint(x)\n",
+                  "used after move")
+
+
+class TestImmutableByDefault(unittest.TestCase):
+    """6.0.0 (b): plain `let` is immutable; `let mut` is mutable."""
+
+    def test_plain_let_assign_errors(self):
+        check_err("let x = 5\nx = 6\n",
+                  "declared with plain 'let', which is immutable")
+        check_err("let x = 5\nx = 6\n",
+                  "let mut x = ...")
+
+    def test_plain_let_compound_assign_errors(self):
+        check_err("let x = 5\nx += 1\n",
+                  "declared with plain 'let', which is immutable")
+        check_err("let x = 5\nx -= 1\n",
+                  "declared with plain 'let', which is immutable")
+
+    def test_let_mut_assigns_freely(self):
+        check("let mut x = 5\nx = 6\nx += 1\nx -= 2\nprint(x)\n")
+        check("let mut s = \"a\"\ns = \"b\"\nprint(s)\n")
+
+    def test_param_assign_errors(self):
+        check_err("func f(a) { a = 5\nreturn a }\n",
+                  "function parameters are immutable")
+
+    def test_for_var_assign_errors(self):
+        check_err("for i in range(3) {\n i = 9\n}\n",
+                  "a 'for' loop variable is immutable")
+
+    def test_index_assignment_still_allowed(self):
+        # Index assignment mutates the value's contents, not the
+        # binding itself, so it stays allowed on a plain `let`.
+        check("let a = [1, 2]\na[0] = 9\nprint(a)\n")
+        check('let d = {"k": 1}\nd["k"] = 2\nprint(d)\n')
+
+    def test_push_on_plain_let_still_allowed(self):
+        # Same boundary: push/pop mutate contents, not the binding.
+        check("let a = [1]\npush(a, 2)\nprint(a)\n")
+        check("let a = [1, 2]\nprint(pop(a))\nprint(a)\n")
+
+    def test_shadowing_keeps_scopes_separate(self):
+        check("let x = 1\nif true {\nlet mut x = 2\nx = 3\n"
+              "print(x)\n}\nprint(x)\n")
+        check_err("let mut x = 1\nif true {\nlet x = 2\nx = 3\n}\n",
+                  "declared with plain 'let', which is immutable")
+
+    def test_unknown_name_assignment_untouched(self):
+        # A name the checker does not know is the runtime's business.
+        check("x = 5\n")
 
 
 class TestReassignmentRevives(unittest.TestCase):

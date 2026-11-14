@@ -35,7 +35,7 @@ class TestRunSelfhost(unittest.TestCase):
             ["run", "--selfhost", str(EXAMPLES / "hello.kbr")])
         self.assertEqual(code, 0, err)
         self.assertIn("Hello, Rafid!", out)
-        self.assertIn("Welcome to Kabir version 5.0.0.", out)
+        self.assertIn("Welcome to Kabir version 6.0.0.", out)
         self.assertIn("2 + 3 = 5", out)
 
     def test_run_selfhost_matches_plain_run(self):

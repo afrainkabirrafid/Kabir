@@ -1,6 +1,6 @@
 # Kabir Architecture — how the compiler, VM, and interpreter work
 
-This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 5.0.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
+This document is for anyone who wants to read, debug, or hack on Kabir's implementation. It describes the code as it actually is in version 6.0.0 — file by file, in the order a program flows through it. If this document and the code ever disagree, the code wins; please fix the document.
 
 ## The big picture
 
@@ -272,14 +272,16 @@ plain strings (`"number"`, `"string"`, `"bool"`, `"array"`, `"dict"`,
   type differs from the scrutinee's is an error; unknown type names in
   annotations are an error. `any` accepts everything in `let`, param,
   and return positions.
-- **Ownership-lite (3.0.0).** `let mut` marks a value as owned; the
-  checker moves arrays/dicts on assign, call argument, and return
-  (Copy values — numbers, strings, bools, null — never move), errors
-  on use-after-move, and revives a name on reassignment. Plain `let`
-  is untouched. `mut` is contextual, not a keyword, so `let mut = 1`
-  still parses as a variable named `mut`. Passing an owned value to
-  any function moves it — including `print`/`len`, which only read it;
-  that strictness is deliberate for now (see the LANGUAGE.md section).
+- **Ownership-lite (3.0.0) + immutable by default (6.0.0).** `let mut`
+  marks a value as owned; the checker moves arrays/dicts on assign,
+  call argument, and return (Copy values — numbers, strings, bools,
+  null — never move), errors on use-after-move, and revives a name on
+  reassignment. Since 6.0.0 plain `let` is immutable — reassigning it
+  (or a function parameter, `for` variable, or `match` binding) is a
+  compile-time error — and read-only builtins (`print`, `len`, ...)
+  borrow their arguments instead of moving them, while `push`/`pop`/
+  `send` still move. `mut` is contextual, not a keyword, so
+  `let mut = 1` still parses as a variable named `mut`.
 - **Type-only.** The checker never reports undefined variables, wrong
   argument counts, or anything that needs run-time knowledge — those
   stay runtime errors.
@@ -557,7 +559,8 @@ are split by layer, mirroring this document:
 | `tests/test_native_cache.py` | Native cache (5.0.0): hit/miss, `--no-cache`, cache key, `rt.o` reuse, out-path copy, stale-entry handling (10 tests) |
 | `tests/test_vm_speed.py` | VM speed (5.0.0): closures, captured mutation, shadowing, non-leak, break/continue, bound methods (19 tests) |
 | `tests/test_cli_5_0.py` | CLI wiring for 5.0.0: `run --selfhost`, flag conflicts (5 tests) |
-| `tests/test_ownership.py` | Ownership-lite: `let mut` moves, use-after-move errors, revival on reassignment |
+| `tests/test_cli_6_0.py` | CLI wiring for 6.0.0: `--version`, read-only builtins borrow, plain-`let` reassignment is a compile-time error (6 tests) |
+| `tests/test_ownership.py` | Ownership-lite: `let mut` moves, use-after-move errors, revival on reassignment; 6.0.0: read-only builtins borrow, plain `let` is immutable |
 | `tests/test_slots.py` | Slot compiler: code dict v2, `LOAD_SLOT`/`STORE_SLOT`, captured vars stay name-based, VM output equivalence |
 | `tests/test_native.py` | Native backend: transpile fragments, every builtin/method, match, recursion, JSON/file I/O/HTTP e2e, closure/import errors |
 | `tests/test_cli_2_0.py` | CLI wiring: type errors inside `kabir run`, `--interp`, `new`/`build`/project-dir/`.kbc` commands |

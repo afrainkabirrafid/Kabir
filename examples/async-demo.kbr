@@ -9,7 +9,7 @@
 # before exiting, so both finish before the program ends.
 
 async func producer(ch, start) {
-    let i = 0
+    let mut i = 0
     while i < 3 {
         send(ch, start + i)
         i = i + 1
@@ -23,7 +23,7 @@ async func add(a, b) {
 async func coordinator(ch) {
     let total = add(20, 22)
     let got = []
-    let i = 0
+    let mut i = 0
     while i < 3 {
         push(got, recv(ch))
         i = i + 1

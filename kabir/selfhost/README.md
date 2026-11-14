@@ -3,6 +3,13 @@
 Kabir compiles itself. The Python implementation in `kabir/` stays
 the bootstrap compiler; these files are the Kabir implementation.
 
+> 6.0.0 note: these sources were migrated for immutable-by-default —
+> every reassigned binding is now `let mut` (113 conversions), and
+> three function bodies (`substr` in `lexer.kbr` / `compiler.kbr`,
+> `comp_emit` in `compiler.kbr`) were rewritten to stop assigning to
+> parameters, which are immutable. The migration changes no bytecode:
+> the compiler ignores the `mut` marker.
+
 ## Files
 
 | File | What it is |
