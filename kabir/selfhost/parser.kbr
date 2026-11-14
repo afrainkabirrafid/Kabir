@@ -259,23 +259,49 @@ func parse_statement(st) {
 
 func parse_import(st) {
     let tok = advance(st)
-    let path_tok = expect(st, "STRING", "", "a file path in double quotes after import")
-    if path_tok == null {
-        return null
+    if check(st, "STRING", "") {
+        let path_tok = advance(st)
+        let parts = path_tok["value"]
+        if len(parts) != 1 or parts[0][0] != "lit" {
+            fail(st, "import paths must be plain strings, not interpolated ones", path_tok["line"], path_tok["col"])
+            return null
+        }
+        let path = parts[0][1]
+        if not path.ends_with(".kbr") {
+            fail(st, "import path must name a .kbr file", path_tok["line"], path_tok["col"])
+            return null
+        }
+        let node = mk("ImportStmt", tok["line"], tok["col"])
+        node["path"] = path
+        return node
     }
-    let parts = path_tok["value"]
-    if len(parts) != 1 or parts[0][0] != "lit" {
-        fail(st, "import paths must be plain strings, not interpolated ones", path_tok["line"], path_tok["col"])
-        return null
+    if check(st, "IDENT", "") {
+        # Bare-name package import: import greet (7.0.0, registry
+        # wiring -- resolved at run time by kabir/imports.py). A
+        # hyphenated name (import my-pkg) lexes as IDENT, OP(-),
+        # IDENT, so consume "-name" segments while they follow.
+        let first_tok = advance(st)
+        let mut name = first_tok["value"]
+        while check(st, "OP", "-") {
+            let nxt = peek_at(st, 1)
+            if nxt == null or nxt["kind"] != "IDENT" {
+                break
+            }
+            advance(st)
+            let part_tok = advance(st)
+            name = name + "-" + part_tok["value"]
+        }
+        let first = name[0]
+        if not ((first >= "a" and first <= "z") or (first >= "A" and first <= "Z")) {
+            fail(st, "Invalid package name", tok["line"], tok["col"])
+            return null
+        }
+        let node = mk("ImportStmt", tok["line"], tok["col"])
+        node["path"] = name
+        return node
     }
-    let path = parts[0][1]
-    if not path.ends_with(".kbr") {
-        fail(st, "import path must name a .kbr file", path_tok["line"], path_tok["col"])
-        return null
-    }
-    let node = mk("ImportStmt", tok["line"], tok["col"])
-    node["path"] = path
-    return node
+    fail(st, "Expected a file path in double quotes after 'import' -- like import \"helpers.kbr\" -- or a package name, like import greet", tok["line"], tok["col"])
+    return null
 }
 
 func parse_type_ann(st) {

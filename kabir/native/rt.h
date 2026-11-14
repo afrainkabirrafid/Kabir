@@ -36,6 +36,13 @@ typedef struct KFunc KFunc;
 
 typedef KVal (*KFnPtr)(KVal *args, int nargs);
 
+/* A captured variable lives in a heap cell (KCell); a slot (KSlot)
+ * points at the cell so the cell can be (re)created when the
+ * defining `let` / parameter / loop variable executes, while every
+ * closure that captured the slot keeps seeing the current cell. */
+typedef KVal *KCell;
+typedef KVal **KSlot;
+
 struct KArray {
     KVal *items;
     int len;
@@ -56,6 +63,17 @@ struct KFunc {
     int is_builtin;    /* 1 for builtins / string methods */
     int has_recv;      /* 1 for a bound string method */
     char *recv_str;    /* bound receiver string when has_recv */
+    /* Captured-variable environment (7.0.0 closures): an array of
+     * slots, one per free variable, in the order the transpiler
+     * lists them. A slot (KSlot = KVal **) points at a heap cell
+     * (KCell = KVal *) that holds the variable's current value, so
+     * a captured variable stays shared -- and mutable -- between
+     * the defining function and every closure that captured it,
+     * even after the defining function has returned. All slots and
+     * cells are arena-allocated and freed at exit with the rest.
+     * Plain (non-closure) functions have env == NULL, nenv == 0. */
+    KSlot *env;
+    int nenv;
 };
 
 struct KVal {
@@ -94,8 +112,18 @@ KVal k_strn(const char *s, size_t n);
 KVal k_new_array(void);
 KVal k_new_dict(void);
 KVal k_make_func(KFnPtr fn, const char *name, int arity);
+KVal k_make_closure(KFnPtr fn, const char *name, int arity,
+                    KSlot *env, int nenv);
 KVal k_make_builtin(KFnPtr fn, const char *name, int arity);
 KVal k_make_bound_method(const char *name, KVal recv);
+/* Captured-variable slots/cells (7.0.0 closures, arena-allocated). */
+KSlot k_new_slot(void);               /* slot with no cell yet */
+KCell k_new_cell(KVal v);             /* cell holding v */
+KVal k_slot_get(KSlot slot, const char *name);  /* error if no cell */
+void k_slot_set(KSlot slot, const char *name, KVal v); /* error if none */
+KVal k_env_get(int i, const char *name);        /* i-th capture */
+void k_env_set(int i, const char *name, KVal v);
+KSlot k_env_slot(int i);              /* i-th capture's slot itself */
 /* Array / string helpers used by generated code. */
 KVal k_array_of(int n, KVal *items);          /* copies items */
 KVal k_build_string(int n, const char **parts);

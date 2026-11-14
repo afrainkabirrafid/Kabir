@@ -403,10 +403,34 @@ the CLI runs `check_program` first, like the VM path.
   one. Everything labels the model "native (arena)".
 - **Functions.** Top-level and nested non-capturing functions are
   hoisted to C functions; recursion and mutual recursion between
-  top-level functions work; first-class function values work. A
-  static pre-pass rejects closures (a function reading a variable
-  bound in an enclosing function) and `import` with clear
-  compile-time errors — never silently wrong code.
+  top-level functions work; first-class function values work.
+- **Closures (7.0.0).** A function that reads a variable bound in
+  an enclosing function becomes `k_make_closure` carrying the
+  captured variables as arena slots (`KSlot`/`KCell` in `rt.h`):
+  each captured definition gets a slot, declared where its scope
+  is entered so every execution of the scope (each loop iteration,
+  each call) gets fresh slots, and `k_call` pushes the callee's
+  slots while it runs. A captured variable stays shared -- and
+  mutable through `let mut` -- between the defining function and
+  every closure that captured it, even after the defining function
+  returns. The static analysis (`_collect_node` /
+  `_analyze_function`) computes each function's free variables and
+  captured slots, and still rejects undefined variables at
+  transpile time. One known edge: a name bound in an enclosing
+  scope shadows a module global of the same name, as in the VM.
+- **Imports (7.0.0).** `import "path.kbr"` loads the module at
+  transpile time (`_load_module_tree`, relative to the importing
+  file, cycle + missing-file errors at the import statement). Each
+  imported module gets its own globals (`g_m<module>_k_<name>`)
+  and a guarded init function (`kabir_mod_<n>_init`) holding its
+  top-level code, called at every import point so the code runs
+  once, in execution order, even when the import sits inside a
+  function. Bindings are copied into the importer at each import
+  (globals at module top level, fresh locals elsewhere, like the
+  VM's cache-hit copy). Bare-name package imports (`import greet`)
+  are still out: the parser requires a `.kbr` path and the shared
+  package resolver (Leap 1) is not wired into native mode yet --
+  the seam is `_resolve_bare_import` in `kabir/codegen.py`.
 - **`if`/`elif` chains** compile to guarded flag blocks, because
   conditions need preparatory statements that cannot sit between a
   `}` and an `else if` in C.
@@ -562,7 +586,9 @@ are split by layer, mirroring this document:
 | `tests/test_cli_6_0.py` | CLI wiring for 6.0.0: `--version`, read-only builtins borrow, plain-`let` reassignment is a compile-time error (6 tests) |
 | `tests/test_ownership.py` | Ownership-lite: `let mut` moves, use-after-move errors, revival on reassignment; 6.0.0: read-only builtins borrow, plain `let` is immutable |
 | `tests/test_slots.py` | Slot compiler: code dict v2, `LOAD_SLOT`/`STORE_SLOT`, captured vars stay name-based, VM output equivalence |
-| `tests/test_native.py` | Native backend: transpile fragments, every builtin/method, match, recursion, JSON/file I/O/HTTP e2e, closure/import errors |
+| `tests/test_native.py` | Native backend: transpile fragments, every builtin/method, match, recursion, JSON/file I/O/HTTP e2e, missing-import error |
+| `tests/test_native_closures.py` | Native closures (7.0.0): capture, `let mut` mutation, returned/passed/stored closures, nesting, loop freshness, forward refs, shadowing (20 tests) |
+| `tests/test_native_import.py` | Native imports (7.0.0): nested/diamond/subdir imports, run-once, module mutation/closures, import in function, cycle/missing errors, `build --native` (15 tests) |
 | `tests/test_cli_2_0.py` | CLI wiring: type errors inside `kabir run`, `--interp`, `new`/`build`/project-dir/`.kbc` commands |
 | `tests/test_cli_3_0.py` | CLI wiring for 3.0.0: `run --native`, `build --native`, `add`, `publish` |
 | `tests/test_lsp.py` | LSP server (4.1.0 Wave 2): protocol framing, methods, diagnostics (31 tests) |
@@ -596,7 +622,7 @@ The borrow checker lives in the checker (`kabir/checker.py`), with parser and AS
 
 - **Syntax.** `&x` is a shared borrow, `&mut x` a mutable borrow. The lexer adds `&` as an `OP` token. The AST gains `BorrowExpr(expr, mutable)`. Type annotations may use borrow types: `&number`, `&mut array` (`TypeAnn.borrow`: None / `"shared"` / `"mut"`, plus a `full_name` property the LSP uses for hover text).
 - **Rules enforced** (checker only): (1) while a mutable borrow of a place is live, no other access to that place — read, write, or move; (2) while shared borrows of a place are live, no mutation or move of that place; (3) a borrowed place cannot be moved while borrowed; (4) a borrow ends at its last use — NLL-lite liveness from a last-use walk within a function body (a borrow whose holder is never used ends at once); (5) lifetime elision only — a function returning a borrow must have exactly one borrowed input, else a clear error; returning a borrow of a local is an error.
-- **Documented limits.** No explicit lifetime parameters (`'a`); borrows of `a[i]` are treated as borrowing the whole container; **no reborrowing** (borrowing a borrow-typed value errors); **no dereference operator** (a borrowed value can be printed, compared, indexed, passed on, or returned, but not used in arithmetic, method calls, or where the plain type is expected); no interprocedural tracking beyond signatures; tracked within one function body only; the REPL runs without the checker, so it does not enforce borrow rules.
+- **Documented limits (7.0.0).** Explicit lifetime parameters exist (`'a` on functions; see LANGUAGE.md). Borrows of `a[i]` are treated as borrowing the whole container. Reborrowing (`&mut *r`, `*s = ...`) and the dereference operator (`*r`, usable in arithmetic and anywhere the plain type is expected) both work, at zero runtime cost. A reborrow keeps its source borrow's lifetime (name-based approximation; its true lifetime is shorter). Write-through via a borrowed parameter of a Copy type does not reach the caller (the borrow is a copy at runtime). Nested functions cannot use an enclosing function's lifetimes. The self-host parser/compiler do not parse the new syntax yet (`kabir run --selfhost` on a deref/lifetime program fails). No interprocedural tracking beyond signatures; tracked within one function body only; the REPL runs without the checker, so it does not enforce borrow rules.
 - **Honesty rule.** Full NLL was never promised, only the honest subset above — and the subset is what shipped (78 tests in `tests/test_borrow.py`).
 
 ## 16. Async executor (4.1.0 Wave 1)

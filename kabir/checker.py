@@ -104,6 +104,47 @@ signatures (a function called with a borrowed place may mutate it
 through the alias); ``push``/``pop`` are the only builtins treated
 as mutating their array argument; last-use is flow-insensitive
 (a use inside a branch that never runs still extends the borrow).
+
+7.0.0 borrow checker complete (deref + reborrowing + lifetimes):
+
+- ``*r`` dereferences a borrow: the operand must be a borrow type
+  (``&T`` / ``&mut T``, with or without a lifetime) and the result
+  is the plain type ``T``. A deref is a compile-time no-op at
+  runtime (a borrow IS the value), so it costs nothing. Deref of a
+  non-borrow is a type error; deref of an unknown ("any") value
+  yields "any", as everywhere else.
+- Reborrowing: ``&mut *r`` re-borrows a mutable borrow and ``*s =
+  10`` writes through one. A reborrow registers a fresh borrow of
+  the same underlying place, with ``source`` set to the holder it
+  was reborrowed from; using that holder while the reborrow is
+  live is an error. Rules: a mutable reborrow needs a mutable
+  borrow (``&mut *r`` on a shared borrow is an error); a reborrow
+  is allowed only while every live borrow of the place is held by
+  the thing being reborrowed (so a second reborrow while one is
+  live is an error); reading through the original while a mutable
+  reborrow is live is an error; writing through a holder is
+  allowed only while every live borrow of the place is held by
+  that holder. A plain ``&r`` (no ``*``) is still an error --
+  reborrowing goes through ``*``.
+- Explicit lifetime parameters: ``func f<'a>(x: &'a number) ->
+  &'a number``. Lifetimes must be declared on the function before
+  use, must be used at least once, and must not be duplicated. A
+  returned ``&'a T`` needs a parameter carrying lifetime ``'a``
+  (same name); an elided ``-> &T`` keeps the old rule (exactly one
+  borrowed parameter). Inside a function body a value must carry
+  exactly the lifetime the return type (or annotation) requires --
+  a borrow with a different named lifetime, or with no lifetime
+  (an anonymous/local borrow), does not satisfy ``'a``. At a call
+  site lifetimes are generic: each argument instantiates the
+  callee's lifetime parameter, so a single argument of any
+  lifetime is accepted -- but when the callee requires the SAME
+  lifetime in two or more parameter positions, all arguments in
+  those positions must carry the same named lifetime (two
+  different named lifetimes is a compile-time error), and the
+  callee's return lifetime is instantiated to the lifetime the
+  arguments actually carried. A reborrow keeps its source
+  borrow's lifetime (a reborrow's true lifetime is shorter; the
+  checker is conservative about lifetimes, not about aliasing).
 """
 
 from . import ast_nodes as ast
@@ -363,6 +404,11 @@ class _Checker:
         # func_stack: one {"params", "borrow_params"} per function
         # being checked, for the return-a-borrow rules.
         self.func_stack = []
+        # lifetime_stack (7.0.0): one set of declared lifetime names
+        # per function being checked (parallel to func_stack). A
+        # lifetime in an annotation is only valid when it is in the
+        # innermost set; the top level declares none.
+        self.lifetime_stack = []
 
     # -- plumbing ------------------------------------------------------
 
@@ -466,17 +512,75 @@ class _Checker:
     # -- borrow checker (4.0.0) ---------------------------------------
 
     @staticmethod
-    def _types_compatible(expected, got):
+    def _split_borrow(type_):
+        """Split a borrow type string into (kind, lifetime, base), or
+        None when *type_* is not a borrow.
+
+        kind is "shared" or "mut", lifetime is a name like "a" or
+        None (elided), base is the plain type. ``"&'a mut array"``
+        -> ("mut", "a", "array"); ``"&number"`` -> ("shared", None,
+        "number"); ``"number"`` and ``"any"`` -> None."""
+        if type_ == "any" or not type_.startswith("&"):
+            return None
+        rest = type_[1:]
+        lifetime = None
+        if rest.startswith("'"):
+            space = rest.find(" ")
+            if space == -1:
+                return None  # malformed; the checker never builds one
+            lifetime = rest[1:space]
+            rest = rest[space + 1:]
+        if rest.startswith("mut "):
+            return ("mut", lifetime, rest[4:])
+        return ("shared", lifetime, rest)
+
+    @staticmethod
+    def _make_borrow(kind, lifetime, base):
+        """Rebuild a borrow type string from its parts (the inverse
+        of _split_borrow)."""
+        prefix = "&"
+        if lifetime is not None:
+            prefix += "'" + lifetime + " "
+        if kind == "mut":
+            prefix += "mut "
+        return prefix + base
+
+    @staticmethod
+    def _types_compatible(expected, got, strict_lifetimes=True):
         """True when a value of type *got* may be used where
         *expected* is wanted. Besides equality, ``&mut T`` coerces
-        to ``&T``; a borrow never coerces to the plain type."""
+        to ``&T``; a borrow never coerces to the plain type.
+
+        7.0.0 lifetimes: an elided borrow satisfies an elided
+        expectation, and a named lifetime satisfies the same name.
+        A named lifetime also satisfies an elided expectation (the
+        name is simply not demanded). An elided borrow does NOT
+        satisfy a named expectation -- an anonymous borrow's
+        lifetime is not known to be as long as ``'a`` -- and two
+        different named lifetimes are incompatible. That strictness
+        applies to annotations and returns; call-site arguments
+        instantiate the callee's lifetime parameters instead, so
+        _check_call passes strict_lifetimes=False and checks
+        lifetimes separately (see _check_call_lifetimes)."""
         if expected == got:
             return True
-        if (expected.startswith("&")
-                and not expected.startswith("&mut ")
-                and got.startswith("&mut ")):
-            return expected[1:] == got[5:]
-        return False
+        exp = _Checker._split_borrow(expected)
+        got_b = _Checker._split_borrow(got)
+        if exp is None or got_b is None:
+            return False
+        exp_kind, exp_life, exp_base = exp
+        got_kind, got_life, got_base = got_b
+        if exp_base != got_base:
+            return False
+        if got_kind == "mut" and exp_kind == "shared":
+            pass  # &mut T coerces to &T
+        elif got_kind != exp_kind:
+            return False
+        if not strict_lifetimes:
+            return True
+        if exp_life is None:
+            return True
+        return got_life == exp_life
 
     def _is_mut_binding(self, name):
         """True if the innermost binding of *name* was declared with
@@ -509,24 +613,57 @@ class _Checker:
         return [b for b in self.borrow_frames[-1]["borrows"]
                 if b["place"] == place]
 
-    def _register_borrow(self, node, place, kind):
+    def _register_borrow(self, node, place, kind, source=None,
+                         place_expr=None):
         """Record a new borrow of *place* ("shared" or "mut").
 
         It starts as a temporary, live only for the statement that
         created it; a `let` or assignment adopts it afterwards (see
-        _adopt_borrows), extending it to the holder's last use."""
+        _adopt_borrows), extending it to the holder's last use.
+        *source* (7.0.0) is the holder a reborrow was taken from
+        (``&mut *r`` records source "r"); plain borrows have None.
+        A use of the source while the reborrow is live is an error
+        (see _live_reborrow_of). *place_expr* is the borrowed place
+        expression itself (``x`` or ``a[0]``) -- a reborrow inherits
+        its source's, and a deref-write (`*s = 10`) resolves through
+        it to the ultimate place (see _check_deref_assign)."""
         frame = self.stmt_frames[-1] if self.stmt_frames else None
         record = {
             "place": place, "kind": kind, "holders": set(),
             "last_use": frame["index"] if frame is not None else 0,
             "owner": frame["id"] if frame is not None else 0,
             "bframe": self.borrow_frames[-1]["id"],
-            "seq": self._borrow_seq, "node": node,
+            "seq": self._borrow_seq, "node": node, "source": source,
+            "place_expr": place_expr,
         }
         self._borrow_seq += 1
         self.borrow_frames[-1]["borrows"].append(record)
         self._pending.append(record)
         return record
+
+    def _live_reborrow_of(self, holder):
+        """Live borrow records that reborrow *holder* (7.0.0) --
+        records whose source is *holder*. Using or reassigning
+        *holder* while one is live is an error."""
+        return [b for b in self.borrow_frames[-1]["borrows"]
+                if b.get("source") == holder]
+
+    def _borrow_record_of_holder(self, holder):
+        """The first live borrow record held by *holder* (7.0.0),
+        or None -- the case for a borrowed parameter, which has no
+        record here (its place lives in the caller)."""
+        for record in self.borrow_frames[-1]["borrows"]:
+            if holder in record["holders"]:
+                return record
+        return None
+
+    def _borrow_place_of_holder(self, holder):
+        """The place a borrow held by *holder* borrows (7.0.0), or
+        None when *holder* holds no live borrow record -- the case
+        for a borrowed parameter, whose place lives in the caller.
+        Callers fall back to the holder's own name as the place."""
+        record = self._borrow_record_of_holder(holder)
+        return record["place"] if record is not None else None
 
     def _adopt_borrows(self, mark, holder):
         """Adopt borrows created since sequence number *mark* (i.e.
@@ -626,11 +763,14 @@ class _Checker:
 
     def _check_borrow(self, node):
         """Check a `&x` / `&mut x` expression; return its type."""
+        if isinstance(node.expr, ast.DerefExpr):
+            # 7.0.0 reborrowing: `&mut *r` / `&*r`.
+            return self._check_reborrow(node)
         if isinstance(node.expr, ast.BorrowExpr):
             self._fail(
                 node,
                 "Cannot borrow a borrow -- borrow the variable "
-                "itself instead; reborrowing is not supported",
+                "itself instead, or reborrow it with '&mut *r'",
             )
         place = self._place_root(node.expr)
         if place is None:
@@ -644,8 +784,8 @@ class _Checker:
             self._fail(
                 node,
                 "Cannot borrow '%s' -- it already holds a borrow; "
-                "borrow the original variable instead; reborrowing "
-                "is not supported" % place,
+                "borrow the original variable instead, or reborrow "
+                "it with '&mut *%s'" % (place, place),
             )
         # Borrowing a moved value is a use after move.
         self._check_use(node, place)
@@ -683,8 +823,146 @@ class _Checker:
         else:
             borrow_type = "&" + value_type
         self._register_borrow(node, place,
-                              "mut" if node.mutable else "shared")
+                              "mut" if node.mutable else "shared",
+                              place_expr=node.expr)
         return borrow_type
+
+    def _check_reborrow(self, node):
+        """Check a `&mut *r` / `&*r` reborrow (7.0.0); return its type.
+
+        The operand of the deref must hold a borrow; a mutable
+        reborrow needs a mutable borrow. The reborrow borrows the
+        SAME underlying place as the source borrow, so every
+        existing conflict rule (no use of the place while mutably
+        borrowed, no move while borrowed) keeps working through
+        the new record. It is allowed only while every live borrow
+        of that place is held by the thing being reborrowed -- a
+        second reborrow while one is live is an error. The result
+        keeps the source borrow's lifetime (a reborrow's true
+        lifetime is shorter; see the module docstring)."""
+        holder = self._place_root(node.expr.operand)
+        borrow_type = self._check_expr(node.expr.operand)
+        if borrow_type == "any":
+            # Unknown value: permissive, like everywhere else. The
+            # deref itself still gets checked (it yields "any").
+            self._check_expr(node.expr)
+            if holder is not None:
+                self._register_borrow(
+                    node, holder, "mut" if node.mutable else "shared",
+                    source=holder,
+                    place_expr=node.expr.operand)
+            return "any"
+        split = self._split_borrow(borrow_type)
+        if split is None:
+            name = holder if holder is not None else "this value"
+            self._fail(
+                node,
+                "Cannot reborrow '%s' -- it is a %s, not a borrow; "
+                "reborrowing needs a '&T' or '&mut T' value"
+                % (name, borrow_type),
+            )
+        kind, lifetime, base = split
+        if node.mutable and kind == "shared":
+            self._fail(
+                node,
+                "Cannot reborrow '%s' as mutable -- it is a shared "
+                "borrow (&%s); only a mutable borrow (&mut %s) can "
+                "be reborrowed as mutable"
+                % (holder, base, base),
+            )
+        # The deref itself is a use of the holder: reading through
+        # it while a *different* live mutable borrow of the same
+        # place exists is an error (see _check_deref).
+        self._check_expr(node.expr)
+        # The underlying place: the place the source borrow borrows
+        # (a let-bound holder's record says so); a borrowed
+        # parameter has no record here, so the holder itself stands
+        # in as the place -- uses of it are then caught by the Var
+        # rule for a mutably-borrowed place. The place EXPRESSION
+        # is inherited the same way, so a deref-write resolves
+        # through the whole reborrow chain to the original place.
+        place = None
+        place_expr = None
+        if holder is not None:
+            source_record = self._borrow_record_of_holder(holder)
+            if source_record is not None:
+                place = source_record["place"]
+                place_expr = source_record.get("place_expr")
+            else:
+                place = holder
+                place_expr = node.expr.operand
+        if place is not None:
+            for record in self._live_borrows(place):
+                if holder not in record["holders"]:
+                    others = sorted(record["holders"])
+                    detail = (" held by '%s'" % others[0]) if others \
+                        else ""
+                    self._fail(
+                        node,
+                        "Cannot reborrow '%s' -- '%s' is already "
+                        "borrowed%s; that borrow must end first"
+                        % (holder, place, detail),
+                    )
+        borrow_type = self._make_borrow(
+            "mut" if node.mutable else "shared", lifetime, base)
+        if place is not None:
+            self._register_borrow(
+                node, place, "mut" if node.mutable else "shared",
+                source=holder, place_expr=place_expr)
+        return borrow_type
+
+    def _check_deref(self, node):
+        """Check a `*r` dereference (7.0.0); return the plain type.
+
+        The operand must be a borrow type; the result is the plain
+        type it borrows. Reading through a borrow while a live
+        MUTABLE borrow of the same place is held by someone else
+        (a reborrow of it) is an error; shared borrows never block
+        a read.
+
+        The read is resolved to the place the borrow actually
+        borrows (``node.resolved``): at runtime a borrow IS the
+        value, so for Copy values the holder is only a copy -- after
+        `*s = 10`, reading the holder `s` would give the stale 5,
+        while the place holds 10. The runtimes read the resolved
+        place instead; a holder with no live borrow record (a
+        borrowed parameter, or one reassigned away from borrowing)
+        resolves to itself."""
+        operand_type = self._check_expr(node.operand)
+        if operand_type == "any":
+            return "any"
+        split = self._split_borrow(operand_type)
+        if split is None:
+            self._fail(
+                node,
+                "Cannot dereference a %s -- '*' only works on a "
+                "borrow (&T or &mut T); dereference the borrow "
+                "itself, or use the original value"
+                % operand_type,
+            )
+        _kind, _lifetime, base = split
+        holder = self._place_root(node.operand)
+        if holder is not None:
+            place = self._borrow_place_of_holder(holder) or holder
+            for record in self._live_borrows(place):
+                if (record["kind"] == "mut"
+                        and holder not in record["holders"]):
+                    others = sorted(record["holders"])
+                    detail = (" held by '%s'" % others[0]) if others \
+                        else ""
+                    self._fail(
+                        node,
+                        "Cannot read through '%s' while it is "
+                        "mutably reborrowed%s -- the reborrow must "
+                        "end first" % (holder, detail),
+                    )
+            record = self._borrow_record_of_holder(holder)
+            if (record is not None
+                    and record.get("place_expr") is not None):
+                node.resolved = record["place_expr"]
+            else:
+                node.resolved = node.operand
+        return base
 
     def _check_returnable_borrow(self, record, node):
         """Error if a borrow of a local is returned from a function.
@@ -717,20 +995,36 @@ class _Checker:
                 "before using it again" % name,
             )
 
-    def _validate_ann(self, ann):
+    def _validate_ann(self, ann, allowed=None):
         """Return the type string for a TypeAnn, or error if unknown.
 
         Borrow annotations keep their prefix: `&number` -> "&number",
-        `&mut array` -> "&mut array"."""
+        `&mut array` -> "&mut array", `&'a number` -> "&'a number".
+        7.0.0: a lifetime in the annotation must be declared on the
+        enclosing function. *allowed* is that function's declared
+        set; when None it is the innermost lifetime_stack entry (or
+        the empty set at the top level, where no lifetime is valid)."""
         if ann is None:
             return None
         if ann.name not in VALID_TYPES:
             self._fail(ann, UNKNOWN_TYPE_MSG % ann.name)
+        if ann.lifetime is not None:
+            if allowed is None:
+                allowed = (self.lifetime_stack[-1]
+                           if self.lifetime_stack else set())
+            if ann.lifetime not in allowed:
+                self._fail(
+                    ann,
+                    "Lifetime '%s' is not declared here -- declare "
+                    "it on the function, like func f<'%s>(...)"
+                    % (ann.lifetime, ann.lifetime),
+                )
         return ann.full_name
 
-    def _ann_types(self, anns):
+    def _ann_types(self, anns, allowed=None):
         """Validate a list of TypeAnn-or-None, keeping None entries."""
-        return [self._validate_ann(a) for a in (anns or [])]
+        return [self._validate_ann(a, allowed=allowed)
+                for a in (anns or [])]
 
     # -- entry point ---------------------------------------------------
 
@@ -819,9 +1113,13 @@ class _Checker:
         self._maybe_move(node.value)
         if isinstance(node.value, ast.FuncDecl):
             # A let-bound anonymous function is a known user function
-            # for later call-site checks.
-            param_types = self._ann_types(node.value.param_types)
-            return_type = self._validate_ann(node.value.return_type)
+            # for later call-site checks. Its annotations may use
+            # ITS OWN lifetimes, not the enclosing scope's.
+            allowed = set(getattr(node.value, "lifetimes", None) or [])
+            param_types = self._ann_types(node.value.param_types,
+                                          allowed=allowed)
+            return_type = self._validate_ann(node.value.return_type,
+                                             allowed=allowed)
             self._record_func(node.name, param_types, return_type)
         if ann is not None:
             if (ann != "any" and value_type != "any"
@@ -870,7 +1168,93 @@ class _Checker:
                 "'let mut %s = ...' to make it mutable"
                 % (name, name, name))
 
+    def _check_deref_assign(self, node):
+        """Check a write through a deref: `*s = 10` / `*s += 1`
+        (7.0.0).
+
+        The operand must be a variable holding a MUTABLE borrow
+        (writing through a shared borrow is an error). The write
+        is allowed only while every live borrow of the underlying
+        place is held by that same variable -- writing through the
+        original while a reborrow of it is live is an error, and
+        writing through a reborrow while the original is still the
+        live one is fine only once the original's own record has
+        ended (NLL-lite: it ends at its last use)."""
+        target = node.target
+        if not isinstance(target.operand, ast.Var):
+            self._fail(
+                target,
+                "Can only write through a borrow held in a variable "
+                "-- write through '*name', where 'name' holds the "
+                "borrow",
+            )
+        holder = target.operand.name
+        holder_type = self._lookup(holder)
+        if holder_type != "any":
+            split = self._split_borrow(holder_type)
+            if split is None:
+                self._fail(
+                    target,
+                    "Cannot write through '*%s' -- '%s' is a %s, "
+                    "not a borrow; only a borrow can be written "
+                    "through" % (holder, holder, holder_type),
+                )
+            kind, _lifetime, base = split
+            if kind == "shared":
+                self._fail(
+                    target,
+                    "Cannot write through '*%s' -- '%s' is a shared "
+                    "borrow (&%s); only a mutable borrow (&mut %s) "
+                    "can be written through"
+                    % (holder, holder, base, base),
+                )
+        else:
+            base = "any"
+        place = self._borrow_place_of_holder(holder) or holder
+        for record in self._live_borrows(place):
+            if holder not in record["holders"]:
+                others = sorted(record["holders"])
+                detail = (" held by '%s'" % others[0]) if others else ""
+                self._fail(
+                    target,
+                    "Cannot write through '*%s' while it is "
+                    "reborrowed%s -- the reborrow must end first"
+                    % (holder, detail),
+                )
+        # Resolve the write to the ultimate place. At runtime a
+        # borrow IS the value, so for Copy values (numbers) the
+        # holder is only a copy: storing to the holder would never
+        # reach the borrowed place. The checker knows the alias
+        # chain, so it annotates this statement with the place the
+        # borrow (or reborrow chain) actually borrows -- `*s = 10`
+        # becomes a store to `x` (or to `a[0]`). The runtimes honor
+        # the annotation and fall back to the holder when it is
+        # absent (unchecked code, or a borrowed parameter whose
+        # place lives in the caller).
+        source_record = self._borrow_record_of_holder(holder)
+        if (source_record is not None
+                and source_record.get("place_expr") is not None):
+            node.resolved_target = source_record["place_expr"]
+        else:
+            node.resolved_target = target.operand
+        # The write reads the holder (extending its last use) and
+        # may move the value.
+        self._check_expr(target.operand)
+        value_type = self._check_expr(node.value)
+        self._maybe_move(node.value)
+        if node.op == "+=":
+            self._check_plus(node, base, value_type)
+        elif node.op == "-=":
+            self._check_number_operands(node, "-=", base, value_type)
+
     def _check_assign(self, node):
+        # 7.0.0: writing through a deref (`*s = 10`) is its own
+        # branch -- it writes the borrowed place, not the binding,
+        # so the immutable and borrowed-place rules below do not
+        # apply to it as written.
+        if isinstance(node.target, ast.DerefExpr):
+            self._check_deref_assign(node)
+            return
         # 6.0.0 immutable by default: a plain `let` binding (and a
         # function parameter, `for` variable, `match` binding, or
         # function name -- none of which can be `let mut`) cannot be
@@ -880,6 +1264,18 @@ class _Checker:
                 and self._is_mut_binding(node.target.name) is False):
             self._fail(node.target,
                        self._immutable_msg(node.target.name))
+        # 7.0.0: reassigning a binding while it is reborrowed is an
+        # error -- the reborrow still points at the old borrow.
+        if isinstance(node.target, ast.Var):
+            for record in self._live_reborrow_of(node.target.name):
+                others = sorted(record["holders"])
+                detail = (" held by '%s'" % others[0]) if others else ""
+                self._fail(
+                    node.target,
+                    "Cannot assign to '%s' while it is reborrowed%s "
+                    "-- the reborrow must end first"
+                    % (node.target.name, detail),
+                )
         # A borrowed place cannot be written while the borrow is
         # live: no reassignment, no compound assignment, no element
         # write through it.
@@ -965,8 +1361,38 @@ class _Checker:
             return
         if value_type != "any" and not self._types_compatible(
                 expected, value_type):
+            # 7.0.0: when a named lifetime is expected, say WHY the
+            # returned borrow does not satisfy it, not just that the
+            # types differ.
+            target = node.value if node.value is not None else node
+            exp_split = self._split_borrow(expected)
+            got_split = self._split_borrow(value_type)
+            if (exp_split is not None and exp_split[1] is not None
+                    and got_split is not None):
+                exp_kind, exp_life, exp_base = exp_split
+                got_kind, got_life, got_base = got_split
+                if exp_base == got_base and (
+                        got_kind == "mut" or got_kind == exp_kind):
+                    if got_life is None:
+                        self._fail(
+                            target,
+                            "This function should return a borrow "
+                            "with lifetime '%s', but this 'return' "
+                            "gives a borrow with no lifetime -- it "
+                            "does not live as long as '%s'; return a "
+                            "borrow of a '%s' parameter instead"
+                            % (exp_life, exp_life, exp_life),
+                        )
+                    self._fail(
+                        target,
+                        "This function should return a borrow with "
+                        "lifetime '%s', but this 'return' gives a "
+                        "borrow with lifetime '%s' -- a '%s' borrow "
+                        "does not live as long as a '%s' borrow"
+                        % (exp_life, got_life, got_life, exp_life),
+                    )
             self._fail(
-                node.value if node.value is not None else node,
+                target,
                 "This function should return a %s, but this 'return' "
                 "gives a %s -- return a %s instead"
                 % (expected, value_type, expected),
@@ -992,27 +1418,80 @@ class _Checker:
             self._pop_scope()
 
     def _check_func_decl(self, node, statement):
-        param_types = self._ann_types(node.param_types)
-        return_type = self._validate_ann(node.return_type)
-        # Lifetime elision: a function returning a borrow must take
-        # exactly one borrowed parameter, else the returned borrow
-        # could not be tied to any input.
-        if return_type is not None and return_type.startswith("&"):
-            borrowed = [t for t in param_types
-                        if t is not None and t.startswith("&")]
-            if len(borrowed) != 1:
-                name = node.name or "<anonymous>"
-                if not borrowed:
-                    detail = "it takes no borrowed parameters"
-                else:
-                    detail = ("it takes %d borrowed parameters"
-                              % len(borrowed))
+        # 7.0.0 lifetimes: declared names must be unique and used.
+        lifetimes = list(getattr(node, "lifetimes", None) or [])
+        seen = set()
+        for name in lifetimes:
+            if name in seen:
                 self._fail(
                     node,
-                    "Function '%s' returns a borrow, but lifetime "
-                    "elision needs exactly one borrowed parameter "
-                    "-- %s" % (name, detail),
+                    "Lifetime '%s' is declared twice on this "
+                    "function -- write it once" % name,
                 )
+            seen.add(name)
+        declared = set(lifetimes)
+        param_types = self._ann_types(node.param_types, allowed=declared)
+        return_type = self._validate_ann(node.return_type,
+                                         allowed=declared)
+        used = set()
+        for type_ in param_types:
+            if type_ is not None:
+                split = self._split_borrow(type_)
+                if split is not None and split[1] is not None:
+                    used.add(split[1])
+        if return_type is not None:
+            split = self._split_borrow(return_type)
+            if split is not None and split[1] is not None:
+                used.add(split[1])
+        for name in lifetimes:
+            if name not in used:
+                self._fail(
+                    node,
+                    "Lifetime '%s' is declared but never used -- "
+                    "use it in a parameter or the return type, or "
+                    "remove it from the list" % name,
+                )
+        # Lifetime elision (4.0.0, generalized in 7.0.0): a function
+        # returning a borrow must be tied to an input. A NAMED
+        # return lifetime needs a parameter carrying that same
+        # lifetime; an elided return needs exactly one borrowed
+        # parameter, as before.
+        if return_type is not None and return_type.startswith("&"):
+            ret_split = self._split_borrow(return_type)
+            ret_life = ret_split[1] if ret_split is not None else None
+            if ret_life is not None:
+                carriers = [
+                    t for t in param_types
+                    if t is not None and self._split_borrow(t) is not None
+                    and self._split_borrow(t)[1] == ret_life
+                    and self._types_compatible(
+                        return_type, t, strict_lifetimes=False)]
+                if not carriers:
+                    fname = node.name or "<anonymous>"
+                    self._fail(
+                        node,
+                        "Function '%s' returns a borrow with "
+                        "lifetime '%s', but no parameter carries "
+                        "lifetime '%s' -- a returned borrow must "
+                        "come from an input with the same lifetime"
+                        % (fname, ret_life, ret_life),
+                    )
+            else:
+                borrowed = [t for t in param_types
+                            if t is not None and t.startswith("&")]
+                if len(borrowed) != 1:
+                    name = node.name or "<anonymous>"
+                    if not borrowed:
+                        detail = "it takes no borrowed parameters"
+                    else:
+                        detail = ("it takes %d borrowed parameters"
+                                  % len(borrowed))
+                    self._fail(
+                        node,
+                        "Function '%s' returns a borrow, but lifetime "
+                        "elision needs exactly one borrowed parameter "
+                        "-- %s" % (name, detail),
+                    )
         if statement and node.name is not None:
             # Register before checking the body so recursion works.
             self._define(node.name, "function", kind="func")
@@ -1029,6 +1508,7 @@ class _Checker:
                 name for name, type_ in zip(node.params, param_types)
                 if type_ is not None and type_.startswith("&")},
         })
+        self.lifetime_stack.append(declared)
         try:
             for name, type_ in zip(node.params, param_types):
                 self._define(name, type_ if type_ is not None else "any",
@@ -1043,6 +1523,7 @@ class _Checker:
             finally:
                 self.return_stack.pop()
         finally:
+            self.lifetime_stack.pop()
             self.func_stack.pop()
             self.borrow_frames.pop()
             self._pending = [b for b in self._pending
@@ -1075,9 +1556,23 @@ class _Checker:
                         "-- the mutable borrow must end first"
                         % node.name,
                     )
+            # 7.0.0: while a reborrow of this binding is live, the
+            # binding itself cannot be used either -- it is borrowed
+            # by the reborrow.
+            for record in self._live_reborrow_of(node.name):
+                others = sorted(record["holders"])
+                detail = (" held by '%s'" % others[0]) if others else ""
+                self._fail(
+                    node,
+                    "Cannot use '%s' while it is reborrowed%s -- "
+                    "the reborrow must end first"
+                    % (node.name, detail),
+                )
             return self._lookup(node.name)
         if isinstance(node, ast.BorrowExpr):
             return self._check_borrow(node)
+        if isinstance(node, ast.DerefExpr):
+            return self._check_deref(node)
         if isinstance(node, ast.ArrayLiteral):
             for element in node.elements:
                 self._check_expr(element)
@@ -1264,6 +1759,83 @@ class _Checker:
                             "%s() needs a number" % name)
         return _STDLIB_RETURNS[name]
 
+    def _check_call_lifetimes(self, name, node, param_types, arg_types):
+        """Call-site lifetime check (7.0.0).
+
+        Lifetimes on a callee are generic: each argument
+        instantiates the lifetime parameter of its position, so a
+        single argument of any lifetime is accepted. But when the
+        callee requires the SAME lifetime in two or more parameter
+        positions, the arguments in those positions must agree: two
+        different NAMED lifetimes is a compile-time error (neither
+        outlives the other). An elided argument agrees with
+        anything -- its lifetime is whatever the call needs."""
+        by_lifetime = {}
+        for index, expected in enumerate(param_types):
+            if expected is None:
+                continue
+            split = self._split_borrow(expected)
+            if split is None or split[1] is None:
+                continue
+            if index >= len(arg_types):
+                continue
+            got = arg_types[index]
+            if got == "any":
+                continue
+            got_split = self._split_borrow(got)
+            got_life = got_split[1] if got_split is not None else None
+            by_lifetime.setdefault(split[1], []).append(
+                (index, got_life))
+        for life, positions in by_lifetime.items():
+            named = {}
+            for index, got_life in positions:
+                if got_life is not None:
+                    named.setdefault(got_life, []).append(index)
+            if len(named) > 1:
+                lives = sorted(named)
+                first_index = named[lives[0]][0]
+                second_index = named[lives[1]][0]
+                self._fail(
+                    node.args[second_index],
+                    "Argument %d to '%s' has lifetime '%s', but "
+                    "argument %d gave this call lifetime '%s' -- "
+                    "'%s' needs all its '%s' arguments to share "
+                    "one lifetime"
+                    % (second_index + 1, name, lives[1],
+                       first_index + 1, lives[0], name, life),
+                )
+
+    def _instantiate_return(self, param_types, arg_types, return_type):
+        """The callee's return type with its lifetime parameters
+        instantiated from the actual arguments (7.0.0).
+
+        A named lifetime in the return type is replaced by the
+        lifetime the arguments in the matching parameter positions
+        actually carried (they agree -- _check_call_lifetimes
+        enforced it). When no argument in those positions carries
+        a named lifetime, the return lifetime is elided. A return
+        type without a named lifetime is returned unchanged."""
+        if return_type is None:
+            return "any"
+        split = self._split_borrow(return_type)
+        if split is None or split[1] is None:
+            return return_type
+        kind, life, base = split
+        carried = None
+        for index, expected in enumerate(param_types):
+            if expected is None:
+                continue
+            exp_split = self._split_borrow(expected)
+            if exp_split is None or exp_split[1] != life:
+                continue
+            if index >= len(arg_types):
+                continue
+            got_split = self._split_borrow(arg_types[index])
+            if got_split is not None and got_split[1] is not None:
+                carried = got_split[1]
+                break
+        return self._make_borrow(kind, carried, base)
+
     def _check_call(self, node):
         arg_types = [self._check_expr(arg) for arg in node.args]
         # push()/pop() mutate their array in place, so calling one
@@ -1307,14 +1879,23 @@ class _Checker:
                         got = arg_types[index]
                         if (got != "any"
                                 and not self._types_compatible(
-                                    expected, got)):
+                                    expected, got,
+                                    strict_lifetimes=False)):
                             self._fail(
                                 node.args[index],
                                 "Argument %d to '%s' should be a %s, "
                                 "but got a %s" % (
                                     index + 1, name, expected, got),
                             )
-                return return_type if return_type is not None else "any"
+                # 7.0.0 lifetimes: a call instantiates the callee's
+                # lifetime parameters from the arguments it is given.
+                # When the callee requires the SAME lifetime in two
+                # or more positions, all arguments in those positions
+                # must carry the same named lifetime.
+                self._check_call_lifetimes(name, node, param_types,
+                                           arg_types)
+                return self._instantiate_return(
+                    param_types, arg_types, return_type)
             if name in _BUILTIN_RETURNS:
                 return self._check_builtin_call(name, node, arg_types)
             if name in _STDLIB_RETURNS:

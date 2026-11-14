@@ -43,7 +43,7 @@ class TestVersion(unittest.TestCase):
     def test_version_is_6_0_0(self):
         code, out, err = _run_cli(["--version"])
         self.assertEqual(code, 0, err)
-        self.assertEqual(out.strip(), "kabir 6.0.0")
+        self.assertEqual(out.strip(), "kabir 7.0.0")
 
 
 class TestReadOnlyBuiltinsBorrowCli(unittest.TestCase):

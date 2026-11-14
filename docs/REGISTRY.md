@@ -13,6 +13,10 @@ by hand.
 > owner's approval. Until then `kabir add` without `KABIR_REGISTRY`
 > set refuses with a clear error. See
 > [Decision needed](#decision-needed) at the end.
+>
+> **Status (7.0.0):** `kabir add` now wires packages into `import`
+> — `import greet` resolves via `Kabir.toml` + `Kabir.lock` to
+> `vendor/greet/<version>/src/main.kbr`. See §8a.
 
 ## 1. The index repo layout
 
@@ -240,9 +244,40 @@ switching later is a one-line change to `DEFAULT_REGISTRY_URL`.
   if it ever grows to thousands of packages, the index should be
   split per package (e.g. `index/<name>.json`) — a format change
   for a later version, not 5.0.0.
-* `kabir add` does not run any code from the package and does not
-  wire it into `import` yet — vendored files land under
-  `vendor/<name>/<version>/` for the project to use.
+
+## 8a. Importing a package (7.0.0)
+
+`kabir add` now wires the package into `import` (7.0.0, Leap 1):
+
+```kabir
+import greet
+print(greet("Rafid"))   # Hello, Rafid!
+```
+
+The name resolves through the enclosing project — `Kabir.toml`
+`[dependencies]` gives the exact version wanted, `Kabir.lock`
+gives the exact version installed, and the entry point is
+`vendor/<name>/<version>/src/main.kbr`. The imported module's
+bindings become available exactly like a quoted-path import's:
+same flat export, same module cache, same cycle detection.
+
+* **Transitive imports work:** a vendored package that itself does
+  `import <its-dependency>` finds that dependency in the
+  *consumer* project's `vendor/` tree (the consumer's lockfile
+  lists every transitive dependency, so it is already installed).
+  A transitive dependency can also be imported directly from the
+  consumer — the lockfile is the installed set.
+* **Exact versions only:** a manifest/lock disagreement is an
+  error naming the package and both versions
+  (`Version mismatch for package "greet" ...`), never a silent
+  re-resolution. A package that is not a dependency at all fails
+  with `Package "greet" is not a dependency of project ...` and
+  the `kabir add` command that fixes it.
+* **One resolver:** the name→path mapping lives in
+  `kabir/imports.py` (`resolve_import_spec`) and is shared by the
+  interpreter, the VM, and (later) the native backend — there is
+  no second resolver anywhere.
+* Quoted imports (`import "file.kbr"`) are unchanged.
 
 ## 9. Decision needed
 

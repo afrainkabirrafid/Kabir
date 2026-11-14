@@ -57,7 +57,8 @@ class ExprStmt(Node):
 
 class FuncDecl(Node):
     def __init__(self, name, params, body, line=None, col=None,
-                 param_types=None, return_type=None, is_async=False):
+                 param_types=None, return_type=None, is_async=False,
+                 lifetimes=None):
         super().__init__(line, col)
         self.name = name      # may be None for an anonymous func expression
         self.params = params  # list of names
@@ -71,6 +72,9 @@ class FuncDecl(Node):
         # `await` inside it suspends that task until awaited work
         # finishes.
         self.is_async = is_async
+        # 7.0.0 lifetimes: names from `func f<'a, 'b>(...)`, in
+        # order; [] when the function declares none.
+        self.lifetimes = list(lifetimes) if lifetimes else []
 
 
 class ReturnStmt(Node):
@@ -213,22 +217,45 @@ class BorrowExpr(Node):
         self.mutable = mutable  # True for `&mut x`, False for `&x`
 
 
+class DerefExpr(Node):
+    """A dereference: `*r` (7.0.0).
+
+    Reads the value behind a borrow. Compile-time only, like a
+    borrow: at runtime a borrow IS the value, so `*r` compiles to
+    just `r` -- a deref costs nothing. The checker requires the
+    operand to be a borrow type (`&T` / `&mut T`, with or without a
+    lifetime) and yields the plain type `T`. As an assignment
+    target (`*s = 10`) it writes through a mutable borrow.
+    """
+    def __init__(self, operand, line=None, col=None):
+        super().__init__(line, col)
+        self.operand = operand  # the borrowed value being dereferenced
+
+
 class TypeAnn(Node):
-    def __init__(self, name, line=None, col=None, borrow=None):
+    def __init__(self, name, line=None, col=None, borrow=None,
+                 lifetime=None):
         super().__init__(line, col)
         self.name = name      # base type name as written, e.g. "number"
         # 4.0.0 borrow types: None (plain), "shared" (`&number`),
         # "mut" (`&mut number`).
         self.borrow = borrow
+        # 7.0.0 lifetime: the name from `&'a number` / `&'a mut
+        # array`, or None when no lifetime is written.
+        self.lifetime = lifetime
 
     @property
     def full_name(self):
-        """The type as written, e.g. "number", "&number", "&mut array"."""
-        if self.borrow == "shared":
-            return "&" + self.name
+        """The type as written, e.g. "number", "&number", "&mut array",
+        "&'a number", "&'a mut array"."""
+        if self.borrow is None:
+            return self.name
+        prefix = "&"
+        if self.lifetime is not None:
+            prefix += "'" + self.lifetime + " "
         if self.borrow == "mut":
-            return "&mut " + self.name
-        return self.name
+            prefix += "mut "
+        return prefix + self.name
 
 
 class Wildcard(Node):

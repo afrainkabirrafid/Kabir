@@ -111,19 +111,30 @@ class TestTranspile(unittest.TestCase):
         c = codegen.transpile("let mut xs = [1]\npush(xs, 2)\nprint(xs)\n")
         self.assertIn("k_array_of", c)
 
-    def test_closure_is_a_clear_error(self):
-        with self.assertRaises(KabirError) as ctx:
-            codegen.transpile(
-                "func outer() {\n    let x = 5\n"
-                "    func inner() {\n        return x\n    }\n"
-                "    return inner()\n}\nprint(outer())\n")
-        self.assertIn("closures not supported in native mode yet",
-                      str(ctx.exception))
+    def test_closure_transpiles_to_make_closure(self):
+        # 7.0.0: closures work in native mode -- a function that
+        # reads an enclosing variable becomes k_make_closure with
+        # the captured slot, and its body reads k_env_get.
+        c = codegen.transpile(
+            "func outer() {\n    let x = 5\n"
+            "    func inner() {\n        return x\n    }\n"
+            "    return inner()\n}\nprint(outer())\n")
+        self.assertIn("k_make_closure(", c)
+        self.assertIn("k_env_get(", c)
 
-    def test_import_is_a_clear_error(self):
+    def test_plain_function_still_uses_make_func(self):
+        # A function with no captures is unchanged: k_make_func,
+        # no closure machinery.
+        c = codegen.transpile(
+            "func fib(n) {\n    if n < 2 {\n        return n\n    }\n"
+            "    return fib(n - 1) + fib(n - 2)\n}\nprint(fib(10))\n")
+        self.assertIn("k_make_func(kabir_fn_0,", c)
+        self.assertNotIn("k_make_closure(", c)
+
+    def test_missing_import_is_a_clear_error(self):
         with self.assertRaises(KabirError) as ctx:
             codegen.transpile('import "helpers.kbr"\nprint(1)\n')
-        self.assertIn("import not supported in native mode yet",
+        self.assertIn('Cannot import "helpers.kbr" -- no such file',
                       str(ctx.exception))
 
     def test_undefined_variable_is_a_clear_error(self):

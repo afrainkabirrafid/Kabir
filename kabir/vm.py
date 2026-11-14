@@ -25,6 +25,7 @@ from . import semantics as _semantics
 from .builtins import BuiltinFunction, _type_name
 from .compile import compile_program, compile_source
 from .errors import KabirError, error_at
+from .imports import resolve_import_spec
 from .interpreter import Environment
 from .parser import parse as _parse_source
 from .stdlib import STRING_METHODS, build_stdlib
@@ -1078,12 +1079,17 @@ class VM:
     # -- imports -------------------------------------------------------
     def _load_module(self, path, frame, line, col, frames):
         cur_filename = frame.code.get("filename") or self.filename
-        if cur_filename.startswith("<"):
-            base = os.getcwd()
-        else:
-            base = os.path.dirname(os.path.abspath(cur_filename))
-        resolved = os.path.join(base, path)
-        canonical = os.path.realpath(os.path.abspath(resolved))
+        # One shared resolver (kabir/imports.py) turns the import spec
+        # into a file: "file.kbr" resolves relative to the importing
+        # file, a bare name resolves via the project's manifest +
+        # lockfile to vendor/<name>/<version>/src/main.kbr. A
+        # resolution failure is reported at the import statement.
+        try:
+            canonical = resolve_import_spec(path, cur_filename)
+        except KabirError as exc:
+            # exc.message, not str(exc): str renders with a default
+            # "<stdin>" location that would leak into this error.
+            self._instr_error(frame, line, col, exc.message)
         if canonical in self._importing:
             chain = [os.path.basename(p) for p in self._importing]
             chain.append(os.path.basename(canonical))

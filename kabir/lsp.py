@@ -184,9 +184,13 @@ class _Analyzer:
             for p, t in zip(node.params, types))
         ret = getattr(node, "return_type", None)
         ret_text = (" -> %s" % ret.full_name) if ret is not None else ""
+        # 7.0.0 lifetimes: `func f<'a, 'b>(...)`.
+        lifetimes = getattr(node, "lifetimes", None) or []
+        lt_text = ("<'%s>" % ", '".join(lifetimes)) if lifetimes else ""
         if node.name is not None:
-            return "func %s(%s)%s" % (node.name, params, ret_text)
-        return "func(%s)%s" % (params, ret_text)
+            return "func %s%s(%s)%s" % (node.name, lt_text, params,
+                                        ret_text)
+        return "func%s(%s)%s" % (lt_text, params, ret_text)
 
     # -- type inference ------------------------------------------------
     def _lookup_type(self, env, name):
@@ -222,6 +226,26 @@ class _Analyzer:
             return "number"
         if isinstance(node, ast.UnaryOp):
             return "number" if node.op == "-" else "bool"
+        if isinstance(node, ast.BorrowExpr):
+            inner = self._infer(node.expr, env)
+            if inner == "any":
+                return "any"
+            return "&mut " + inner if node.mutable else "&" + inner
+        if isinstance(node, ast.DerefExpr):
+            # 7.0.0: `*r` has the plain type the borrow borrows --
+            # strip `&`, an optional `'a` lifetime, and `mut `.
+            inner = self._infer(node.operand, env)
+            if inner == "any" or not inner.startswith("&"):
+                return inner if inner != "any" else "any"
+            rest = inner[1:]
+            if rest.startswith("'"):
+                space = rest.find(" ")
+                if space == -1:
+                    return "any"
+                rest = rest[space + 1:]
+            if rest.startswith("mut "):
+                rest = rest[4:]
+            return rest
         if isinstance(node, ast.Call):
             callee = node.callee
             if isinstance(callee, ast.Var):
@@ -346,6 +370,12 @@ class _Analyzer:
             self._walk_expr(node.left, scope, env)
             self._walk_expr(node.right, scope, env)
         elif isinstance(node, ast.UnaryOp):
+            self._walk_expr(node.operand, scope, env)
+        elif isinstance(node, ast.BorrowExpr):
+            self._walk_expr(node.expr, scope, env)
+        elif isinstance(node, ast.DerefExpr):
+            # 7.0.0: walk the borrowed value, so `*r` counts as a
+            # use of `r` for references and rename.
             self._walk_expr(node.operand, scope, env)
         elif isinstance(node, ast.Call):
             self._walk_expr(node.callee, scope, env)

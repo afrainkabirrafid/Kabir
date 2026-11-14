@@ -1,5 +1,15 @@
 # Kabir Changelog
 
+## 7.0.0 — 2026-11-14 — "Finish What We Started"
+
+Commander Kakarot picked all three leaps. **No breaking change to existing programs.**
+
+- **Registry complete — import wiring** — bare-name `import greet` now works: the package name resolves through the project's `Kabir.toml` `[dependencies]` + `Kabir.lock` to `vendor/greet/<version>/src/main.kbr`, on the VM, the interpreter, AND native. Transitive deps resolve the same way. Resolution is a single shared helper (`kabir/imports.py: resolve_import_spec`) — every backend calls it, no second resolver anywhere. `import "file.kbr"` (quoted path) is unchanged. `kabir add` / `kabir publish --stage` work as before; index format unchanged; exact versions only, no ranges.
+- **Native complete — closures + import** — `kabir run --native` / `kabir build --native` now accept closures (captured variables stay shared and mutable through cells/slots, even after the defining function returns; returned, stored, passed-as-argument, nested, and loop-collected closures all work) and `import` of local modules (quoted-path and bare-name package imports; transitive, deduped, diamond-safe, top-level code runs once). Arena memory model kept. Native fib(25) binary-direct 0.0076 s, cold wall 1.53 s, warm 0.15 s — no regression vs 6.0.0. Still rejected in native mode, with clear compile-time errors: `async`/`await`, `spawn()`/`chan()`/`send()`/`recv()`, undefined variables.
+- **Borrow checker complete — deref, reborrowing, lifetimes** — `*r` dereferences a borrow (arithmetic, call args, returns, comparisons — zero runtime cost, a borrow IS the value); `&mut *r` re-borrows and `*s = 10` writes through a mutable borrow, with the checker enforcing single-live-`&mut` and use-after-move; explicit lifetime parameters on functions (`func f<'a>(x: &'a number) -> &'a number`), checker-enforced — mismatched lifetimes are compile-time errors, elided borrows still agree with any lifetime. NLL-lite kept for existing code.
+- **Tests** — 1104 tests (942 in 6.0.0 + 162 new: 26 registry-import, 35 native, 101 borrow/lifetimes), 1 pre-existing skip. No test deleted or weakened.
+- **Limits (honest)** — the self-host parser/compiler do not parse the new syntax yet (`kabir run --selfhost` on a deref/lifetime program fails); write-through via a borrowed parameter of a Copy type does not reach the caller; a reborrow keeps its source borrow's lifetime (name-based approximation); nested functions cannot use an enclosing function's lifetimes; the REPL and `kabir run --interp` still run without the checker; registry exact versions only, no yank/delete.
+
 ## 6.0.0 — 2026-11-14 — "The Breaking Clean-Up"
 
 The two breaking changes held since 4.1.0, taken together on the Commander's explicit "do all". **This release breaks existing programs** — see the migration note below.

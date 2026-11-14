@@ -169,8 +169,13 @@ def run_file(path, use_interp=False, use_native=False, no_cache=False,
             print(err.render(), file=sys.stderr)
             return 1
         try:
+            # 7.0.0: pass the checked program through, so checker
+            # annotations on the AST (a deref-write's resolved
+            # place) survive into native codegen instead of being
+            # lost to a re-parse.
             binary = cached_compile_native(
-                source, filename=path, use_cache=not no_cache)
+                source, filename=path, use_cache=not no_cache,
+                program=program)
             proc = subprocess.run([binary])
             return proc.returncode
         except KabirError as err:
@@ -578,7 +583,8 @@ def main(argv=None):
             out_path = os.path.join(target, "target", manifest["name"])
             cached_compile_native(source, filename=str(entry),
                                   out_path=out_path,
-                                  use_cache=not no_cache)
+                                  use_cache=not no_cache,
+                                  program=program)
         except KabirError as err:
             print(err.render(), file=sys.stderr)
             return 1

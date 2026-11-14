@@ -1332,14 +1332,15 @@ interpreter path) does not check types at all.
 
 ## Import
 
-`import` loads another `.kbr` file and brings its top-level bindings into the importing file. It is a statement: the keyword `import` followed by a plain string literal holding the path.
+`import` loads another `.kbr` file and brings its top-level bindings into the importing file. It is a statement with two forms: the keyword `import` followed by a plain string literal holding the path, or by a bare package name (7.0.0 — see [Package imports](#package-imports)).
 
 ```kabir
 import "utils/helpers.kbr"
 import "lib/math-tools.kbr"
+import greet
 ```
 
-The path must be a plain string literal — an interpolated path (`import "dir/{name}.kbr"`) or a computed path (`import some_var`) is a parse error:
+The path must be a plain string literal — an interpolated path (`import "dir/{name}.kbr"`) is a parse error:
 
 ```kabir
 import "dir/{x}.kbr"
@@ -1372,6 +1373,45 @@ demo.kbr:1:8: import "notes.txt" must name a .kbr file
 The path resolves **relative to the importing file's directory**, never to the process working directory. `import "helpers.kbr"` in `/home/rafid/proj/main.kbr` loads `/home/rafid/proj/helpers.kbr`, even when you run `kabir run proj/main.kbr` from elsewhere. A file imported by an imported file resolves relative to *its own* directory, not the entry file's. An absolute path in the string is honoured as-is. In the REPL there is no importing file, so the path resolves relative to the working directory.
 
 There is no search path and no `..` sandboxing: `import "../shared.kbr"` is allowed.
+
+### Package imports
+
+A bare name imports a registry package instead of a file (7.0.0):
+
+```kabir
+import greet
+print(greet("Rafid"))   # Hello, Rafid!
+```
+
+The name resolves through the enclosing project: `Kabir.toml`
+`[dependencies]` gives the exact version wanted, `Kabir.lock`
+gives the exact version installed, and the entry point is
+`vendor/<name>/<version>/src/main.kbr` under the project root.
+Install it first with `kabir add greet@<version>` (see
+[REGISTRY.md](REGISTRY.md)).
+
+* **Hyphenated names work:** `import my-pkg`. A name must start
+  with a letter and contain only letters, digits, `-` and `_` —
+  the same rule as project names. `import _foo` and `import 5`
+  are parse errors.
+* **Transitive imports work:** a vendored package that itself does
+  `import <its-dependency>` finds that dependency in the
+  *consumer* project's `vendor/` tree — the consumer's lockfile
+  lists every transitive dependency, so it is already installed.
+  A transitive dependency can also be imported directly from the
+  consumer, since it is vendored and locked.
+* **Exact versions only.** If `Kabir.toml` and `Kabir.lock`
+  disagree about a package's version, the import fails with a
+  `Version mismatch` error naming the package and both versions —
+  run `kabir add <name>@<version>` to reinstall. A package that
+  is not a dependency at all fails with a clear error naming the
+  package and the `kabir add` command that fixes it. A bare import
+  outside any project (no `Kabir.toml` above the importing file)
+  fails the same way.
+* **Same semantics as a file import.** The package's top-level
+  bindings come in flat, the module is cached (importing it twice
+  runs it once), and cycles are detected — everything in
+  [What an import brings in](#what-an-import-brings-in) applies.
 
 ### What an import brings in
 
@@ -2139,7 +2179,7 @@ $ ./target/my_app
 Hello from my_app!
 ```
 
-Memory model is **native (arena)**: values are freed all at once at exit, not refcounted. Supported: numbers, strings, bools, null, arrays, dicts, `if`/`while`/`for`, functions including recursion, all built-ins and stdlib functions, string methods, `match`, and `let mut` (no runtime effect). **Not supported**: closures and `import` — both are clear compile-time errors, never silently wrong code. Numbers are C doubles (integers beyond 2^53 lose precision), and `http_get`/`http_post` are `http://` only in native mode. Native runtime errors print `Kabir runtime error: <message>` and exit 1, without `file:line:col`.
+Memory model is **native (arena)**: values are freed all at once at exit, not refcounted. Supported: numbers, strings, bools, null, arrays, dicts, `if`/`while`/`for`, functions including recursion, all built-ins and stdlib functions, string methods, `match`, and `let mut` (no runtime effect). Closures work too (7.0.0): a function that reads a variable from an enclosing function captures it — returned, stored, and passed closures keep working, and `let mut` captures stay mutable. `import "path.kbr"` works too (7.0.0): the imported module is compiled to native as well, its top-level code runs once, and its bindings are copied into the importer. **Not supported**: async/await and `spawn`/`chan`/`send`/`recv` (VM-only — clear compile-time errors), and bare-name package imports (`import greet`, waiting on the shared package resolver). Numbers are C doubles (integers beyond 2^53 lose precision), and `http_get`/`http_post` are `http://` only in native mode. Native runtime errors print `Kabir runtime error: <message>` and exit 1, without `file:line:col`.
 
 ## Package registry
 
@@ -2198,21 +2238,77 @@ func set_first(items: &mut array) {
 }
 ```
 
+## Dereferencing (`*`) and reborrowing
+
+Since 7.0.0, a borrow can be dereferenced with `*`: `*r` is the value behind the borrow, usable in arithmetic and anywhere the plain type is expected. A deref costs nothing at run time — a borrow **is** the value, so `*r` compiles to just `r`.
+
+```kabir
+let x = 5
+let r = &x
+print(*r)          # 5
+let y = *r + 1     # 6
+
+func double(a: &number) -> number {
+    return *a * 2
+}
+print(double(&x))  # 10
+```
+
+A mutable borrow can be reborrowed with `&mut *r`, and a value can be written through a mutable borrow with `*s = 10`:
+
+```kabir
+let mut x = 5
+let r = &mut x
+let s = &mut *r    # reborrow: s borrows through r
+*s = 10
+print(x)           # 10
+```
+
+Rules for reborrowing: a mutable reborrow needs a mutable borrow (`&mut *r` on a shared borrow is an error); while a reborrow is live, the original cannot be used or written through; a second reborrow while one is live is an error; writing through a shared borrow is an error. A plain `&r` (no `*`) is still an error — reborrowing goes through `*`.
+
+## Lifetimes (`'a`)
+
+Since 7.0.0, functions can declare explicit lifetime parameters: `func f<'a>(x: &'a number) -> &'a number`. A lifetime must be declared on the function before use, must be used at least once, and must not be duplicated. A returned `&'a T` needs a parameter carrying that same lifetime; inside the function body, a value must carry exactly the lifetime the return type (or annotation) requires — a borrow with a different named lifetime, or with no lifetime at all, does not satisfy `'a`:
+
+```kabir
+func first<'a>(x: &'a number) -> &'a number {
+    return x
+}
+
+func bad<'a>(x: &'a number, y: &number) -> &'a number {
+    return y   # error: y has no lifetime, it does not live as long as 'a
+}
+```
+
+At a call site lifetimes are generic: each argument instantiates the callee's lifetime parameter, so a single argument of any lifetime is accepted. But when the callee requires the *same* lifetime in two or more parameter positions, all arguments in those positions must carry the same named lifetime:
+
+```kabir
+func pick<'a>(x: &'a number, y: &'a number) -> &'a number {
+    return x
+}
+
+func caller<'a, 'b>(x: &'a number, y: &'b number) -> &'a number {
+    return pick(x, y)   # error: 'a and 'b are different lifetimes
+}
+```
+
+A function that returns an elided borrow (`-> &number`, no lifetime) keeps the older elision rule: it must take exactly one borrowed parameter.
+
 Rules the checker enforces (compile-time errors otherwise):
 
 1. While a mutable borrow of a place is live, no other access to that place — no read, no write, no move.
 2. While shared borrows of a place are live, no mutation or move of that place.
 3. A borrowed place cannot be moved while it is borrowed.
 4. A borrow ends at its last use (NLL-lite: liveness is a simple last-use walk within a function body). A borrow whose holder is never used ends at once.
-5. Lifetime elision only: a function returning a borrow must have exactly one borrowed input, otherwise it is a clear error. Returning a borrow of a local is an error — only a borrow of a borrowed parameter (or of a top-level binding) may be returned.
+5. A function returning a borrow must be tied to an input: a named return lifetime `&'a T` needs a parameter carrying lifetime `'a`; an elided return needs exactly one borrowed parameter. Returning a borrow of a local is an error — only a borrow of a borrowed parameter (or of a top-level binding) may be returned.
 
 Documented limits:
 
-- **No explicit lifetime parameters** — there is no `'a` syntax in 4.1.0.
 - **Borrows of `a[i]` are treated as borrowing the whole container** — borrowing one element borrows the array.
-- **No reborrowing** — borrowing a borrow-typed value (including `&a` on a borrowed parameter) is an error.
-- **No dereference operator** — the biggest usability limit: a borrowed value can be printed, compared, indexed (arrays and dicts), passed on, or returned, but not used in arithmetic, in method calls, or where the plain type is expected. `len(&x)` and `push(m, 4)` through a borrow are type errors; pass the original binding instead.
 - **No interprocedural tracking beyond signatures** — what a function does with a borrow is checked only through its declared parameter and return types. A borrow is tracked within one function body only.
+- **A reborrow keeps its source borrow's lifetime** — the checker does not track that a reborrow's true lifetime is shorter than its source's; lifetime checking is name-based, so a reborrow is treated as living as long as the borrow it came from.
+- **Writing through a borrowed parameter of a Copy type does not reach the caller** — `func bump(r: &mut number) { *r = *r + 1 }` updates the parameter, not the caller's variable, because a borrow **is** the value at run time and a number has no identity to share. (Arrays and dicts do propagate: they are shared objects.) A write through a borrow whose chain is visible in the same function body does reach the original.
+- **The self-hosting parser and compiler do not parse the new syntax yet** — `kabir run --selfhost` rejects `*r`, `&mut *r`, and `<'a>` programs. The Python parser, checker, VM, interpreter, and native backend all support them.
 
 ## Async/await + tasks and channels
 
@@ -2302,6 +2398,6 @@ To avoid surprises, the things people most often expect that are **not** in 6.0.
 - **A step argument for `range()`** — `range(a, b)` only; there is no `range(a, b, step)`.
 - **Assignment as an expression** — `let x = y = 1` and `print(x = 1)` are errors.
 - **Tail-call optimisation** — recursion is capped at 500 nested calls.
-- **Closures and `import` in native mode** — both are compile-time errors there; the VM path supports them.
+- **Closures and `import` in native mode** — both work since 7.0.0 (closures via captured arena slots, imports via per-module init functions); async and bare-name package imports are still VM-only / pending there.
 
 The roadmap for these lives in the [README](../README.md#roadmap).

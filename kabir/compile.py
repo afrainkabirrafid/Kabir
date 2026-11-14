@@ -310,6 +310,62 @@ class _CodeBuilder:
         self._define_name(stmt.name, stmt.line, stmt.col)
 
     def _stmt_AssignStmt(self, stmt):
+        # 7.0.0: writing through a deref (`*s = 10`) stores to the
+        # place the borrow actually borrows. The checker annotates
+        # the statement with that place (resolved_target); without
+        # it (unchecked code, or a borrowed parameter) the store
+        # goes to the variable holding the borrow. A borrow IS the
+        # value at runtime, so either way this is a plain store --
+        # no copy, no extra instruction.
+        if isinstance(stmt.target, ast.DerefExpr):
+            if not isinstance(stmt.target.operand, ast.Var):
+                self.fail(stmt.target,
+                          "Can only write through a borrow held in "
+                          "a variable")
+            resolved = getattr(stmt, "resolved_target", None)
+            if isinstance(resolved, ast.Var):
+                name = resolved.name
+                if stmt.op == "=":
+                    self.compile_expr(stmt.value)
+                else:
+                    self.compile_expr(resolved)
+                    self.compile_expr(stmt.value)
+                    self.emit("ADD" if stmt.op == "+=" else "SUB",
+                              None, stmt.line, stmt.col)
+                self._store_name(name, stmt.line, stmt.col)
+                return
+            if isinstance(resolved, ast.Index):
+                if stmt.op == "=":
+                    self.compile_expr(resolved.target)
+                    self.compile_expr(resolved.index)
+                    self.compile_expr(stmt.value)
+                    self.emit("SET_INDEX", None,
+                              resolved.index.line, resolved.index.col)
+                    self.emit("POP", None, stmt.line, stmt.col)
+                    return
+                self.compile_expr(resolved)
+                self.compile_expr(stmt.value)
+                self.emit("ADD" if stmt.op == "+=" else "SUB", None,
+                          stmt.line, stmt.col)
+                temp = self._fresh_temp()
+                self.emit("DEFINE_VAR", temp, stmt.line, stmt.col)
+                self.compile_expr(resolved.target)
+                self.compile_expr(resolved.index)
+                self.emit("LOAD_VAR", temp, stmt.line, stmt.col)
+                self.emit("SET_INDEX", None,
+                          resolved.index.line, resolved.index.col)
+                self.emit("POP", None, stmt.line, stmt.col)
+                return
+            if stmt.op == "=":
+                self.compile_expr(stmt.value)
+            else:
+                self.compile_expr(stmt.target)
+                self.compile_expr(stmt.value)
+                self.emit("ADD" if stmt.op == "+=" else "SUB", None,
+                          stmt.line, stmt.col)
+            self._store_name(stmt.target.operand.name,
+                             stmt.line, stmt.col)
+            return
         if isinstance(stmt.target, ast.Var):
             if stmt.op == "=":
                 self.compile_expr(stmt.value)
@@ -522,6 +578,20 @@ class _CodeBuilder:
         # 4.0.0 borrow checker: a borrow IS the value at runtime --
         # `&x` compiles to just `x`. Zero runtime cost.
         self.compile_expr(expr.expr)
+
+    def _expr_DerefExpr(self, expr):
+        # 7.0.0 deref: a borrow IS the value at runtime -- `*r`
+        # compiles to just `r`, exactly like `&x`. Zero runtime
+        # cost; the checker has already enforced the borrow rules.
+        # The checker resolves the read to the place the borrow
+        # actually borrows (node.resolved), so a write through a
+        # reborrow is visible here; without it (unchecked code) the
+        # read goes to the variable holding the borrow.
+        resolved = getattr(expr, "resolved", None)
+        if resolved is not None:
+            self.compile_expr(resolved)
+        else:
+            self.compile_expr(expr.operand)
 
     def _expr_ArrayLiteral(self, expr):
         for element in expr.elements:

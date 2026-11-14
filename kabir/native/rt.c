@@ -36,6 +36,16 @@ static void **g_arena = NULL;
 static size_t g_arena_len = 0;
 static size_t g_arena_cap = 0;
 
+/* Closure environment stack (7.0.0): k_call pushes the callee's
+ * captured-variable slots and pops them on return, so a closure
+ * body always reads its own captures however it was reached --
+ * returned, stored, passed as an argument, or called recursively.
+ * Plain (non-closure) functions push NULL. This is runtime
+ * bookkeeping, not arena data: plain malloc, freed in cleanup. */
+static KSlot **g_env_stack = NULL;
+static int g_env_depth = 0;
+static int g_env_cap = 0;
+
 static void arena_track(void *ptr) {
     if (g_arena_len == g_arena_cap) {
         size_t ncap = g_arena_cap ? g_arena_cap * 2 : 256;
@@ -102,6 +112,10 @@ void k_rt_cleanup(void) {
     g_arena = NULL;
     g_arena_len = 0;
     g_arena_cap = 0;
+    free(g_env_stack);
+    g_env_stack = NULL;
+    g_env_depth = 0;
+    g_env_cap = 0;
 }
 
 /* -- errors ----------------------------------------------------------- */
@@ -185,6 +199,8 @@ static KVal make_func(KFnPtr fn, const char *name, int arity,
     f->is_builtin = is_builtin;
     f->has_recv = 0;
     f->recv_str = NULL;
+    f->env = NULL;
+    f->nenv = 0;
     r.tag = K_FUNC;
     r.u.fn = f;
     return r;
@@ -192,6 +208,74 @@ static KVal make_func(KFnPtr fn, const char *name, int arity,
 
 KVal k_make_func(KFnPtr fn, const char *name, int arity) {
     return make_func(fn, name, arity, 0);
+}
+
+/* A closure: like k_make_func, but with the captured-variable slots
+ * the transpiler collected for this function. The slot pointers are
+ * copied into an arena array -- the caller's compound literal would
+ * die with its block, and a closure may outlive it. */
+KVal k_make_closure(KFnPtr fn, const char *name, int arity,
+                    KSlot *env, int nenv) {
+    KVal r = make_func(fn, name, arity, 0);
+    if (nenv > 0) {
+        KSlot *arr = (KSlot *)k_alloc(sizeof(KSlot) * (size_t)nenv);
+        memcpy(arr, env, sizeof(KSlot) * (size_t)nenv);
+        r.u.fn->env = arr;
+        r.u.fn->nenv = nenv;
+    }
+    return r;
+}
+
+/* -- captured-variable slots/cells (7.0.0 closures) ------------------ */
+
+KSlot k_new_slot(void) {
+    /* k_alloc zeroes, so the slot starts with no cell. */
+    return (KSlot)k_alloc(sizeof(KCell));
+}
+
+KCell k_new_cell(KVal v) {
+    KCell cell = (KCell)k_alloc(sizeof(KVal));
+    *cell = v;
+    return cell;
+}
+
+static KCell need_cell(KSlot slot, const char *name) {
+    if (!slot || !*slot)
+        k_error("Undefined variable '%s' -- it was never defined "
+                "with 'let'. Check the spelling", name);
+    return *slot;
+}
+
+KVal k_slot_get(KSlot slot, const char *name) {
+    return *need_cell(slot, name);
+}
+
+void k_slot_set(KSlot slot, const char *name, KVal v) {
+    *need_cell(slot, name) = v;
+}
+
+static KSlot *cur_env(void) {
+    return g_env_depth > 0 ? g_env_stack[g_env_depth - 1] : NULL;
+}
+
+KVal k_env_get(int i, const char *name) {
+    KSlot *env = cur_env();
+    if (!env)
+        k_error("Undefined variable '%s' -- it was never defined "
+                "with 'let'. Check the spelling", name);
+    return *need_cell(env[i], name);
+}
+
+void k_env_set(int i, const char *name, KVal v) {
+    KSlot *env = cur_env();
+    if (!env)
+        k_error("Undefined variable '%s' -- it was never defined "
+                "with 'let'. Check the spelling", name);
+    *need_cell(env[i], name) = v;
+}
+
+KSlot k_env_slot(int i) {
+    return cur_env()[i];
 }
 
 KVal k_make_builtin(KFnPtr fn, const char *name, int arity) {
@@ -207,6 +291,8 @@ KVal k_make_bound_method(const char *name, KVal recv) {
     f->is_builtin = 1;
     f->has_recv = 1;
     f->recv_str = recv.u.str;
+    f->env = NULL;
+    f->nenv = 0;
     r.tag = K_FUNC;
     r.u.fn = f;
     return r;
@@ -751,7 +837,27 @@ KVal k_call(KVal callee, KVal *args, int nargs) {
     if (f->arity >= 0 && nargs != f->arity)
         k_error("Function '%s' takes %d argument%s, but got %d", f->name,
                 f->arity, f->arity == 1 ? "" : "s", nargs);
-    return f->fn(args, nargs);
+    /* Closures (7.0.0): run the body with the callee's captured
+     * slots on top of the environment stack; pop on return. A
+     * closure called from anywhere -- returned, stored, passed as
+     * an argument -- reads the captures it was created with. */
+    if (g_env_depth == g_env_cap) {
+        int ncap = g_env_cap ? g_env_cap * 2 : 64;
+        KSlot **next = (KSlot **)realloc(
+            g_env_stack, (size_t)ncap * sizeof(KSlot *));
+        if (!next) {
+            fprintf(stderr, "Kabir runtime error: out of memory\n");
+            exit(1);
+        }
+        g_env_stack = next;
+        g_env_cap = ncap;
+    }
+    g_env_stack[g_env_depth++] = f->env;
+    {
+        KVal result = f->fn(args, nargs);
+        g_env_depth--;
+        return result;
+    }
 }
 
 static const char *METHOD_NAMES[] = {

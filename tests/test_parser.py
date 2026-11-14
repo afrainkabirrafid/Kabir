@@ -122,8 +122,15 @@ class TestParser(unittest.TestCase):
         self.assertIn(".kbr", str(ctx.exception))
 
     def test_import_bare_name_errors(self):
+        # A bare name is a package import (7.0.0), so `import some_var`
+        # parses now; only an invalid package name still errors.
         with self.assertRaises(KabirError):
-            parse("import some_var")
+            parse("import _foo")
+
+    def test_import_bare_name_parses(self):
+        stmt = parse("import some_var").statements[0]
+        self.assertIsInstance(stmt, ast.ImportStmt)
+        self.assertEqual(stmt.path, "some_var")
 
     def test_import_computed_path_errors(self):
         with self.assertRaises(KabirError):

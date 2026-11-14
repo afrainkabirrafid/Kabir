@@ -102,7 +102,11 @@ class TestRunNative(unittest.TestCase):
             self.assertIn("number", err)
 
     @NEEDS_CC
-    def test_run_native_closure_is_a_clear_error(self):
+    def test_run_native_closure_works(self):
+        # 7.0.0: closures run in native mode (this used to be a
+        # clear compile-time error). The native binary inherits
+        # stdio, so its output bypasses redirect_stdout -- run the
+        # real CLI as a subprocess instead.
         with tempfile.TemporaryDirectory() as tmp:
             prog = Path(tmp) / "clos.kbr"
             prog.write_text(
@@ -114,9 +118,14 @@ class TestRunNative(unittest.TestCase):
                 "    return inner()\n"
                 "}\n"
                 "print(outer())\n", encoding="utf-8")
-            code, out, err = _run_cli(["run", "--native", str(prog)])
-            self.assertEqual(code, 1)
-            self.assertIn("closures not supported", err)
+            root = Path(__file__).resolve().parent.parent
+            env = dict(os.environ, PYTHONPATH=str(root))
+            proc = subprocess.run(
+                [sys.executable, "-m", "kabir", "run", "--native",
+                 str(prog)],
+                cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "5\n")
 
     def test_run_interp_and_native_together_is_usage_error(self):
         code, out, err = _run_cli(

@@ -280,6 +280,10 @@ PARSER_SNIPPETS = [
     "let s = \"\"\nlet t = \"{x}\"\n",
     "let x = 1 < 2 == true\n",
     "let s = \"x\"\nlet t = s[0]\n",
+    # Imports: quoted file path and bare package name (7.0.0).
+    "import \"lib.kbr\"\n",
+    "import greet\n",
+    "import my-pkg\n",
 ]
 
 
@@ -316,7 +320,12 @@ class TestSelfhostParser(unittest.TestCase):
             ("print(1", "close paren"),
             ('import "dir/{name}.kbr"', "plain string"),
             ('import "notes.txt"', ".kbr"),
-            ("import some_var", "file path"),
+            # `import some_var` used to be here, but bare-name imports
+            # (7.0.0) made it legal syntax -- it now fails at run time
+            # (resolution), not at parse time. A number is still a
+            # parse error, and so is a name starting with "_".
+            ("import 5", "file path"),
+            ("import _foo", "Invalid package name"),
             ('match v { "a{b}": 1 }', "plain string"),
             ('{"a": 1, 2: 3}', "Dict keys must be strings"),
             ("x.y = 1", "Only a variable or an index"),

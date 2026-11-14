@@ -38,6 +38,7 @@ Canonical style (documented in docs/LANGUAGE.md):
 
 from . import ast_nodes as ast
 from .errors import KabirError
+from .imports import is_package_spec
 from .parser import parse
 
 INDENT = "    "
@@ -268,6 +269,10 @@ class _Printer:
             return [indent + "return "
                     + self._fmt_expr(stmt.value, level)]
         if isinstance(stmt, ast.ImportStmt):
+            # Bare-name package imports stay bare; quoted file imports
+            # stay quoted. The rule lives in kabir/imports.py.
+            if is_package_spec(stmt.path):
+                return [indent + "import " + stmt.path]
             return [indent + "import " + _quote(stmt.path)]
         if isinstance(stmt, ast.BreakStmt):
             return [indent + "break"]
@@ -307,12 +312,16 @@ class _Printer:
             for p, t in zip(stmt.params, types))
         ret = getattr(stmt, "return_type", None)
         ret_text = (" -> %s" % ret.full_name) if ret is not None else ""
+        # 7.0.0 lifetimes: `func f<'a, 'b>(...)` round-trips.
+        lifetimes = getattr(stmt, "lifetimes", None) or []
+        lt_text = ("<'%s>" % ", '".join(lifetimes)) if lifetimes else ""
         # 4.0.0 async: `async func ...` round-trips through the
         # formatter (used by both declarations and anonymous funcs).
         prefix = "async " if getattr(stmt, "is_async", False) else ""
         if stmt.name is not None:
-            return "%sfunc %s(%s)%s {" % (prefix, stmt.name, params, ret_text)
-        return "%sfunc(%s)%s {" % (prefix, params, ret_text)
+            return "%sfunc %s%s(%s)%s {" % (prefix, stmt.name, lt_text,
+                                            params, ret_text)
+        return "%sfunc%s(%s)%s {" % (prefix, lt_text, params, ret_text)
 
     def _fmt_func(self, stmt, level):
         indent = INDENT * level
@@ -430,6 +439,12 @@ class _Printer:
             if node.mutable:
                 return "&mut " + inner, _UNARY_PREC
             return "&" + inner, _UNARY_PREC
+        if isinstance(node, ast.DerefExpr):
+            # 7.0.0: a deref binds like a unary operator: `*r`,
+            # `**r` (a double deref formats back as `**r`, which
+            # re-parses as one).
+            inner = self._fmt_expr(node.operand, level, _UNARY_PREC)
+            return "*" + inner, _UNARY_PREC
         if isinstance(node, ast.Call):
             callee = self._fmt_expr(node.callee, level, _POSTFIX_PREC)
             args = ", ".join(self._fmt_expr(a, level) for a in node.args)

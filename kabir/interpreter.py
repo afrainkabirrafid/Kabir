@@ -14,6 +14,7 @@ from . import semantics as _semantics
 from .builtins import build_builtins, BuiltinFunction, _type_name
 from .stdlib import STRING_METHODS, build_stdlib
 from .errors import KabirError, error_at
+from .imports import resolve_import_spec
 from .parser import parse as _parse_source
 
 
@@ -38,10 +39,37 @@ class _ContinueSignal(Exception):
 class Environment:
     def __init__(self, parent=None):
         self.vars = {}
+        # 7.0.0 borrow aliases: name -> the place expression (a Var
+        # or Index node) that a borrow held in `name` borrows. Lets
+        # the unchecked interpreter resolve a deref-write (`*s =
+        # 10`) to the borrowed place, the way the checker does with
+        # resolved_target on the checked path. Scoped like vars: a
+        # child env sees its parents' aliases, and dropping the env
+        # drops its aliases.
+        self.aliases = {}
         self.parent = parent
 
     def define(self, name, value):
         self.vars[name] = value
+
+    def define_alias(self, name, place):
+        self.aliases[name] = place
+
+    def lookup_alias(self, name):
+        env = self
+        while env is not None:
+            if name in env.aliases:
+                return env.aliases[name]
+            env = env.parent
+        return None
+
+    def drop_alias(self, name):
+        env = self
+        while env is not None:
+            if name in env.aliases:
+                del env.aliases[name]
+                return
+            env = env.parent
 
     def get(self, name):
         env = self
@@ -161,7 +189,43 @@ class Interpreter:
     def _run_LetStmt(self, stmt):
         value = self.compute(stmt.value)
         self._current_env().define(stmt.name, value)
+        self._record_borrow_alias(stmt.name, stmt.value)
         return None
+
+    def _alias_place(self, node):
+        """The place expression a borrow of *node* borrows (7.0.0),
+        following the interpreter's alias chain. Used to record
+        what a new borrow binding aliases, so an unchecked
+        deref-write can resolve it."""
+        if isinstance(node, ast.DerefExpr):
+            # Reborrow (`&mut *r`): the place is whatever the
+            # dereferenced holder aliases; a holder with no alias
+            # (a borrowed parameter) stands for itself.
+            if isinstance(node.operand, ast.Var):
+                aliased = self._current_env().lookup_alias(
+                    node.operand.name)
+                if aliased is not None:
+                    return self._alias_place(aliased)
+            return node.operand
+        return node
+
+    def _record_borrow_alias(self, name, value_node):
+        """After `let name = <value>` (or an assignment to `name`),
+        remember what `name` borrows (7.0.0). A borrow binding
+        aliases its place; a copy of a borrow (`let t = r`) copies
+        the alias; anything else clears it (rebinding ends the
+        borrow)."""
+        env = self._current_env()
+        if isinstance(value_node, ast.BorrowExpr):
+            env.define_alias(name, self._alias_place(value_node.expr))
+        elif isinstance(value_node, ast.Var):
+            aliased = env.lookup_alias(value_node.name)
+            if aliased is not None:
+                env.define_alias(name, aliased)
+            else:
+                env.drop_alias(name)
+        else:
+            env.drop_alias(name)
 
     def _run_AssignStmt(self, stmt):
         value = self.compute(stmt.value)
@@ -175,6 +239,40 @@ class Interpreter:
                            "Cannot assign to '%s' -- it was never defined. "
                            "Use 'let %s = ...' first"
                            % (stmt.target.name, stmt.target.name))
+            self._record_borrow_alias(stmt.target.name, stmt.value)
+        elif isinstance(stmt.target, ast.DerefExpr):
+            # 7.0.0: writing through a deref (`*s = 10`) stores to
+            # the place the borrow actually borrows. The checker
+            # annotates it (resolved_target) on the checked path;
+            # unchecked, the interpreter resolves it through its
+            # own alias chain; with neither, the store goes to the
+            # variable holding the borrow. Either way a borrow IS
+            # the value at runtime, so this is a plain store.
+            if not isinstance(stmt.target.operand, ast.Var):
+                self.error(stmt.target,
+                           "Can only write through a borrow held in "
+                           "a variable")
+            resolved = getattr(stmt, "resolved_target", None)
+            if resolved is None:
+                holder = stmt.target.operand.name
+                resolved = self._current_env().lookup_alias(holder)
+                if resolved is None:
+                    resolved = stmt.target.operand
+            if isinstance(resolved, ast.Var):
+                if not self._current_env().assign(resolved.name, value):
+                    self.error(resolved,
+                               "Cannot assign to '%s' -- it was never "
+                               "defined. Use 'let %s = ...' first"
+                               % (resolved.name, resolved.name))
+            elif isinstance(resolved, ast.Index):
+                self._assign_index(resolved, value, stmt)
+            elif not self._current_env().assign(
+                    stmt.target.operand.name, value):
+                self.error(stmt.target.operand,
+                           "Cannot assign to '%s' -- it was never defined. "
+                           "Use 'let %s = ...' first"
+                           % (stmt.target.operand.name,
+                              stmt.target.operand.name))
         else:  # Index target
             self._assign_index(stmt.target, value, stmt)
         return None
@@ -313,15 +411,17 @@ class Interpreter:
         return None
 
     def _load_module(self, path, node):
-        # Resolve relative to the importing file's directory; with no
-        # importing file (REPL "<repl>", "<stdin>", tests) relative to
-        # the process working directory.
-        if self.filename.startswith("<"):
-            base = os.getcwd()
-        else:
-            base = os.path.dirname(os.path.abspath(self.filename))
-        resolved = os.path.join(base, path)
-        canonical = os.path.realpath(os.path.abspath(resolved))
+        # One shared resolver (kabir/imports.py) turns the import spec
+        # into a file: "file.kbr" resolves relative to the importing
+        # file, a bare name resolves via the project's manifest +
+        # lockfile to vendor/<name>/<version>/src/main.kbr. A
+        # resolution failure is reported at the import statement.
+        try:
+            canonical = resolve_import_spec(path, self.filename)
+        except KabirError as exc:
+            # exc.message, not str(exc): str renders with a default
+            # "<stdin>" location that would leak into this error.
+            self.error(node, exc.message)
         # Cycle: this file is already being executed further up the stack.
         if canonical in self._importing:
             chain = [os.path.basename(p) for p in self._importing]
@@ -456,6 +556,24 @@ class Interpreter:
     def _compute_BorrowExpr(self, expr):
         # 4.0.0 borrow checker: a borrow IS the value at runtime.
         return self.compute(expr.expr)
+
+    def _compute_DerefExpr(self, expr):
+        # 7.0.0 deref: a borrow IS the value at runtime -- `*r`
+        # evaluates to just `r`, exactly like `&x`. Zero runtime
+        # cost; the checker has already enforced the borrow rules.
+        # The checker resolves the read to the place the borrow
+        # actually borrows (node.resolved), so a write through a
+        # reborrow is visible here; unchecked, the interpreter
+        # resolves it through its own alias chain; with neither,
+        # the read goes to the variable holding the borrow.
+        resolved = getattr(expr, "resolved", None)
+        if resolved is not None:
+            return self.compute(resolved)
+        if isinstance(expr.operand, ast.Var):
+            aliased = self._current_env().lookup_alias(expr.operand.name)
+            if aliased is not None:
+                return self.compute(aliased)
+        return self.compute(expr.operand)
 
     def _compute_ArrayLiteral(self, expr):
         return [self.compute(el) for el in expr.elements]

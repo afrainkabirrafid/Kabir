@@ -76,8 +76,24 @@ class Lexer:
                 self._advance()
             elif ch.isdigit():
                 tokens.append(self._number())
-            elif ch == '"' or ch == "'":
+            elif ch == '"':
+                # NOTE (7.0.0, Leap 1 repair): the lifetimes edit
+                # replaced the old `'"' or "'"` branch with a
+                # single-quote-only one, which dropped double-quote
+                # string lexing entirely. Restored here; the lifetime
+                # branch below is untouched.
                 tokens.append(self._string())
+            elif ch == "'":
+                # 7.0.0 lifetimes: `'a` is a lifetime name when an
+                # identifier follows the quote and is itself followed
+                # by `>`, `,`, `)`, or whitespace + an identifier (as
+                # in `func f<'a>(...)` or `&'a number`). Anything
+                # else is the old single-quote-string error.
+                lifetime = self._try_lifetime()
+                if lifetime is not None:
+                    tokens.append(lifetime)
+                else:
+                    tokens.append(self._string())
             elif ch.isalpha() or ch == "_":
                 tokens.append(self._ident())
             elif self.source[self.pos:self.pos + 2] in MULTI_OPS:
@@ -95,6 +111,37 @@ class Lexer:
                 self._fail("Unexpected character %r" % ch)
         tokens.append(Token("EOF", None, self.line, self.col))
         return tokens
+
+    def _try_lifetime(self):
+        """Lex `'a` as a LIFETIME token, or return None.
+
+        A lifetime is an apostrophe followed by an identifier that
+        is followed (after optional whitespace) by `>`, `,`, `)`, or
+        another identifier -- the positions a lifetime can appear:
+        `<'a>`, `<'a, 'b>`, `&'a number`, `-> &'a number`. Anything
+        else (notably `'hello'`, a single-quoted string attempt) is
+        not a lifetime: the position is restored and the caller
+        falls through to the single-quote error.
+        """
+        save_pos, save_line, save_col = self.pos, self.line, self.col
+        start_line, start_col = self.line, self.col
+        self._advance()  # consume "'"
+        if not (self._peek().isalpha() or self._peek() == "_"):
+            self.pos, self.line, self.col = save_pos, save_line, save_col
+            return None
+        start = self.pos
+        while (self.pos < self.length
+               and (self._peek().isalnum() or self._peek() == "_")):
+            self._advance()
+        name = self.source[start:self.pos]
+        save2_pos, save2_line, save2_col = self.pos, self.line, self.col
+        while self.pos < self.length and self._peek() in " \t\r\n":
+            self._advance()
+        nxt = self._peek()
+        if nxt in (">", ",", ")") or nxt.isalpha() or nxt == "_":
+            return Token("LIFETIME", name, start_line, start_col)
+        self.pos, self.line, self.col = save_pos, save_line, save_col
+        return None
 
     def _number(self):
         start_line, start_col = self.line, self.col

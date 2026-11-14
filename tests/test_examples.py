@@ -24,7 +24,7 @@ class TestExamples(unittest.TestCase):
         proc = run_example("hello.kbr")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Hello, Rafid!", proc.stdout)
-        self.assertIn("Welcome to Kabir version 6.0.0.", proc.stdout)
+        self.assertIn("Welcome to Kabir version 7.0.0.", proc.stdout)
         self.assertIn("2 + 3 = 5", proc.stdout)
 
     def test_fizzbuzz(self):
@@ -96,7 +96,7 @@ class TestCli(unittest.TestCase):
         proc = subprocess.run([PYTHON, "-m", "kabir", "--version"],
                               capture_output=True, text=True, cwd=ROOT)
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout.strip(), "kabir 6.0.0")
+        self.assertEqual(proc.stdout.strip(), "kabir 7.0.0")
 
     def test_help(self):
         proc = subprocess.run([PYTHON, "-m", "kabir", "--help"],

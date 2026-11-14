@@ -6,8 +6,16 @@ or -> and -> equality (== !=) -> comparison (< <= > >=) -> additive
 unary (-, not) -> postfix (call, index) -> primary.
 """
 
+import re
+
 from .errors import KabirError, error_at
 from . import ast_nodes as ast
+
+# Package names for bare imports (import greet): same rule as
+# project.NAME_RE -- starts with a letter, then letters, digits,
+# "-" and "_". Kept here (rather than importing project) so the
+# parser stays independent of the project/registry layer.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 
 class Parser:
@@ -136,25 +144,49 @@ class Parser:
 
     def _import(self):
         tok = self._advance()  # import
-        path_tok = self._expect(
-            "STRING",
-            what='a file path in double quotes after \'import\' -- '
-                 'like import "helpers.kbr"')
-        parts = path_tok.value
-        if len(parts) != 1 or parts[0][0] != "lit":
-            self._fail("import paths must be plain strings, not "
-                       "interpolated ones", token=path_tok)
-        path = parts[0][1]
-        if not path.endswith(".kbr"):
-            self._fail('import "%s" must name a .kbr file' % path,
-                       token=path_tok)
-        return ast.ImportStmt(path, line=tok.line, col=tok.col)
+        if self._check("STRING"):
+            # Quoted file import: import "helpers.kbr".
+            path_tok = self._advance()
+            parts = path_tok.value
+            if len(parts) != 1 or parts[0][0] != "lit":
+                self._fail("import paths must be plain strings, not "
+                           "interpolated ones", token=path_tok)
+            path = parts[0][1]
+            if not path.endswith(".kbr"):
+                self._fail('import "%s" must name a .kbr file' % path,
+                           token=path_tok)
+            return ast.ImportStmt(path, line=tok.line, col=tok.col)
+        if self._check("IDENT"):
+            # Bare-name package import: import greet (7.0.0, registry
+            # wiring -- resolved at run time by kabir/imports.py).
+            # A hyphenated name (import my-pkg) lexes as IDENT, OP(-),
+            # IDENT, so consume "-name" segments while they follow.
+            name = self._advance().value
+            while self._check("OP", "-"):
+                nxt = (self.tokens[self.pos + 1]
+                       if self.pos + 1 < len(self.tokens) else None)
+                if nxt is None or nxt.kind != "IDENT":
+                    break
+                self._advance()  # -
+                name += "-" + self._advance().value
+            if not _PACKAGE_NAME_RE.match(name):
+                self._fail('Invalid package name "%s" -- package names '
+                           "must start with a letter and contain only "
+                           'letters, digits, "-" and "_"', token=tok)
+            return ast.ImportStmt(name, line=tok.line, col=tok.col)
+        self._fail("Expected a file path in double quotes after 'import' "
+                   '-- like import "helpers.kbr" -- or a package name, '
+                   "like import greet", token=tok)
 
     def _type_ann(self):
         # 4.0.0 borrow types: `&number` (shared) and `&mut number`.
+        # 7.0.0 lifetimes: `&'a number` and `&'a mut array`.
         borrow = None
+        lifetime = None
         if self._match("OP", "&"):
             borrow = "shared"
+            if self._check("LIFETIME"):
+                lifetime = self._advance().value
             if self._check("IDENT", "mut"):
                 nxt = (self.tokens[self.pos + 1]
                        if self.pos + 1 < len(self.tokens) else None)
@@ -166,7 +198,7 @@ class Parser:
         tok = self._expect("IDENT",
                            what="a type name, like 'number'")
         return ast.TypeAnn(tok.value, line=tok.line, col=tok.col,
-                           borrow=borrow)
+                           borrow=borrow, lifetime=lifetime)
 
     def _let(self):
         tok = self._advance()  # let
@@ -205,6 +237,22 @@ class Parser:
         name = None
         if self._check("IDENT"):
             name = self._advance().value
+        # 7.0.0 lifetimes: `func f<'a, 'b>(...)` declares the
+        # lifetime parameters the annotations below may use.
+        lifetimes = []
+        if self._check("OP", "<"):
+            self._advance()
+            self._skip_newlines()
+            while True:
+                lt = self._expect("LIFETIME",
+                                  what="a lifetime name, like 'a, after '<'")
+                lifetimes.append(lt.value)
+                self._skip_newlines()
+                if not self._match("PUNCT", ","):
+                    break
+                self._skip_newlines()
+            self._expect("OP", ">",
+                         "'>' to close the lifetime list")
         self._expect("PUNCT", "(", "'(' after the function name")
         params = []
         param_types = []
@@ -229,7 +277,8 @@ class Parser:
                             line=line, col=col,
                             param_types=param_types,
                             return_type=return_type,
-                            is_async=is_async)
+                            is_async=is_async,
+                            lifetimes=lifetimes)
 
     # -- match expressions --------------------------------------------
     def _match_expr(self):
@@ -329,8 +378,10 @@ class Parser:
         expr = self._expression()
         if self._check("OP") and self.current.value in ("=", "+=", "-="):
             op = self._advance().value
-            if not isinstance(expr, (ast.Var, ast.Index)):
-                self._fail("Only a variable or an index can be assigned to",
+            if not isinstance(expr, (ast.Var, ast.Index, ast.DerefExpr)):
+                self._fail("Only a variable or an index can be assigned "
+                           "to -- a dereference (*r) can be assigned to "
+                           "as well, but nothing else",
                            token=tok)
             value = self._expression()
             return ast.AssignStmt(expr, op, value, line=tok.line, col=tok.col)
@@ -416,6 +467,22 @@ class Parser:
                     mutable = True
             return ast.BorrowExpr(self._unary(), mutable,
                                   line=tok.line, col=tok.col)
+        if self._check("OP", "*"):
+            # 7.0.0 deref: `*r` reads the value behind a borrow.
+            # Binds like a unary operator, so `*r + 1` is `(*r) + 1`
+            # and `&mut *r` is a reborrow of `r`.
+            self._advance()
+            return ast.DerefExpr(self._unary(),
+                                 line=tok.line, col=tok.col)
+        if self._check("OP", "**"):
+            # 7.0.0: `**r` at an operand position is a double deref
+            # (`*` `*r`). A binary `**` (power) never appears here --
+            # it is consumed by `_power` after a left operand -- so
+            # this cannot steal a power expression.
+            self._advance()
+            inner = ast.DerefExpr(self._unary(),
+                                  line=tok.line, col=tok.col)
+            return ast.DerefExpr(inner, line=tok.line, col=tok.col)
         if self._check("OP", "-"):
             self._advance()
             return ast.UnaryOp("-", self._unary(), line=tok.line, col=tok.col)
@@ -563,6 +630,11 @@ def _starts_expression(tok):
             "func", "match", "true", "false", "null", "not"):
         return True
     if tok.kind == "OP" and tok.value == "-":
+        return True
+    if tok.kind == "OP" and tok.value in ("*", "&", "**"):
+        # 7.0.0: `&mut *r` is a mutable reborrow (deref starts an
+        # expression), and `&mut &x` is a mutable borrow of a borrow
+        # (a checker error, but it parses as one borrow).
         return True
     return False
 

@@ -75,6 +75,25 @@ Open an issue with:
 - The smallest `.kbr` program that shows the problem.
 - What you expected, and what actually happened (paste the full error output).
 
+## Releasing
+
+One command, from the repo root:
+
+```bash
+./release.sh 6.1.0 --notes "What changed, in one line."
+```
+
+It validates the version (X.Y.Z, greater than the current one, not
+already on PyPI), requires a CHANGELOG.md entry for it (or adds one
+from `--notes`), bumps the version in every place it appears
+literally, runs the full test suite, builds wheel + sdist, uploads to
+PyPI, pushes a snapshot to GitHub (asks for approval on a card), and
+verifies the release live plus a clean-venv `pip install`. The PyPI
+token comes from `TWINE_PASSWORD` (env var) or a hidden prompt — it
+is never stored. `./release.sh --help` lists the options
+(`--dry-run`, `--skip-tests`, `--skip-pypi`, `--skip-push`); run
+`--dry-run` first before a real release.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License, the same license as the project (see [LICENSE](LICENSE)).
